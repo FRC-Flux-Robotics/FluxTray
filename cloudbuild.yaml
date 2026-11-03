@@ -1,0 +1,42 @@
+# GCP Cloud Build Pipeline for Standalone FluxTray Driver Station Agent
+#
+# Run manually:
+#   gcloud builds submit . \
+#     --config=cloudbuild.yaml
+
+steps:
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "pull-fluxfig-from-gcs"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        mkdir -p /workspace/libs
+        if gcloud storage cp gs://btvaroska/frc-10413/libs/fluxfig-latest.jar /workspace/libs/fluxfig-1.0.0.jar 2>/dev/null; then
+          echo "Pulled latest fluxfig-latest.jar from GCS into /workspace/libs/fluxfig-1.0.0.jar"
+        else
+          echo "Using committed /workspace/libs/fluxfig-1.0.0.jar"
+        fi
+
+  - name: "eclipse-temurin:17-jdk-jammy"
+    id: "compile-test-and-package-fluxtray"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        chmod +x ./scripts/build.sh
+        ./scripts/build.sh
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    id: "publish-fluxtray-jar-to-gcs"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        gcloud storage cp dist/FluxTray.jar gs://btvaroska/frc-10413/tools/FluxTray-latest.jar
+        gcloud storage cp dist/FluxTray.jar gs://btvaroska/frc-10413/tools/FluxTray-2027.1.0.jar
+        gcloud storage cp dist/FluxTray.jar gs://btvaroska/frc-10413/tools/FluxTray-1.0.0.jar
+        echo "Published gs://btvaroska/frc-10413/tools/FluxTray-latest.jar (v2027.1.0)"
