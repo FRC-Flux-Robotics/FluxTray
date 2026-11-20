@@ -1,31 +1,52 @@
 package frc.flux.tray;
 
 import frc.flux.tray.BatteryAndRunManager.CompletedRunBundle;
+import frc.flux.tray.DriveWatcher.ActionType;
+import frc.flux.tray.DriveWatcher.PollOutcome;
 import frc.flux.tray.PackageDeployer.PackageManifest;
 import frc.lib.fluxfig.FluxFig;
 import frc.lib.fluxfig.FluxSystemSnapshot;
 import frc.lib.fluxfig.FluxSystemSnapshot.CanInterfaceStats;
 import frc.lib.fluxfig.FluxSystemSnapshot.WatchDecision;
+import java.awt.image.BufferedImage;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /**
- * Comprehensive verification suite for {@code FluxTray.jar}:
- *
- * <ol>
- *   <li>Strict Enabled / FMS transfer lockout &amp; 3-second post-Disable guard
- *   <li>{@code .fluxpkg.zip} deployment, platform check, {@code FluxFig.validateStrict()} safety
- *       gate, multi-laptop overwrite guard, 5-slot rollback ring, and 1-click "Restore STABLE"
- *   <li>Named battery tracking ({@code 2026-B01..B12}) + 3-headset spoken battery fallback
- *   <li>Practice Mode auto-pull vs. Competition FMS "Capture on Field, Sync in Pit" workflow
- *   <li>All 14 offline SystemCore &amp; Controller watch metrics and actionable decisions
- * </ol>
+ * Comprehensive verification suite for {@code FluxTray.jar} covering M1.6–M1.10 plus existing
+ * rollback, tuning, FMS pit sync, scouting QR, and 14 watch metrics contracts.
  */
 public final class FluxTrayTest {
 
@@ -63,19 +84,32 @@ public final class FluxTrayTest {
       testHealthyAndAnomalousSystemSnapshots();
       testFluxFigTuningModeSwitchAndVersionPromotion();
       testScoutingPwaAndSignedQrScanner();
-      System.out.println("FluxTrayTest: ALL 6 SUITES (34 ASSERTIONS & 14 WATCH METRICS) PASSED");
+      testNt4WebSocketLiveLockoutAndOncePerDisableAutoPull();
+      testRoboRioRobotCommandAtomicDeployRestartAndRobotStateLockout();
+      testDriveWatcherIncrementalLedgerDsLogFilterAtomicZipAndRealWavAudio();
+      System.out.println("FluxTrayTest: ALL 9 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
   }
 
   private static void testSafetyLockoutAndAbort() {
-    RobotSafetyLockout lockout = new RobotSafetyLockout(1_000L);
-    // Initially disabled at t=1000ms -> at t=2500ms (< 3000ms), not ready for auto log pull
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    assertEquals(-1L, lockout.lastDisabledTimestampMs(), "Initial lastDisabledTimestampMs is -1L");
+    assertTrue(
+        !lockout.isReadyForAutoLogPull(10_000L),
+        "Idle robot without Enabled -> Disabled transition must NOT trigger auto-pull");
+
+    // Observe Enabled -> Disabled transition at t=1_000ms.
+    lockout.updateState(true, false, 500L);
+    lockout.updateState(false, false, 1_000L);
     assertTrue(!lockout.isReadyForAutoLogPull(2_500L), "Must wait 3.0s after Disable before log pull");
     assertTrue(lockout.isReadyForAutoLogPull(4_100L), "Ready for log pull after >= 3.0s Disabled");
+    assertTrue(lockout.claimAutoLogPull(4_100L), "First auto-pull claim succeeds once");
+    assertTrue(!lockout.claimAutoLogPull(4_200L), "Second auto-pull claim blocked for same disable");
+    assertTrue(!lockout.isReadyForAutoLogPull(5_000L), "Auto-pull not ready again until next Enable");
 
-    // Start a transfer while Disabled, then transition to Enabled -> transfer must abort immediately
+    // Start a transfer while Disabled, then transition to Enabled -> transfer must abort immediately.
     lockout.beginTransferOrThrow("deployPackage");
     assertEquals(1, lockout.activeTransferCount(), "1 active transfer");
     lockout.updateState(true, false, 5_000L);
@@ -90,7 +124,6 @@ public final class FluxTrayTest {
     }
     assertTrue(threwOnEnabled, "Must block transfers while Enabled");
 
-    // Disable at t=10_000ms, but attach FMS -> must still block transfers
     lockout.updateState(false, true, 10_000L);
     boolean threwOnFms = false;
     try {
@@ -104,7 +137,7 @@ public final class FluxTrayTest {
   private static void testPackageDeployAndRollbackRing() throws IOException {
     Path temp = createTempDir("fluxtray-deploy-test-");
     MockRobotServer robot = new MockRobotServer(temp.resolve("robot"), "systemcore-2027");
-    RobotSafetyLockout lockout = new RobotSafetyLockout(0L);
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
     PackageDeployer deployerA = new PackageDeployer(lockout, "pit-laptop-A");
     PackageDeployer deployerB = new PackageDeployer(lockout, "pit-laptop-B");
 
@@ -147,6 +180,7 @@ public final class FluxTrayTest {
         "{\"version\":\"2025.0\",\"waypoints\":[]}",
         robot.readRemoteText("deploy/pathplanner/paths/Shop_Center_Shuttle.path"),
         "deploy/pathplanner/** recursively deployed from .fluxpkg.zip");
+    assertEquals(1, robot.restartCount(), "Robot restarted after deploy");
 
     Path pkgExpV2 =
         PackageDeployer.createFluxPkgZip(
@@ -183,12 +217,14 @@ public final class FluxTrayTest {
         "STABLE_JAR_V1_BYTES",
         robot.readRemoteText("jars/prev_stable.jar"),
         "prev_stable.jar remains untouched by EXPERIMENTAL deploy");
+    assertEquals(2, robot.restartCount(), "Robot restarted after second deploy");
 
     deployerB.restoreStable(robot);
     assertEquals(
         "STABLE_JAR_V1_BYTES",
         robot.readRemoteText("frcUserProgram.jar"),
         "Restore STABLE restored STABLE v1");
+    assertEquals(3, robot.restartCount(), "Robot restarted after Restore STABLE");
 
     Path badConfigs = createSampleFluxFigConfigs(temp.resolve("configs-bad"), "can_s1", 120.0);
     boolean badConfigBlocked = false;
@@ -212,15 +248,13 @@ public final class FluxTrayTest {
     MockRobotServer robot = new MockRobotServer(temp.resolve("robot"), "systemcore-2027");
     robot.seedSimulatedMatchLogs("2027-02-18_16-08-12");
 
-    RobotSafetyLockout lockout = new RobotSafetyLockout(0L);
-    MultiMicAudioRecorder audio = new MultiMicAudioRecorder();
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
     BatteryAndRunManager mgr = new BatteryAndRunManager(hubDir, lockout, audio);
 
-    // Detect initial boot epoch -> battery prompt pending
     assertTrue(mgr.checkRobotBootEpoch(robot.currentBootEpochId()), "New boot epoch detected");
     assertTrue(mgr.isBatteryPromptPending(), "Battery prompt pending after boot");
 
-    // Simulate match enable -> spoken battery fallback in audio -> disable
     lockout.updateState(true, false, 1_000L);
     audio.onRobotStateChanged(true, 1_000L);
     audio.recordVoiceCue("Coach", 4.2, "We forgot the tray menu, running battery 2026-B07 today");
@@ -228,7 +262,6 @@ public final class FluxTrayTest {
     lockout.updateState(false, false, 150_000L);
     audio.onRobotStateChanged(false, 150_000L);
 
-    // Practice Mode: pull after >= 3.0s Disabled (and >= 10s for full debrief)
     Path usbMirror = temp.resolve("FLUXLOGS_USB");
     CompletedRunBundle practiceRun =
         mgr.pullPracticeRunLogs(
@@ -239,7 +272,7 @@ public final class FluxTrayTest {
             robot,
             dsLogDir,
             usbMirror,
-            161_000L);
+            165_000L);
 
     assertEquals("2026-B07", practiceRun.batteryName(), "Spoken battery fallback resolved 2026-B07");
     assertEquals("COMPLETE", practiceRun.syncStatus(), "Practice run is immediately COMPLETE");
@@ -265,11 +298,16 @@ public final class FluxTrayTest {
         "Default match-logs_<date>_<time>_COMP_2027.zip packaged by default");
     assertTrue(
         Files.isRegularFile(
-            usbMirror.resolve("2027-02-18_16-08-12_COMP_2027").resolve("driver-audio.ogg"))
+                usbMirror
+                    .resolve("2027-02-18_16-08-12_COMP_2027")
+                    .resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME))
+            && Files.isRegularFile(
+                usbMirror
+                    .resolve("2027-02-18_16-08-12_COMP_2027")
+                    .resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME))
             && Files.isRegularFile(usbMirror.resolve(practiceRun.zipArchive().getFileName())),
-        "Mirrored run bundle and default .zip archive to FLUXLOGS USB stick");
+        "Mirrored run bundle with mentor-audio.wav, audio-sync.json, and default .zip archive");
 
-    // Verify custom output directory and custom .zip filename override (--dir / --file / --out)
     Path customOutDir = temp.resolve("custom-export-dir");
     CompletedRunBundle customOutRun =
         mgr.pullPracticeRunLogs(
@@ -292,8 +330,7 @@ public final class FluxTrayTest {
             && Files.size(customOutRun.zipArchive()) > 200,
         "Custom zip archive created and non-empty");
 
-    // Competition FMS Mode ("Capture on Field, Sync in Pit")
-    robot.setReachable(false); // Blocked on FMS field VLAN
+    robot.setReachable(false);
     lockout.updateState(true, true, 200_000L);
     audio.onRobotStateChanged(true, 200_000L);
     mgr.selectBattery("2026-B03");
@@ -313,7 +350,6 @@ public final class FluxTrayTest {
         audio.recordedCues().size(),
         "recordedCues cleared after run capture so stale cues never leak into next run");
 
-    // Robot returns to pit and powers on -> syncPendingFmsRuns pulls robot logs + system-snapshot.txt
     robot.setReachable(true);
     robot.seedSimulatedMatchLogs("Qual14");
     List<CompletedRunBundle> synced = mgr.syncPendingFmsRuns(robot);
@@ -354,47 +390,45 @@ public final class FluxTrayTest {
             "SystemCore-10413",
             "6.6.47-rt39-v8-16k+",
             612.0,
-            5.0, // 200 Hz target
+            5.0,
             2.10,
-            7.85, // #1: Loop p99 > 6.5 ms
+            7.85,
             16.40,
-            18.50, // #3: First-enable cold JIT spike > 12 ms
-            2.15, // #4: 250 Hz odometry jitter > 1.5 ms
+            18.50,
+            2.15,
             0.90,
-            3.40, // #2: VisionMs trace spike > 2.5 ms
+            3.40,
             0.40,
-            88.5, // #8: Total CPU > 80% while Java is only 14%
+            88.5,
             14.0,
             68.0,
-            29.5, // #7: Kernel softirq > 25%
+            29.5,
             2.5,
-            6.8, // #13: Disk iowait > 5% & low storage
+            6.8,
             95_000L,
             82_000L,
-            83.5, // #9: CPU temp >= 80 C & thermal throttle
+            83.5,
             1800.0,
-            0x50005, // #9 & #10: Thermal throttle (0x40004) + 5V undervoltage (0x10001)
-            3.85, // #11: Heap alloc > 2.0 MB/s
+            0x50005,
+            3.85,
             9,
             42.0,
-            3, // #12: 3 GC-correlated loop overruns
-            280.0, // #13: Free storage < 400 MB
+            3,
+            280.0,
             31.0,
-            0.68, // #14: ARMv8 PMU IPC < 0.80 & LLC miss > 15%
+            0.68,
             6.5,
             19.4,
             740L,
             List.of(
                 new CanInterfaceStats(
-                    "can_s0", 380_000L, 90_000L, 14L, 0L, 6L, 0, 0, "ERROR-ACTIVE"), // #5: drops
+                    "can_s0", 380_000L, 90_000L, 14L, 0L, 6L, 0, 0, "ERROR-ACTIVE"),
                 new CanInterfaceStats(
-                    "can_s1", 1_200L, 400L, 0L, 0L, 0L, 0, 0, "ERROR-ACTIVE"), // #5b: odd port
+                    "can_s1", 1_200L, 400L, 0L, 0L, 0L, 0, 0, "ERROR-ACTIVE"),
                 new CanInterfaceStats(
-                    "can_s2", 140_000L, 45_000L, 0L, 0L, 0L, 19, 1, "ERROR-PASSIVE") // #6: bus err
-                ));
+                    "can_s2", 140_000L, 45_000L, 0L, 0L, 0L, 19, 1, "ERROR-PASSIVE")));
 
-    List<WatchDecision> decisions =
-        FluxSystemSnapshot.parse(stressed.serialize()).evaluate();
+    List<WatchDecision> decisions = FluxSystemSnapshot.parse(stressed.serialize()).evaluate();
     assertTrue(
         decisions.size() >= 14,
         "Expected all 14+ watch metric decisions to fire, got " + decisions.size());
@@ -410,7 +444,7 @@ public final class FluxTrayTest {
 
     MockRobotServer robot = new MockRobotServer(temp.resolve("robot"), "systemcore-2027");
     robot.seedSimulatedMatchLogs("2027-02-19_10-00-00");
-    RobotSafetyLockout lockout = new RobotSafetyLockout(0L);
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
     PackageDeployer deployer = new PackageDeployer(lockout, "pit-laptop-A");
 
     String initialSha =
@@ -431,7 +465,9 @@ public final class FluxTrayTest {
     robot.writeRemoteText(
         FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_PATH.toString(), robotFig.getEffectiveSnapshot());
 
-    MultiMicAudioRecorder audio = new MultiMicAudioRecorder();
+    lockout.updateState(true, false, 1_000L);
+    lockout.updateState(false, false, 1_500L);
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
     BatteryAndRunManager mgr = new BatteryAndRunManager(hubDir, lockout, audio);
     mgr.selectBattery("2026-B03");
     CompletedRunBundle run =
@@ -448,7 +484,6 @@ public final class FluxTrayTest {
         Files.isRegularFile(run.runDir().resolve("tuned-snapshot.txt")),
         "Post-run auto-pull safety net archived tuned-snapshot.txt");
 
-    // lock robot back to Mode.PRODUCTION
     FluxFig.ReleaseEntry release =
         deployer.promoteRemoteTuningSnapshot(
             hubConfigs, "student-alex", "Dialed Elevator kP", robot);
@@ -575,37 +610,521 @@ public final class FluxTrayTest {
     assertEquals(2, csvLines.size(), "scouting-matches.csv has header + 1 deduplicated match row");
   }
 
+  private static void testNt4WebSocketLiveLockoutAndOncePerDisableAutoPull() throws Exception {
+    AtomicLong fakeClockMs = new AtomicLong(10_000L);
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    AtomicInteger abortCallbacks = new AtomicInteger(0);
+    lockout.addAbortListener(abortCallbacks::incrementAndGet);
+
+    CountDownLatch enabledObserved = new CountDownLatch(1);
+    CountDownLatch disabledObserved = new CountDownLatch(1);
+
+    try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+      int port = server.getLocalPort();
+      Thread mockServer =
+          new Thread(
+              () -> {
+                try (Socket client = server.accept()) {
+                  performWsServerHandshake(client);
+                  OutputStream out = client.getOutputStream();
+                  String announce =
+                      "[{\"method\":\"announce\",\"params\":{\"name\":\"/FMSInfo/FMSControlData\",\"id\":7,\"type\":\"int\",\"properties\":{}}}]";
+                  sendWsFrame(out, 0x01, announce.getBytes(StandardCharsets.UTF_8));
+                  // Send Enabled + DS attached (0x21).
+                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 1_000_000L, 0x21));
+                  enabledObserved.await(3, TimeUnit.SECONDS);
+                  // Advance clock and transition to Disabled + DS attached (0x20).
+                  fakeClockMs.set(20_000L);
+                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 2_000_000L, 0x20));
+                  disabledObserved.await(3, TimeUnit.SECONDS);
+                } catch (Exception ignored) {
+                }
+              },
+              "mock-nt4-ws-server");
+      mockServer.setDaemon(true);
+      mockServer.start();
+
+      // Start an active transfer while idle -> must abort when NT4 reports Enabled.
+      lockout.beginTransferOrThrow("in-flight-scp");
+      assertEquals(1, lockout.activeTransferCount(), "Active transfer before NT4 Enable");
+
+      try (Nt4RobotStateClient ntClient =
+          new Nt4RobotStateClient(
+              List.of("127.0.0.1"),
+              port,
+              lockout,
+              (enabled, fms, word, host, ts) -> {
+                if (enabled) {
+                  enabledObserved.countDown();
+                } else if (word == 0x20) {
+                  disabledObserved.countDown();
+                }
+              },
+              fakeClockMs::get)) {
+        ntClient.start();
+        assertTrue(enabledObserved.await(5, TimeUnit.SECONDS), "NT4 client received Enabled frame");
+        assertTrue(lockout.isEnabled(), "Lockout entered Enabled from live NT4 frame");
+        assertEquals(0, lockout.activeTransferCount(), "In-flight transfer aborted on NT4 Enable");
+        assertTrue(abortCallbacks.get() >= 1, "Abort listener invoked on NT4 Enable");
+
+        assertTrue(
+            disabledObserved.await(5, TimeUnit.SECONDS), "NT4 client received Disabled frame");
+        assertTrue(!lockout.isEnabled(), "Lockout returned to Disabled");
+        assertEquals(20_000L, lockout.lastDisabledTimestampMs(), "Disabled timestamp recorded");
+
+        assertTrue(
+            !lockout.isReadyForAutoLogPull(22_000L), "Auto-pull blocked at +2.0s after Disable");
+        assertTrue(
+            lockout.isReadyForAutoLogPull(23_100L), "Auto-pull ready at +3.1s after Disable");
+        assertTrue(
+            lockout.claimAutoLogPull(23_100L), "Auto-pull claims exactly once after Disable");
+        assertTrue(
+            !lockout.claimAutoLogPull(24_000L), "Auto-pull does NOT fire a second time");
+      }
+    }
+  }
+
+  private static void testRoboRioRobotCommandAtomicDeployRestartAndRobotStateLockout()
+      throws IOException {
+    assertTrue(
+        SshRobotTransport.ROBORIO_CANDIDATE_HOSTS.containsAll(
+            List.of("10.104.13.2", "172.22.11.2", "roboRIO-10413-FRC.local")),
+        "Multi-host roboRIO discovery list matches spec");
+    assertEquals(15L, SshRobotTransport.COMMAND_TIMEOUT_SEC, "Command timeout is 15s");
+    assertEquals(300L, SshRobotTransport.TRANSFER_TIMEOUT_SEC, "Transfer timeout is 300s");
+    List<String> sshOpts = SshRobotTransport.buildSshOptions();
+    assertTrue(
+        sshOpts.stream().anyMatch(o -> o.startsWith("UserKnownHostsFile=")),
+        "SSH options include OS-safe UserKnownHostsFile");
+    assertTrue(!sshOpts.contains("-O"), "Never pass legacy -O option");
+
+    String parsedJar =
+        PackageDeployer.parseJarPathFromRobotCommand(
+            "exec /usr/local/frc/JRE/bin/java -XX:+UseSerialGC -jar /home/lvuser/Flux-RoboRIO-2027.jar\n");
+    assertEquals(
+        "Flux-RoboRIO-2027.jar", parsedJar, "Parsed exact GradleRIO JAR from robotCommand");
+
+    Path temp = createTempDir("fluxtray-roborio-deploy-");
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.setRobotStateFile(false, false, "FUEL");
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+
+    Path cfgV1 = createSampleFluxFigConfigs(temp.resolve("cfg-v1"), "Drivetrain", 60.0);
+    Files.writeString(cfgV1.resolve("marker.txt"), "DEPLOY_V1_MARKER", StandardCharsets.UTF_8);
+    Path jarV1 = temp.resolve("fuel-v1.jar");
+    Files.writeString(jarV1, "ROBORIO_STABLE_V1", StandardCharsets.UTF_8);
+    Path pkgV1 =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("STABLE_v1_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_v1", "roborio-2026", "STABLE", "aaa1111", false, "cfg11111", "boris"),
+            jarV1,
+            cfgV1);
+
+    deployer.deployPackage(pkgV1, rio, true);
+    assertEquals(
+        "ROBORIO_STABLE_V1",
+        rio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        "Deployed onto exact robotCommand JAR target Flux-RoboRIO-2027.jar");
+    assertTrue(
+        !rio.remoteFileExists("frcUserProgram.jar"),
+        "Did NOT write mismatched frcUserProgram.jar when robotCommand targets Flux-RoboRIO-2027.jar");
+    assertEquals(
+        "DEPLOY_V1_MARKER",
+        rio.readRemoteText("jars/prev_stable_deploy/marker.txt"),
+        "deploy/ tree saved inside jars/prev_stable_deploy/");
+    assertEquals("Flux-RoboRIO-2027.jar", rio.lastRestartedJar(), "Restarted exact active JAR");
+    assertEquals(1, rio.restartCount(), "Restart executed after deploy");
+
+    // Dirty EXPERIMENTAL package must NOT overwrite prev_stable even if channel mistakenly says STABLE.
+    Path cfgV2 = createSampleFluxFigConfigs(temp.resolve("cfg-v2"), "Drivetrain", 60.0);
+    Files.writeString(cfgV2.resolve("marker.txt"), "DEPLOY_V2_EXP_MARKER", StandardCharsets.UTF_8);
+    Path jarV2 = temp.resolve("fuel-v2-dirty.jar");
+    Files.writeString(jarV2, "ROBORIO_DIRTY_V2", StandardCharsets.UTF_8);
+    Path pkgDirty =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("EXP_v2_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "EXP_v2", "roborio-2026", "STABLE", "bbb2222", true, "cfg22222", "boris"),
+            jarV2,
+            cfgV2);
+    deployer.deployPackage(pkgDirty, rio, true);
+    assertEquals("ROBORIO_DIRTY_V2", rio.readRemoteText("Flux-RoboRIO-2027.jar"), "Live JAR is v2");
+    assertEquals(
+        "ROBORIO_STABLE_V1",
+        rio.readRemoteText("jars/prev_stable.jar"),
+        "Dirty package did NOT overwrite jars/prev_stable.jar");
+    assertEquals(
+        "DEPLOY_V1_MARKER",
+        rio.readRemoteText("jars/prev_stable_deploy/marker.txt"),
+        "Dirty package did NOT overwrite jars/prev_stable_deploy/");
+
+    // Restore STABLE must restore BOTH JAR and deploy/ and restart robot code.
+    deployer.restoreStable(rio);
+    assertEquals(
+        "ROBORIO_STABLE_V1",
+        rio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        "Restore STABLE restored exact robotCommand JAR");
+    assertEquals(
+        "DEPLOY_V1_MARKER",
+        rio.readRemoteText("deploy/marker.txt"),
+        "Restore STABLE restored matching deploy/ directory");
+    assertEquals(3, rio.restartCount(), "Restart executed after Restore STABLE");
+
+    // switchActiveMode with null profile must preserve detected robot identity FUEL (not COMP_2027).
+    FluxFig.ActiveProfileDirective dir =
+        deployer.switchActiveMode(null, FluxFig.Mode.TUNING, "cfg11111", rio);
+    assertEquals("FUEL", dir.profile(), "switchActiveMode resolved FUEL rather than COMP_2027");
+
+    // Robot-side /tmp/flux-robot-state ENABLED must block both deploy and log pull even if local lockout is idle.
+    rio.setRobotStateFile(true, false, "FUEL");
+    boolean blockedByStateFile = false;
+    try {
+      deployer.pushFluxFigConfigs(cfgV1, null, rio);
+    } catch (IllegalStateException expected) {
+      blockedByStateFile = expected.getMessage().contains("/tmp/flux-robot-state");
+    }
+    assertTrue(blockedByStateFile, "Robot-side /tmp/flux-robot-state ENABLED blocks mutating push");
+
+    boolean pullBlockedByStateFile = false;
+    try {
+      rio.downloadAllLogs(temp.resolve("blocked-pull"));
+    } catch (IllegalStateException expected) {
+      pullBlockedByStateFile = expected.getMessage().contains("/tmp/flux-robot-state");
+    }
+    assertTrue(pullBlockedByStateFile, "Robot-side /tmp/flux-robot-state ENABLED blocks log pull");
+  }
+
+  private static void testDriveWatcherIncrementalLedgerDsLogFilterAtomicZipAndRealWavAudio()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-drivewatcher-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsLogDir = temp.resolve("ds-logs");
+    Path ledgerFile = temp.resolve("state/synced-remote-files.json");
+    Path trayLogFile = temp.resolve("state/fluxtray.log");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsLogDir);
+
+    long nowMs = Instant.parse("2026-11-20T18:00:00Z").toEpochMilli();
+    DateTimeFormatter dsFmt = DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss", Locale.US);
+    LocalDateTime nowLdt =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(nowMs), ZoneId.systemDefault());
+    Path recentDs = dsLogDir.resolve(nowLdt.minusMinutes(1).format(dsFmt) + ".dslog");
+    Path oldDs = dsLogDir.resolve(nowLdt.minusHours(3).format(dsFmt) + ".dslog");
+    Files.writeString(recentDs, "RECENT_DSLOG", StandardCharsets.UTF_8);
+    Files.writeString(oldDs, "OLD_SEASON_DSLOG", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(recentDs, FileTime.fromMillis(nowMs - 60_000L));
+    Files.setLastModifiedTime(oldDs, FileTime.fromMillis(nowMs - 3L * 3600_000L));
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.setRobotStateFile(false, false, "FUEL");
+    rio.seedSimulatedMatchLogs("2026-11-20_17-59-30", "FUEL", "cafebabe");
+    String rawRioSnap =
+        "[PLATFORM]\ncontrollerType=ROBORIO\nhostname=roboRIO-10413-FRC\n[CPU_AND_IRQ]\ntotalCpuPct=27.5\n[STORAGE]\nfreeStorageMb=410.0\n";
+    rio.setNextSnapshotRaw(rawRioSnap);
+
+    // Real 16 kHz 16-bit mono PCM sine wave through PcmCapturePort.
+    byte[] syntheticPcm = generateSinePcm16kHz(0.25, 440.0);
+    MultiMicAudioRecorder audio =
+        new MultiMicAudioRecorder(
+            fmt -> {
+              AtomicInteger offset = new AtomicInteger(0);
+              return new MultiMicAudioRecorder.PcmCapturePort() {
+                @Override
+                public int read(byte[] buf, int off, int len) {
+                  int cur = offset.get();
+                  if (cur >= syntheticPcm.length) {
+                    return -1;
+                  }
+                  int n = Math.min(len, syntheticPcm.length - cur);
+                  System.arraycopy(syntheticPcm, cur, buf, off, n);
+                  offset.addAndGet(n);
+                  return n;
+                }
+
+                @Override
+                public void close() {}
+              };
+            });
+    audio.onRobotStateChanged(true, nowMs - 20_000L);
+    Thread.sleep(60L);
+    audio.onRobotStateChanged(false, nowMs - 5_000L);
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(temp.resolve("hub"), ledgerFile, lockout, audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    List<String> toasts = new ArrayList<>();
+    DriveWatcher watcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsLogDir,
+            rio,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> toasts.add(lvl + ":" + title + ":" + msg));
+
+    // Seed a valid STABLE roboRIO package into code/.
+    Path cfgDir = createSampleFluxFigConfigs(temp.resolve("pkg-cfg"), "Drivetrain", 60.0);
+    Path jarFile = temp.resolve("fuel.jar");
+    Files.writeString(jarFile, "FUEL_CT_PACKAGE_BYTES", StandardCharsets.UTF_8);
+    PackageDeployer.createFluxPkgZip(
+        codeDir.resolve("STABLE_v2027.2.0_roborio-2026_fluxpkg.zip"),
+        new PackageManifest(
+            "STABLE_v2027.2.0", "roborio-2026", "STABLE", "abc1234", false, "cafebabe", "boris"),
+        jarFile,
+        cfgDir);
+
+    // Poll 1: stabilizing only -> no deploy yet.
+    PollOutcome poll1 = watcher.pollOnce(nowMs);
+    assertEquals(ActionType.NONE, poll1.action(), "Poll 1 must wait for 2-poll stabilization");
+    assertEquals(0, rio.restartCount(), "No deploy/restart on poll 1");
+
+    // Poll 2: stabilized -> pulls pending logs FIRST, then deploys + restarts.
+    PollOutcome poll2 = watcher.pollOnce(nowMs + 1_000L);
+    assertEquals(ActionType.DEPLOYED_PACKAGE, poll2.action(), "Poll 2 deploys stabilized package");
+    assertTrue(
+        poll2.preDeployLogsBundle() != null && poll2.preDeployLogsBundle().zipArchive() != null,
+        "Pre-deploy log pull produced atomic ZIP");
+
+    // Verify pull happened strictly BEFORE uploadAtomic and restart in robot operation log.
+    List<String> ops = rio.operationLog();
+    int pullIdx = indexOfPrefix(ops, "downloadSelectedLogs:");
+    int uploadIdx = indexOfPrefix(ops, "uploadAtomic:Flux-RoboRIO-2027.jar");
+    int restartIdx = indexOfPrefix(ops, "restart:Flux-RoboRIO-2027.jar");
+    assertTrue(
+        pullIdx >= 0 && uploadIdx > pullIdx && restartIdx > uploadIdx,
+        "Expected downloadSelectedLogs -> uploadAtomic -> restart order, got " + ops);
+
+    // Verify logs/ contains ONLY the single atomic .zip (no raw run folder, no .part file).
+    List<Path> logsDirChildren;
+    try (Stream<Path> s = Files.list(logsDir)) {
+      logsDirChildren = s.toList();
+    }
+    assertEquals(1, logsDirChildren.size(), "Drive logs/ must contain ONLY 1 atomic .zip");
+    Path producedZip = logsDirChildren.get(0);
+    assertTrue(
+        producedZip.getFileName().toString().endsWith("_FUEL.zip")
+            && !producedZip.getFileName().toString().endsWith(".part"),
+        "Final atomic ZIP named for FUEL without .part suffix: " + producedZip.getFileName());
+
+    // Inspect ZIP contents: mentor-audio.wav (real RIFF/WAVE), audio-sync.json, raw snapshot, windowed dslog.
+    Set<String> entryNames = new TreeSet<>();
+    try (ZipFile zf = new ZipFile(producedZip.toFile())) {
+      var en = zf.entries();
+      while (en.hasMoreElements()) {
+        ZipEntry ze = en.nextElement();
+        entryNames.add(ze.getName());
+        if (ze.getName().endsWith("/" + MultiMicAudioRecorder.AUDIO_FILE_NAME)) {
+          byte[] wavBytes = zf.getInputStream(ze).readAllBytes();
+          assertTrue(wavBytes.length > 44, "mentor-audio.wav contains PCM payload beyond 44B header");
+          assertEquals("RIFF", new String(wavBytes, 0, 4, StandardCharsets.US_ASCII), "RIFF magic");
+          assertEquals("WAVE", new String(wavBytes, 8, 4, StandardCharsets.US_ASCII), "WAVE magic");
+          int sampleRate = ByteBuffer.wrap(wavBytes, 24, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+          assertEquals(16_000, sampleRate, "WAV sample rate is 16000 Hz");
+        } else if (ze.getName().endsWith("/" + MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME)) {
+          String syncText = new String(zf.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8);
+          assertTrue(
+              syncText.contains("\"enableEpochMs\": " + (nowMs - 20_000L))
+                  && syncText.contains("\"disableEpochMs\": " + (nowMs - 5_000L)),
+              "audio-sync.json contains exact enable/disable epochs: " + syncText);
+        } else if (ze.getName().endsWith("/system-snapshot.txt")) {
+          String snapText = new String(zf.getInputStream(ze).readAllBytes(), StandardCharsets.UTF_8);
+          assertEquals(
+              rawRioSnap,
+              snapText,
+              "system-snapshot.txt stores raw capture text (not default-filled serialize())");
+        }
+      }
+    }
+    assertTrue(
+        entryNames.stream().anyMatch(n -> n.endsWith("/" + recentDs.getFileName())),
+        "±4 min matching .dslog included");
+    assertTrue(
+        entryNames.stream().noneMatch(n -> n.endsWith("/" + oldDs.getFileName())),
+        "3-hour-old .dslog excluded by ±4 min window filter");
+    assertTrue(
+        entryNames.stream().noneMatch(n -> n.endsWith("driver-audio.ogg")),
+        "Retired fake text driver-audio.ogg is not written");
+
+    // Incremental ledger: calling findUnsyncedRemoteLogs again returns 0 files.
+    assertTrue(Files.isRegularFile(ledgerFile), "synced-remote-files.json persisted");
+    assertEquals(
+        0, runMgr.findUnsyncedRemoteLogs(rio).size(), "Incremental ledger skips already-synced files");
+
+    // Dropping invalid code/configs/*.csv must be rejected locally without touching the robot.
+    Path badConfigsDir = codeDir.resolve("configs");
+    createSampleFluxFigConfigs(badConfigsDir, "can_s1", 120.0);
+    int restartsBeforeBadCfg = rio.restartCount();
+    watcher.pollOnce(nowMs + 2_000L);
+    PollOutcome badCfgOutcome = watcher.pollOnce(nowMs + 3_000L);
+    assertEquals(
+        ActionType.REJECTED_INVALID_CONFIG,
+        badCfgOutcome.action(),
+        "Invalid code/configs/*.csv blocked locally by FluxFig.validateStrict()");
+    assertEquals(restartsBeforeBadCfg, rio.restartCount(), "Robot untouched on invalid config");
+
+    // Emptying code/ (.fluxpkg.zip removed) triggers Restore STABLE after 2 stabilized polls.
+    Files.delete(codeDir.resolve("STABLE_v2027.2.0_roborio-2026_fluxpkg.zip"));
+    assertEquals(ActionType.NONE, watcher.pollOnce(nowMs + 4_000L).action(), "Empty poll 1 waits");
+    PollOutcome restoreOutcome = watcher.pollOnce(nowMs + 5_000L);
+    assertEquals(
+        ActionType.RESTORED_STABLE,
+        restoreOutcome.action(),
+        "Emptying code/ restores prev_stable and restarts robot");
+    assertEquals(restartsBeforeBadCfg + 1, rio.restartCount(), "Robot restarted on empty-code restore");
+
+    // Tray icon colors & persistent fluxtray.log check.
+    BufferedImage green = FluxTrayMain.createStatusIcon(FluxTrayMain.TrayStatus.READY);
+    BufferedImage red = FluxTrayMain.createStatusIcon(FluxTrayMain.TrayStatus.ENABLED);
+    assertTrue(green.getRGB(3, 8) != red.getRGB(3, 8), "READY and ENABLED tray icons differ in color");
+    FluxTrayMain.appendTrayLog(trayLogFile, "INFO", "Smoke test log entry");
+    assertTrue(
+        Files.readString(trayLogFile, StandardCharsets.UTF_8).contains("Smoke test log entry"),
+        "Persistent fluxtray.log written");
+    assertTrue(!toasts.isEmpty(), "Toast notifications emitted");
+  }
+
+  private static byte[] generateSinePcm16kHz(double seconds, double freqHz) {
+    int samples = (int) Math.round(seconds * MultiMicAudioRecorder.SAMPLE_RATE_HZ);
+    ByteBuffer buf = ByteBuffer.allocate(samples * 2).order(ByteOrder.LITTLE_ENDIAN);
+    for (int i = 0; i < samples; i++) {
+      short s =
+          (short)
+              Math.round(
+                  12_000.0 * Math.sin(2.0 * Math.PI * freqHz * i / MultiMicAudioRecorder.SAMPLE_RATE_HZ));
+      buf.putShort(s);
+    }
+    return buf.array();
+  }
+
+  private static int indexOfPrefix(List<String> list, String prefix) {
+    for (int i = 0; i < list.size(); i++) {
+      if (list.get(i).startsWith(prefix)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private static void performWsServerHandshake(Socket client) throws Exception {
+    BufferedReader reader =
+        new BufferedReader(new InputStreamReader(client.getInputStream(), StandardCharsets.US_ASCII));
+    String key = "";
+    String protocol = "v4.1.networktables.first.wpi.edu";
+    String line;
+    while ((line = reader.readLine()) != null && !line.isEmpty()) {
+      if (line.toLowerCase(Locale.ROOT).startsWith("sec-websocket-key:")) {
+        key = line.substring(line.indexOf(':') + 1).trim();
+      } else if (line.toLowerCase(Locale.ROOT).startsWith("sec-websocket-protocol:")) {
+        protocol = line.substring(line.indexOf(':') + 1).split(",")[0].trim();
+      }
+    }
+    String acceptSeed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    byte[] sha1 = MessageDigest.getInstance("SHA-1").digest(acceptSeed.getBytes(StandardCharsets.US_ASCII));
+    String accept = Base64.getEncoder().encodeToString(sha1);
+    String response =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Accept: "
+            + accept
+            + "\r\n"
+            + "Sec-WebSocket-Protocol: "
+            + protocol
+            + "\r\n\r\n";
+    OutputStream out = client.getOutputStream();
+    out.write(response.getBytes(StandardCharsets.US_ASCII));
+    out.flush();
+  }
+
+  private static void sendWsFrame(OutputStream out, int opcode, byte[] payload) throws IOException {
+    ByteArrayOutputStream frame = new ByteArrayOutputStream();
+    frame.write(0x80 | (opcode & 0x0F));
+    if (payload.length < 126) {
+      frame.write(payload.length);
+    } else {
+      frame.write(126);
+      frame.write((payload.length >> 8) & 0xFF);
+      frame.write(payload.length & 0xFF);
+    }
+    frame.write(payload);
+    out.write(frame.toByteArray());
+    out.flush();
+  }
+
+  private static byte[] encodeNt4IntFrame(int topicId, long timestampUs, int intVal) {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    out.write(0x94); // 4-element fixarray: [topicId, timestampUs, typeId(1=int), value]
+    out.write(topicId & 0x7F);
+    out.write(0xCF); // uint64 timestamp
+    for (int shift = 56; shift >= 0; shift -= 8) {
+      out.write((int) ((timestampUs >>> shift) & 0xFF));
+    }
+    out.write(1); // NT4 int type ID
+    out.write(intVal & 0x7F);
+    return out.toByteArray();
+  }
+
   private static Path createSampleFluxFigConfigs(
       Path dir, String swerveBus, double statorLimitAmps) throws IOException {
     Files.createDirectories(dir);
+    boolean isRoboRio = !"can_s0".equals(swerveBus) && !"can_s1".equals(swerveBus);
+    String ctrl = isRoboRio ? "ROBORIO_CANIVORE_2026" : "SYSTEMCORE_2027";
+    String mechBus = isRoboRio ? "Mech" : "can_s2";
+    String robotProfile = isRoboRio ? "FUEL" : "COMP_2027";
     Files.writeString(
         dir.resolve("parameters.csv"),
-        "Key,DEFAULT,COMP_2027\n"
-            + "controllerProfile,SYSTEMCORE_2027,SYSTEMCORE_2027\n"
+        "Key,DEFAULT,"
+            + robotProfile
+            + "\n"
+            + "controllerProfile,"
+            + ctrl
+            + ","
+            + ctrl
+            + "\n"
             + "swerveCanBus,"
             + swerveBus
             + ","
             + swerveBus
             + "\n"
-            + "mechCanBus,can_s2,can_s2\n"
-            + "loopPeriodMs,5.0,5.0\n",
+            + "mechCanBus,"
+            + mechBus
+            + ","
+            + mechBus
+            + "\n"
+            + "loopPeriodMs,"
+            + (isRoboRio ? "20.0,20.0" : "5.0,5.0")
+            + "\n",
         StandardCharsets.UTF_8);
     Files.writeString(
         dir.resolve("mechanisms.csv"),
         "robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio\n"
-            + "COMP_2027,Elevator,10,can_s2,"
+            + robotProfile
+            + ",Elevator,10,"
+            + mechBus
+            + ","
             + statorLimitAmps
             + ",40.0,60.0,Elevator_Static,2.4,0.0,0.1,0.18,0.12,0.01,0.35,0.0,48.0,11,false,false,1.0\n",
         StandardCharsets.UTF_8);
     Files.writeString(
         dir.resolve("cameras.csv"),
         "robot,cameraName,portIndex,xMeters,yMeters,zMeters,rollDeg,pitchDeg,yawDeg,stdDevScalar\n"
-            + "COMP_2027,limelightsc0,0,0.28,0.25,0.52,0.0,15.0,0.0,1.0\n",
+            + robotProfile
+            + ",limelightsc0,0,0.28,0.25,0.52,0.0,15.0,0.0,1.0\n",
         StandardCharsets.UTF_8);
     Files.writeString(
         dir.resolve("range_table.csv"),
         "distanceMeters,shooterRps,hoodRotations,timeOfFlightSec\n"
-            + "2.0,45.0,0.15,0.32\n",
+            + "2.0,35.0,0.15,0.32\n",
         StandardCharsets.UTF_8);
     Files.writeString(
         dir.resolve("batteries.csv"),

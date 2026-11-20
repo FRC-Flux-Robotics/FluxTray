@@ -13,9 +13,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li><b>Immediate Enabled / FMS Transfer Lockout:</b> Blocks and immediately aborts any SFTP
  *       package deploy, {@code FluxFig} CSV hot-reload, rollback, or log pull the millisecond the
  *       robot becomes {@code Enabled} or connects to {@code FMS}.
- *   <li><b>3-Second Post-Disable Stabilization Guard:</b> Requires the robot to be continuously
- *       {@code Disabled} for at least {@code 3,000 ms} before auto-pulling closed {@code .wpilog},
- *       {@code .hoot}, and {@code system-snapshot.txt} files over direct robot Wi-Fi.
+ *   <li><b>Observed {@code Enabled -> Disabled} 3-Second Guard:</b> Initializes {@code
+ *       lastDisabledTimestampMs = -1L} so automatic pulls trigger strictly once per observed {@code
+ *       Enabled -> Disabled} transition after {@code >= 3,000 ms} continuously Disabled.
  * </ol>
  */
 public final class RobotSafetyLockout {
@@ -24,17 +24,22 @@ public final class RobotSafetyLockout {
 
   private final AtomicBoolean enabled = new AtomicBoolean(false);
   private final AtomicBoolean fmsAttached = new AtomicBoolean(false);
-  private final AtomicLong lastDisabledTimestampMs = new AtomicLong(0L);
+  private final AtomicLong lastDisabledTimestampMs = new AtomicLong(-1L);
+  private final AtomicBoolean autoPullClaimedForCurrentDisable = new AtomicBoolean(false);
   private final AtomicInteger activeTransfers = new AtomicInteger(0);
   private final AtomicInteger abortedTransferCount = new AtomicInteger(0);
   private final List<Runnable> abortListeners = new CopyOnWriteArrayList<>();
 
   public RobotSafetyLockout() {
-    this(System.currentTimeMillis());
+    this(-1L);
   }
 
-  public RobotSafetyLockout(long initialTimestampMs) {
-    this.lastDisabledTimestampMs.set(initialTimestampMs);
+  /**
+   * Constructs a lockout tracker initialized to {@code lastDisabledTimestampMs = -1L} so an idle
+   * robot never triggers spurious auto-pulls before an observed {@code Enabled -> Disabled} cycle.
+   */
+  public RobotSafetyLockout(long ignoredInitialTimestampMs) {
+    this.lastDisabledTimestampMs.set(-1L);
   }
 
   /** Updates robot state and immediately aborts any in-flight transfers if Enabled or on FMS. */
@@ -42,8 +47,12 @@ public final class RobotSafetyLockout {
       boolean isEnabled, boolean isFmsAttached, long currentTimestampMs) {
     boolean wasEnabled = this.enabled.getAndSet(isEnabled);
     this.fmsAttached.set(isFmsAttached);
-    if (!isEnabled && wasEnabled) {
+    if (isEnabled) {
+      this.lastDisabledTimestampMs.set(-1L);
+      this.autoPullClaimedForCurrentDisable.set(false);
+    } else if (wasEnabled) {
       this.lastDisabledTimestampMs.set(currentTimestampMs);
+      this.autoPullClaimedForCurrentDisable.set(false);
     }
     if (isEnabled || isFmsAttached) {
       abortAllInFlightTransfers();
@@ -77,14 +86,38 @@ public final class RobotSafetyLockout {
   }
 
   /**
-   * Returns {@code true} only when the robot is Disabled, not on FMS, and has been Disabled for at
-   * least {@code 3.0 seconds} so {@code WPILOGWriter} and CTRE {@code SignalLogger} have flushed.
+   * Returns {@code true} when an {@code Enabled -> Disabled} transition has been observed, the
+   * robot is not Enabled or on FMS, and at least {@code 3.0 seconds} have elapsed since disable.
    */
-  public boolean isReadyForAutoLogPull(long nowMs) {
+  public boolean isDisabledStabilizedForAutoPull(long nowMs) {
     if (enabled.get() || fmsAttached.get()) {
       return false;
     }
-    return (nowMs - lastDisabledTimestampMs.get()) >= MIN_DISABLE_DURATION_MS_FOR_LOG_PULL;
+    long disabledAt = lastDisabledTimestampMs.get();
+    if (disabledAt < 0L) {
+      return false;
+    }
+    return (nowMs - disabledAt) >= MIN_DISABLE_DURATION_MS_FOR_LOG_PULL;
+  }
+
+  /**
+   * Returns {@code true} only when an unclaimed {@code Enabled -> Disabled} transition has
+   * stabilized for {@code >= 3.0 seconds} off-FMS.
+   */
+  public boolean isReadyForAutoLogPull(long nowMs) {
+    return !autoPullClaimedForCurrentDisable.get() && isDisabledStabilizedForAutoPull(nowMs);
+  }
+
+  /**
+   * Atomically claims the automatic post-disable log pull so it fires at most once per {@code
+   * Enabled -> Disabled} transition.
+   */
+  public synchronized boolean claimAutoLogPull(long nowMs) {
+    if (!isReadyForAutoLogPull(nowMs)) {
+      return false;
+    }
+    autoPullClaimedForCurrentDisable.set(true);
+    return true;
   }
 
   public void addAbortListener(Runnable listener) {
@@ -107,6 +140,10 @@ public final class RobotSafetyLockout {
 
   public boolean isFmsAttached() {
     return fmsAttached.get();
+  }
+
+  public long lastDisabledTimestampMs() {
+    return lastDisabledTimestampMs.get();
   }
 
   public int activeTransferCount() {
