@@ -18,6 +18,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
@@ -31,6 +32,9 @@ import java.util.regex.Pattern;
 public final class Nt4RobotStateClient implements Closeable {
 
   public static final int DEFAULT_NT4_PORT = 5810;
+  public static final long DEFAULT_PING_INTERVAL_MS = 2_000L;
+  public static final long DEFAULT_IDLE_TIMEOUT_MS = 5_000L;
+  public static final long DEFAULT_RECONNECT_BACKOFF_MS = 1_000L;
   public static final String FMS_CONTROL_DATA_TOPIC = "/FMSInfo/FMSControlData";
   public static final int FMS_CONTROL_ENABLED_BIT = 0x01;
   public static final int FMS_CONTROL_AUTONOMOUS_BIT = 0x02;
@@ -57,6 +61,9 @@ public final class Nt4RobotStateClient implements Closeable {
   private final RobotSafetyLockout lockout;
   private final RobotStateListener listener;
   private final LongSupplier clockMs;
+  private final long pingIntervalMs;
+  private final long idleTimeoutMs;
+  private final long reconnectBackoffMs;
   private final HttpClient httpClient;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicBoolean connected = new AtomicBoolean(false);
@@ -64,6 +71,7 @@ public final class Nt4RobotStateClient implements Closeable {
   private final AtomicInteger lastControlWord = new AtomicInteger(-1);
   private final AtomicReference<WebSocket> activeSocket = new AtomicReference<>(null);
   private final AtomicInteger fmsControlTopicId = new AtomicInteger(-1);
+  private final AtomicLong lastActivityNano = new AtomicLong(0L);
   private final Map<Integer, String> announcedTopics = new ConcurrentHashMap<>();
   private volatile Thread workerThread;
   private volatile Runnable onConnectionChange;
@@ -82,6 +90,26 @@ public final class Nt4RobotStateClient implements Closeable {
       RobotSafetyLockout lockout,
       RobotStateListener listener,
       LongSupplier clockMs) {
+    this(
+        candidateHosts,
+        port,
+        lockout,
+        listener,
+        clockMs,
+        DEFAULT_PING_INTERVAL_MS,
+        DEFAULT_IDLE_TIMEOUT_MS,
+        DEFAULT_RECONNECT_BACKOFF_MS);
+  }
+
+  public Nt4RobotStateClient(
+      List<String> candidateHosts,
+      int port,
+      RobotSafetyLockout lockout,
+      RobotStateListener listener,
+      LongSupplier clockMs,
+      long pingIntervalMs,
+      long idleTimeoutMs,
+      long reconnectBackoffMs) {
     this.candidateHosts =
         (candidateHosts == null || candidateHosts.isEmpty())
             ? SshRobotTransport.ROBORIO_CANDIDATE_HOSTS
@@ -90,6 +118,9 @@ public final class Nt4RobotStateClient implements Closeable {
     this.lockout = lockout;
     this.listener = listener;
     this.clockMs = clockMs != null ? clockMs : System::currentTimeMillis;
+    this.pingIntervalMs = Math.max(50L, pingIntervalMs);
+    this.idleTimeoutMs = Math.max(this.pingIntervalMs + 50L, idleTimeoutMs);
+    this.reconnectBackoffMs = Math.max(25L, reconnectBackoffMs);
     this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
   }
 
@@ -168,8 +199,28 @@ public final class Nt4RobotStateClient implements Closeable {
                 + "\"],\"subuid\":1,\"options\":{\"periodic\":0.05,\"all\":false,\"topicsonly\":false,\"prefix\":false}}}]";
         ws.sendText(subscribeJson, true).get(2, TimeUnit.SECONDS);
 
-        while (running.get() && !closedLatch.await(500, TimeUnit.MILLISECONDS)) {
-          // Stay attached until remote closes or client shuts down.
+        long lastPingNano = System.nanoTime();
+        lastActivityNano.set(lastPingNano);
+        long pollSliceMs = Math.max(25L, Math.min(250L, pingIntervalMs / 2L));
+        long pingSendTimeoutMs = Math.min(2_000L, Math.max(250L, idleTimeoutMs));
+        while (running.get() && !closedLatch.await(pollSliceMs, TimeUnit.MILLISECONDS)) {
+          long nowNano = System.nanoTime();
+          long idleMs = TimeUnit.NANOSECONDS.toMillis(nowNano - lastActivityNano.get());
+          if (idleMs > idleTimeoutMs) {
+            ws.abort();
+            break;
+          }
+          long sincePingMs = TimeUnit.NANOSECONDS.toMillis(nowNano - lastPingNano);
+          if (sincePingMs >= pingIntervalMs) {
+            lastPingNano = nowNano;
+            ByteBuffer pingPayload = ByteBuffer.allocate(8).putLong(nowNano).flip();
+            try {
+              ws.sendPing(pingPayload).get(pingSendTimeoutMs, TimeUnit.MILLISECONDS);
+            } catch (Exception pingEx) {
+              ws.abort();
+              break;
+            }
+          }
         }
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
@@ -190,7 +241,7 @@ public final class Nt4RobotStateClient implements Closeable {
 
       if (running.get()) {
         try {
-          Thread.sleep(1_000L);
+          Thread.sleep(reconnectBackoffMs);
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
           break;
@@ -222,11 +273,13 @@ public final class Nt4RobotStateClient implements Closeable {
 
     @Override
     public void onOpen(WebSocket webSocket) {
+      lastActivityNano.set(System.nanoTime());
       webSocket.request(1);
     }
 
     @Override
     public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+      lastActivityNano.set(System.nanoTime());
       textBuffer.append(data);
       if (last) {
         String msg = textBuffer.toString();
@@ -239,6 +292,7 @@ public final class Nt4RobotStateClient implements Closeable {
 
     @Override
     public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
+      lastActivityNano.set(System.nanoTime());
       byte[] chunk = new byte[data.remaining()];
       data.get(chunk);
       binaryBuffer.write(chunk, 0, chunk.length);
@@ -249,6 +303,18 @@ public final class Nt4RobotStateClient implements Closeable {
       }
       webSocket.request(1);
       return CompletableFuture.completedFuture(null);
+    }
+
+    @Override
+    public CompletionStage<?> onPing(WebSocket webSocket, ByteBuffer message) {
+      lastActivityNano.set(System.nanoTime());
+      return WebSocket.Listener.super.onPing(webSocket, message);
+    }
+
+    @Override
+    public CompletionStage<?> onPong(WebSocket webSocket, ByteBuffer message) {
+      lastActivityNano.set(System.nanoTime());
+      return WebSocket.Listener.super.onPong(webSocket, message);
     }
 
     @Override
@@ -296,12 +362,19 @@ public final class Nt4RobotStateClient implements Closeable {
     }
   }
 
-  private void handleBinaryMessage(byte[] payload, String host) {
+  void handleBinaryMessage(byte[] payload, String host) {
     int targetId = fmsControlTopicId.get();
     if (targetId < 0) {
       return;
     }
-    for (Nt4Frame frame : decodeMsgPackFrames(payload)) {
+    List<Nt4Frame> frames;
+    try {
+      frames = decodeMsgPackFrames(payload);
+    } catch (IllegalArgumentException truncatedOrMalformed) {
+      // Fail closed: discard truncated/corrupt MsgPack packets so EOF never flips ENABLED to DISABLED.
+      return;
+    }
+    for (Nt4Frame frame : frames) {
       if (frame.topicId() == targetId && frame.value() instanceof Number n) {
         int controlWord = n.intValue();
         lastControlWord.set(controlWord);
@@ -392,7 +465,7 @@ public final class Nt4RobotStateClient implements Closeable {
 
     Object readValue() {
       if (pos >= buf.length) {
-        return null;
+        throw new IllegalArgumentException("Unexpected EOF reading NT4 MsgPack value");
       }
       int b = buf[pos++] & 0xFF;
       if (b <= 0x7F) {
@@ -417,7 +490,7 @@ public final class Nt4RobotStateClient implements Closeable {
         case 0xC3 -> Boolean.TRUE;
         case 0xC4 -> readBytes(readU8());
         case 0xC5 -> readBytes(readU16());
-        case 0xC6 -> readBytes((int) readU32());
+        case 0xC6 -> readBytes(readLen32());
         case 0xC7 -> {
           int len = readU8();
           skip(1 + len);
@@ -429,7 +502,7 @@ public final class Nt4RobotStateClient implements Closeable {
           yield null;
         }
         case 0xC9 -> {
-          int len = (int) readU32();
+          int len = readLen32();
           skip(1 + len);
           yield null;
         }
@@ -465,32 +538,40 @@ public final class Nt4RobotStateClient implements Closeable {
         }
         case 0xD9 -> readString(readU8());
         case 0xDA -> readString(readU16());
-        case 0xDB -> readString((int) readU32());
+        case 0xDB -> readString(readLen32());
         case 0xDC -> readArray(readU16());
-        case 0xDD -> readArray((int) readU32());
+        case 0xDD -> readArray(readLen32());
         case 0xDE -> {
           skipMap(readU16());
           yield null;
         }
         case 0xDF -> {
-          skipMap((int) readU32());
+          skipMap(readLen32());
           yield null;
         }
-        default -> null;
+        default ->
+            throw new IllegalArgumentException(
+                "Unsupported NT4 MsgPack format byte: 0x" + Integer.toHexString(b));
       };
     }
 
     private List<Object> readArray(int len) {
-      int safeLen = Math.max(0, Math.min(len, buf.length - pos));
-      List<Object> list = new ArrayList<>(safeLen);
-      for (int i = 0; i < len && pos < buf.length; i++) {
+      if (len < 0) {
+        throw new IllegalArgumentException("Negative MsgPack array length: " + len);
+      }
+      int safeCapacity = Math.min(len, buf.length - pos);
+      List<Object> list = new ArrayList<>(safeCapacity);
+      for (int i = 0; i < len; i++) {
         list.add(readValue());
       }
       return list;
     }
 
     private void skipMap(int pairs) {
-      for (int i = 0; i < pairs && pos < buf.length; i++) {
+      if (pairs < 0) {
+        throw new IllegalArgumentException("Negative MsgPack map length: " + pairs);
+      }
+      for (int i = 0; i < pairs; i++) {
         readValue();
         readValue();
       }
@@ -502,19 +583,37 @@ public final class Nt4RobotStateClient implements Closeable {
     }
 
     private byte[] readBytes(int len) {
-      int actual = Math.max(0, Math.min(len, buf.length - pos));
-      byte[] out = new byte[actual];
-      System.arraycopy(buf, pos, out, 0, actual);
-      pos += actual;
+      if (len < 0 || len > buf.length - pos) {
+        throw new IllegalArgumentException(
+            "Unexpected EOF reading " + len + " MsgPack bytes (remaining=" + (buf.length - pos) + ")");
+      }
+      byte[] out = new byte[len];
+      System.arraycopy(buf, pos, out, 0, len);
+      pos += len;
       return out;
     }
 
     private void skip(int len) {
-      pos = Math.min(buf.length, pos + Math.max(0, len));
+      if (len < 0 || len > buf.length - pos) {
+        throw new IllegalArgumentException(
+            "Unexpected EOF skipping " + len + " MsgPack bytes (remaining=" + (buf.length - pos) + ")");
+      }
+      pos += len;
+    }
+
+    private int readLen32() {
+      long raw = readU32();
+      if (raw > Integer.MAX_VALUE) {
+        throw new IllegalArgumentException("MsgPack length overflow: " + raw);
+      }
+      return (int) raw;
     }
 
     private int readU8() {
-      return pos < buf.length ? (buf[pos++] & 0xFF) : 0;
+      if (pos >= buf.length) {
+        throw new IllegalArgumentException("Unexpected EOF in MsgPackCursor.readU8()");
+      }
+      return buf[pos++] & 0xFF;
     }
 
     private int readU16() {

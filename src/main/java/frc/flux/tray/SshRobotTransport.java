@@ -1,13 +1,17 @@
 package frc.flux.tray;
 
 import frc.lib.fluxfig.FluxSystemSnapshot;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -20,9 +24,10 @@ import java.util.stream.Stream;
 /**
  * Live SSH/SCP transport supporting multi-host roboRIO 2.0 ({@code lvuser@}, {@code /home/lvuser})
  * and SystemCore ({@code systemcore@}, {@code /home/systemcore}) with split command ({@code 15 s})
- * vs. transfer ({@code 300 s}) timeouts, platform-safe {@code UserKnownHostsFile}, SFTP-mode {@code
- * scp}, robot-side {@code /tmp/flux-robot-state} lockout enforcement, atomic staging, and JVM
- * restart.
+ * vs. transfer ({@code 300 s}) timeouts, platform-safe {@code UserKnownHostsFile}, pure-Java USTAR
+ * tar-over-SSH {@code deploy/} streaming, POSIX-quoted remote paths, canonicalized USB log root
+ * discovery, fail-closed {@code /tmp/flux-robot-state} staleness verification, and atomic inlined
+ * SSH lockout guards right before every swap and JVM restart.
  */
 public final class SshRobotTransport implements RobotTransport {
 
@@ -34,7 +39,22 @@ public final class SshRobotTransport implements RobotTransport {
 
   public static final long COMMAND_TIMEOUT_SEC = 15L;
   public static final long TRANSFER_TIMEOUT_SEC = 300L;
+  public static final long HEARTBEAT_MAX_AGE_MS = 5_000L;
+  public static final long HEARTBEAT_MAX_AGE_SEC = 5L;
+  public static final int LOCKOUT_EXIT_CODE = 42;
   private static final int TCP_PROBE_TIMEOUT_MS = 1_200;
+  private static final int TAR_BLOCK_SIZE = 512;
+
+  /** Captured result of one local {@code ssh}/{@code scp} subprocess invocation. */
+  public record ProcessResult(int exitCode, String stdout, String stderr) {}
+
+  /** Port executing {@code ssh}/{@code scp} commands (backed by {@link ProcessBuilder} by default). */
+  @FunctionalInterface
+  public interface ProcessRunner {
+    ProcessResult run(List<String> argv, byte[] stdin, Duration timeout) throws IOException;
+  }
+
+  private record HeartbeatSample(boolean present, long remoteEpochSec, RobotStateHeartbeat heartbeat) {}
 
   private final List<String> candidateHosts;
   private volatile String activeHost;
@@ -43,6 +63,8 @@ public final class SshRobotTransport implements RobotTransport {
   private final String platform;
   private final boolean isSystemCore;
   private final RobotSafetyLockout lockout;
+  private final boolean allowMissingHeartbeat;
+  private final ProcessRunner processRunner;
   private final Set<Process> activeProcesses = ConcurrentHashMap.newKeySet();
   private final Set<String> createdRemoteDirs = ConcurrentHashMap.newKeySet();
 
@@ -56,11 +78,30 @@ public final class SshRobotTransport implements RobotTransport {
             ? List.of(host.trim())
             : (isSystemCore ? SYSTEMCORE_CANDIDATE_HOSTS : ROBORIO_CANDIDATE_HOSTS),
         isSystemCore,
-        lockout);
+        lockout,
+        false,
+        null);
   }
 
   public SshRobotTransport(
       List<String> candidateHosts, boolean isSystemCore, RobotSafetyLockout lockout) {
+    this(candidateHosts, isSystemCore, lockout, false, null);
+  }
+
+  public SshRobotTransport(
+      List<String> candidateHosts,
+      boolean isSystemCore,
+      RobotSafetyLockout lockout,
+      boolean allowMissingHeartbeat) {
+    this(candidateHosts, isSystemCore, lockout, allowMissingHeartbeat, null);
+  }
+
+  public SshRobotTransport(
+      List<String> candidateHosts,
+      boolean isSystemCore,
+      RobotSafetyLockout lockout,
+      boolean allowMissingHeartbeat,
+      ProcessRunner processRunner) {
     List<String> resolved =
         (candidateHosts == null || candidateHosts.isEmpty())
             ? (isSystemCore ? SYSTEMCORE_CANDIDATE_HOSTS : ROBORIO_CANDIDATE_HOSTS)
@@ -72,6 +113,8 @@ public final class SshRobotTransport implements RobotTransport {
     this.remoteHomeDir = isSystemCore ? "/home/systemcore" : "/home/lvuser";
     this.platform = isSystemCore ? "systemcore-2027" : "roborio-2026";
     this.lockout = lockout;
+    this.allowMissingHeartbeat = allowMissingHeartbeat;
+    this.processRunner = processRunner != null ? processRunner : this::runLocalProcess;
     if (lockout != null) {
       lockout.addAbortListener(this::abortActiveProcesses);
     }
@@ -87,6 +130,10 @@ public final class SshRobotTransport implements RobotTransport {
 
   public String activeHost() {
     return activeHost;
+  }
+
+  public boolean isAllowMissingHeartbeat() {
+    return allowMissingHeartbeat;
   }
 
   /** Returns OS-appropriate null known-hosts sink ({@code NUL} on Windows, {@code /dev/null} on POSIX). */
@@ -176,7 +223,7 @@ public final class SshRobotTransport implements RobotTransport {
           continue;
         }
         try {
-          String out = runSshCommandOnHost(candidate, "echo OK");
+          String out = runSshCommandOnHost(candidate, "echo OK", null, COMMAND_TIMEOUT_SEC);
           if (out.contains("OK")) {
             createdRemoteDirs.clear();
             activeHost = candidate;
@@ -190,12 +237,59 @@ public final class SshRobotTransport implements RobotTransport {
   }
 
   @Override
+  public RobotStateHeartbeat readRobotStateHeartbeat() throws IOException {
+    return readRobotStateHeartbeatWithClock().heartbeat();
+  }
+
+  private HeartbeatSample readRobotStateHeartbeatWithClock() throws IOException {
+    String cmd =
+        "printf 'REMOTE_EPOCH_SEC=%s\\n' \"$(date +%s)\" && "
+            + "if [ -f '/tmp/flux-robot-state' ]; then printf 'HEARTBEAT_PRESENT=1\\n'; cat '/tmp/flux-robot-state'; "
+            + "else printf 'HEARTBEAT_PRESENT=0\\n'; fi";
+    String out = runSshCommand(cmd);
+    long remoteEpochSec = -1L;
+    boolean present = false;
+    StringBuilder body = new StringBuilder();
+    for (String line : out.split("\\R")) {
+      if (line.startsWith("REMOTE_EPOCH_SEC=")) {
+        remoteEpochSec = parseLongSafe(line.substring("REMOTE_EPOCH_SEC=".length()), -1L);
+      } else if (line.startsWith("HEARTBEAT_PRESENT=")) {
+        present = "1".equals(line.substring("HEARTBEAT_PRESENT=".length()).trim());
+      } else {
+        body.append(line).append('\n');
+      }
+    }
+    if (!present) {
+      return new HeartbeatSample(false, remoteEpochSec, RobotStateHeartbeat.absent());
+    }
+    RobotStateHeartbeat hb = RobotStateHeartbeat.parse(body.toString());
+    if (!hb.present()) {
+      // File existed on disk but was empty or whitespace-only; treat as present-but-corrupt.
+      hb = new RobotStateHeartbeat(true, false, "CORRUPT", false, false, 0L, "", 0L);
+    }
+    return new HeartbeatSample(true, remoteEpochSec, hb);
+  }
+
+  @Override
   public void assertRobotDisabledForTransfer(String operationName) throws IOException {
     if (lockout != null) {
       lockout.assertSafeForTransfer(operationName);
     }
-    RobotStateHeartbeat hb = readRobotStateHeartbeat();
-    if (hb.present() && (hb.enabled() || hb.fmsAttached())) {
+    HeartbeatSample sample = readRobotStateHeartbeatWithClock();
+    if (!sample.present()) {
+      if (allowMissingHeartbeat) {
+        return;
+      }
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is ABSENT (fail-closed; pass --allow-missing-heartbeat only for initial bootstrap); blocked "
+              + operationName);
+    }
+    RobotStateHeartbeat hb = sample.heartbeat();
+    if (!hb.valid()) {
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is CORRUPT; blocked " + operationName);
+    }
+    if (hb.enabled() || hb.fmsAttached()) {
       if (lockout != null) {
         lockout.updateState(hb.enabled(), hb.fmsAttached(), System.currentTimeMillis());
       }
@@ -203,6 +297,61 @@ public final class SshRobotTransport implements RobotTransport {
       throw new IllegalStateException(
           "LOCKOUT [/tmp/flux-robot-state]: Robot is " + reason + "; blocked " + operationName);
     }
+    if (sample.remoteEpochSec() <= 0L) {
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Unable to read remote clock for staleness check; blocked "
+              + operationName);
+    }
+    long remoteNowMs = sample.remoteEpochSec() * 1_000L;
+    if (hb.isStale(remoteNowMs, HEARTBEAT_MAX_AGE_MS)) {
+      long ageMs = remoteNowMs - hb.epochMs();
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat is STALE (age="
+              + ageMs
+              + " ms, max="
+              + HEARTBEAT_MAX_AGE_MS
+              + " ms); blocked "
+              + operationName);
+    }
+  }
+
+  /**
+   * Builds a pure POSIX/BusyBox shell guard checking {@code /tmp/flux-robot-state} atomically
+   * inside the same SSH command immediately before a mutating {@code mv} or robot JVM restart.
+   */
+  String buildInlineHeartbeatGuard() {
+    String verifyBody =
+        "_st=''; _en=''; _fm=''; _ep=''; "
+            + "while IFS='=' read -r _k _v || [ -n \"$_k\" ]; do "
+            + "case \"$_k\" in "
+            + "STATE) _st=\"$_v\";; "
+            + "ENABLED) _en=\"$_v\";; "
+            + "FMS) _fm=\"$_v\";; "
+            + "EPOCH_MS) _ep=\"$_v\";; "
+            + "esac; done < /tmp/flux-robot-state; "
+            + "[ \"$_st\" = 'DISABLED' ] && [ \"$_en\" = 'false' ] && [ \"$_fm\" = 'false' ] "
+            + "|| { echo \"LOCKOUT: state=$_st enabled=$_en fms=$_fm\" >&2; exit "
+            + LOCKOUT_EXIT_CODE
+            + "; }; "
+            + "case \"$_ep\" in ''|*[!0-9]*) echo 'LOCKOUT: corrupt EPOCH_MS' >&2; exit "
+            + LOCKOUT_EXIT_CODE
+            + ";; esac; "
+            + "_now=$(date +%s); _hb=$((_ep / 1000)); _age=$((_now - _hb)); "
+            + "[ \"$_age\" -le "
+            + HEARTBEAT_MAX_AGE_SEC
+            + " ] && [ \"$_age\" -ge -"
+            + HEARTBEAT_MAX_AGE_SEC
+            + " ] || { echo \"LOCKOUT: stale heartbeat age=${_age}s\" >&2; exit "
+            + LOCKOUT_EXIT_CODE
+            + "; }";
+    if (allowMissingHeartbeat) {
+      return "( if [ -f /tmp/flux-robot-state ]; then " + verifyBody + "; fi )";
+    }
+    return "( [ -f /tmp/flux-robot-state ] || { echo 'LOCKOUT: /tmp/flux-robot-state absent' >&2; exit "
+        + LOCKOUT_EXIT_CODE
+        + "; }; "
+        + verifyBody
+        + " )";
   }
 
   @Override
@@ -240,7 +389,7 @@ public final class SshRobotTransport implements RobotTransport {
     ensureRemoteParentDir(full);
     runScpUpload(localFile, staged);
     assertRobotDisabledForTransfer("commitAtomic:" + remoteRelativePath);
-    runSshCommand("mv -f " + shQuote(staged) + " " + shQuote(full));
+    runSshCommand(buildInlineHeartbeatGuard() + " && mv -f " + shQuote(staged) + " " + shQuote(full));
   }
 
   @Override
@@ -250,21 +399,27 @@ public final class SshRobotTransport implements RobotTransport {
     String target = resolveRemote(remoteRelativeDir);
     String staged = target + ".fluxtray.tmp";
     String backupOld = target + ".fluxtray.old";
-    runSshCommand("rm -rf " + shQuote(staged) + " && mkdir -p " + shQuote(staged));
-    if (Files.isDirectory(localDir)) {
-      try (Stream<Path> walk = Files.walk(localDir)) {
-        for (Path file : walk.filter(Files::isRegularFile).sorted().toList()) {
-          String rel = localDir.relativize(file).toString().replace('\\', '/');
-          String remoteFile = staged + "/" + rel;
-          ensureRemoteParentDir(remoteFile);
-          assertRobotDisabledForTransfer("stageDeployFile:" + rel);
-          runScpUpload(file, remoteFile);
-        }
-      }
+
+    // Stream the entire directory as one POSIX/USTAR tar over SSH stdin so filenames with spaces
+    // never touch Windows OpenSSH scp argument splitting.
+    byte[] tarBytes = buildUstarTarArchive(localDir);
+    if (tarBytes.length > 0) {
+      runSshTransferCommand(
+          "rm -rf "
+              + shQuote(staged)
+              + " && mkdir -p "
+              + shQuote(staged)
+              + " && tar -xf - -C "
+              + shQuote(staged),
+          tarBytes);
+    } else {
+      runSshCommand("rm -rf " + shQuote(staged) + " && mkdir -p " + shQuote(staged));
     }
+
     assertRobotDisabledForTransfer("swapRemoteDirectory:" + remoteRelativeDir);
     runSshCommand(
-        "rm -rf "
+        buildInlineHeartbeatGuard()
+            + " && rm -rf "
             + shQuote(backupOld)
             + " && (if [ -d "
             + shQuote(target)
@@ -291,7 +446,8 @@ public final class SshRobotTransport implements RobotTransport {
     String mkdir = slash > 0 ? "mkdir -p " + shQuote(dst.substring(0, slash)) + " && " : "";
     String out =
         runSshCommand(
-            "if [ -f "
+            buildInlineHeartbeatGuard()
+                + " && if [ -f "
                 + shQuote(src)
                 + " ]; then "
                 + mkdir
@@ -319,7 +475,8 @@ public final class SshRobotTransport implements RobotTransport {
     String mkdir = slash > 0 ? "mkdir -p " + shQuote(dst.substring(0, slash)) + " && " : "";
     String out =
         runSshCommand(
-            "if [ -d "
+            buildInlineHeartbeatGuard()
+                + " && if [ -d "
                 + shQuote(src)
                 + " ]; then "
                 + mkdir
@@ -360,19 +517,26 @@ public final class SshRobotTransport implements RobotTransport {
     String full = resolveRemote(remoteRelativePath);
     String out =
         runSshCommand(
-            "if [ -f " + shQuote(full) + " ]; then rm -f " + shQuote(full) + " && echo DELETED; fi");
+            buildInlineHeartbeatGuard()
+                + " && if [ -f "
+                + shQuote(full)
+                + " ]; then rm -f "
+                + shQuote(full)
+                + " && echo DELETED; fi");
     return out.contains("DELETED");
   }
 
   @Override
   public void restartRobotCode() throws IOException {
     assertRobotDisabledForTransfer("restartRobotCode");
+    String guard = buildInlineHeartbeatGuard();
     if (isSystemCore) {
       runSshCommand(
-          "if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl restart frc-robot 2>/dev/null || systemctl restart frc-robot 2>/dev/null || true; "
-              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then /usr/local/frc/bin/frcKillRobot.sh -t -r; fi");
+          guard
+              + " && (if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl restart frc-robot 2>/dev/null || systemctl restart frc-robot 2>/dev/null || true; "
+              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then /usr/local/frc/bin/frcKillRobot.sh -t -r; fi)");
     } else {
-      runSshCommand("/usr/local/frc/bin/frcKillRobot.sh -t -r");
+      runSshCommand(guard + " && /usr/local/frc/bin/frcKillRobot.sh -t -r");
     }
   }
 
@@ -383,16 +547,22 @@ public final class SshRobotTransport implements RobotTransport {
 
   @Override
   public List<RemoteLogEntry> listRemoteLogEntries() throws IOException {
+    assertRobotDisabledForTransfer("listRemoteLogEntries");
     String probeScript =
-        "for root in "
+        "seen_roots='|'; "
+            + "for root in "
             + shQuote(remoteHomeDir + "/logs")
             + " /U/logs /media/sda1; do "
             + "  [ -d \"$root\" ] || continue; "
-            + "  find -L \"$root\" -maxdepth 3 -type f "
+            + "  canon=$(readlink -f \"$root\" 2>/dev/null || printf '%s' \"$root\"); "
+            + "  case \"$seen_roots\" in *\"|$canon|\"*) continue ;; esac; "
+            + "  seen_roots=\"${seen_roots}${canon}|\"; "
+            + "  find -L \"$canon\" -maxdepth 3 -type f "
             + "    \\( -name '*.wpilog' -o -name '*.hoot' -o -name 'run-meta.json' -o -name 'FRC_UserProgram*' -o -name '*.jpg' -o -name '*.png' \\) 2>/dev/null "
             + "  | while IFS= read -r f; do "
-            + "      meta=$(stat -c '%s|%Y' \"$f\" 2>/dev/null || ls -ln \"$f\" 2>/dev/null | awk '{print $5\"|0\"}'); "
-            + "      printf '%s|%s|%s\\n' \"$root\" \"$f\" \"$meta\"; "
+            + "      cf=$(readlink -f \"$f\" 2>/dev/null || printf '%s' \"$f\"); "
+            + "      meta=$(stat -c '%s|%Y' \"$cf\" 2>/dev/null || ls -ln \"$cf\" 2>/dev/null | awk '{print $5\"|0\"}'); "
+            + "      printf '%s|%s|%s|%s\\n' \"$root\" \"$canon\" \"$cf\" \"$meta\"; "
             + "    done; "
             + "done; "
             + "if [ -f "
@@ -401,12 +571,16 @@ public final class SshRobotTransport implements RobotTransport {
             + "  f="
             + shQuote(remoteHomeDir + "/FRC_UserProgram.log")
             + "; "
-            + "  meta=$(stat -c '%s|%Y' \"$f\" 2>/dev/null || ls -ln \"$f\" 2>/dev/null | awk '{print $5\"|0\"}'); "
-            + "  printf '%s|%s|%s\\n' "
+            + "  cf=$(readlink -f \"$f\" 2>/dev/null || printf '%s' \"$f\"); "
+            + "  meta=$(stat -c '%s|%Y' \"$cf\" 2>/dev/null || ls -ln \"$cf\" 2>/dev/null | awk '{print $5\"|0\"}'); "
+            + "  printf '%s|%s|%s|%s\\n' "
             + shQuote(remoteHomeDir)
-            + " \"$f\" \"$meta\"; "
+            + " "
+            + shQuote(remoteHomeDir)
+            + " \"$cf\" \"$meta\"; "
             + "fi";
     String out = runSshCommand(probeScript);
+    Map<String, RemoteLogEntry> dedupByCanonPath = new LinkedHashMap<>();
     Map<String, RemoteLogEntry> dedupByRelKey = new LinkedHashMap<>();
     for (String line : out.split("\\R")) {
       String trimmed = line.trim();
@@ -417,17 +591,43 @@ public final class SshRobotTransport implements RobotTransport {
       if (parts.length < 4) {
         continue;
       }
-      String root = parts[0];
-      String fullPath = parts[1];
-      long size = parseLongSafe(parts[2], 0L);
-      long mtime = parseLongSafe(parts[3], 0L);
-      String rel = fullPath.startsWith(root + "/") ? fullPath.substring(root.length() + 1) : Path.of(fullPath).getFileName().toString();
-      if (root.startsWith("/media/sda1")) {
-        rel = "usb_sda1/" + rel;
-      } else if (root.startsWith("/U/logs")) {
-        rel = "usb_U/" + rel;
+      String root;
+      String canonRoot;
+      String fullPath;
+      long size;
+      long mtime;
+      if (parts.length >= 5) {
+        root = parts[0];
+        canonRoot = parts[1];
+        fullPath = parts[2];
+        size = parseLongSafe(parts[3], 0L);
+        mtime = parseLongSafe(parts[4], 0L);
+      } else {
+        root = parts[0];
+        canonRoot = parts[0];
+        fullPath = parts[1];
+        size = parseLongSafe(parts[2], 0L);
+        mtime = parseLongSafe(parts[3], 0L);
       }
-      dedupByRelKey.putIfAbsent(rel, new RemoteLogEntry(fullPath, rel, size, mtime));
+      if (dedupByCanonPath.containsKey(fullPath)) {
+        continue;
+      }
+      String rel;
+      if (fullPath.startsWith(canonRoot + "/")) {
+        rel = fullPath.substring(canonRoot.length() + 1);
+      } else if (fullPath.startsWith(root + "/")) {
+        rel = fullPath.substring(root.length() + 1);
+      } else {
+        rel = Path.of(fullPath).getFileName().toString();
+      }
+      if (root.startsWith("/U/logs")) {
+        rel = "usb_U/" + rel;
+      } else if (root.startsWith("/media/sda1")) {
+        rel = "usb_sda1/" + rel;
+      }
+      RemoteLogEntry entry = new RemoteLogEntry(fullPath, rel, size, mtime);
+      dedupByCanonPath.put(fullPath, entry);
+      dedupByRelKey.putIfAbsent(rel, entry);
     }
     return new ArrayList<>(dedupByRelKey.values());
   }
@@ -457,9 +657,9 @@ public final class SshRobotTransport implements RobotTransport {
       cmd.add("scp");
       cmd.add("-p");
       cmd.addAll(buildSshOptions());
-      cmd.add(user + "@" + host + ":" + entry.remoteFullPath());
+      cmd.add(user + "@" + host + ":" + shQuote(entry.remoteFullPath()));
       cmd.add(target.toAbsolutePath().toString());
-      runProcess(new ProcessBuilder(cmd), TRANSFER_TIMEOUT_SEC);
+      runCheckedProcess(cmd, null, TRANSFER_TIMEOUT_SEC);
       downloaded.put(entry.relativeKey(), target);
     }
     return downloaded;
@@ -467,7 +667,107 @@ public final class SshRobotTransport implements RobotTransport {
 
   @Override
   public String captureSystemSnapshotRaw() throws IOException {
+    assertRobotDisabledForTransfer("captureSystemSnapshotRaw");
     return runSshCommand(FluxSystemSnapshot.REMOTE_CAPTURE_SH_COMMAND);
+  }
+
+  /** Builds a pure-Java POSIX/USTAR tar archive for all directories and files under {@code localDir}. */
+  static byte[] buildUstarTarArchive(Path localDir) throws IOException {
+    if (localDir == null || !Files.isDirectory(localDir)) {
+      return new byte[0];
+    }
+    List<Path> dirs;
+    List<Path> files;
+    try (Stream<Path> walk = Files.walk(localDir)) {
+      List<Path> all = walk.filter(p -> !p.equals(localDir)).sorted().toList();
+      dirs = all.stream().filter(Files::isDirectory).toList();
+      files = all.stream().filter(Files::isRegularFile).toList();
+    }
+    if (dirs.isEmpty() && files.isEmpty()) {
+      return new byte[0];
+    }
+    ByteArrayOutputStream out = new ByteArrayOutputStream(8192);
+    for (Path dir : dirs) {
+      String rel = localDir.relativize(dir).toString().replace('\\', '/');
+      if (!rel.endsWith("/")) {
+        rel = rel + "/";
+      }
+      long mtimeSec = Files.getLastModifiedTime(dir).toMillis() / 1_000L;
+      writeUstarHeader(out, rel, 0L, mtimeSec, true);
+    }
+    for (Path file : files) {
+      String rel = localDir.relativize(file).toString().replace('\\', '/');
+      byte[] payload = Files.readAllBytes(file);
+      long mtimeSec = Files.getLastModifiedTime(file).toMillis() / 1_000L;
+      writeUstarHeader(out, rel, payload.length, mtimeSec, false);
+      out.write(payload);
+      int rem = payload.length % TAR_BLOCK_SIZE;
+      if (rem != 0) {
+        out.write(new byte[TAR_BLOCK_SIZE - rem]);
+      }
+    }
+    // POSIX tar terminates with two 512-byte zero blocks.
+    out.write(new byte[TAR_BLOCK_SIZE * 2]);
+    return out.toByteArray();
+  }
+
+  private static void writeUstarHeader(
+      ByteArrayOutputStream out, String relPath, long sizeBytes, long mtimeSec, boolean isDirectory)
+      throws IOException {
+    byte[] header = new byte[TAR_BLOCK_SIZE];
+    String name = relPath;
+    String prefix = "";
+    byte[] rawFull = relPath.getBytes(StandardCharsets.UTF_8);
+    if (rawFull.length > 100) {
+      int split = relPath.lastIndexOf('/');
+      while (split > 0) {
+        String candPrefix = relPath.substring(0, split);
+        String candName = relPath.substring(split + 1);
+        if (!candName.isEmpty()
+            && candPrefix.getBytes(StandardCharsets.UTF_8).length <= 155
+            && candName.getBytes(StandardCharsets.UTF_8).length <= 100) {
+          prefix = candPrefix;
+          name = candName;
+          break;
+        }
+        split = relPath.lastIndexOf('/', split - 1);
+      }
+      if (name.getBytes(StandardCharsets.UTF_8).length > 100
+          || prefix.getBytes(StandardCharsets.UTF_8).length > 155) {
+        throw new IOException("Path too long for POSIX USTAR header: " + relPath);
+      }
+    }
+
+    putBytes(header, 0, name.getBytes(StandardCharsets.UTF_8), 100);
+    putAscii(header, 100, isDirectory ? "0000755\0" : "0000644\0", 8);
+    putAscii(header, 108, "0000000\0", 8);
+    putAscii(header, 116, "0000000\0", 8);
+    putAscii(header, 124, String.format(Locale.US, "%011o\0", isDirectory ? 0L : sizeBytes), 12);
+    putAscii(header, 136, String.format(Locale.US, "%011o\0", Math.max(0L, mtimeSec)), 12);
+    Arrays.fill(header, 148, 156, (byte) ' ');
+    header[156] = (byte) (isDirectory ? '5' : '0');
+    putAscii(header, 257, "ustar\0", 6);
+    putAscii(header, 263, "00", 2);
+    putAscii(header, 329, "0000000\0", 8);
+    putAscii(header, 337, "0000000\0", 8);
+    if (!prefix.isEmpty()) {
+      putBytes(header, 345, prefix.getBytes(StandardCharsets.UTF_8), 155);
+    }
+
+    long checksum = 0L;
+    for (byte b : header) {
+      checksum += (b & 0xFF);
+    }
+    putAscii(header, 148, String.format(Locale.US, "%06o\0 ", checksum), 8);
+    out.write(header);
+  }
+
+  private static void putAscii(byte[] dest, int offset, String value, int maxLen) {
+    putBytes(dest, offset, value.getBytes(StandardCharsets.US_ASCII), maxLen);
+  }
+
+  private static void putBytes(byte[] dest, int offset, byte[] src, int maxLen) {
+    System.arraycopy(src, 0, dest, offset, Math.min(src.length, maxLen));
   }
 
   private void ensureRemoteParentDir(String fullRemotePath) throws IOException {
@@ -486,8 +786,8 @@ public final class SshRobotTransport implements RobotTransport {
     cmd.add("scp");
     cmd.addAll(buildSshOptions());
     cmd.add(localFile.toAbsolutePath().toString());
-    cmd.add(user + "@" + host + ":" + fullRemotePath);
-    runProcess(new ProcessBuilder(cmd), TRANSFER_TIMEOUT_SEC);
+    cmd.add(user + "@" + host + ":" + shQuote(fullRemotePath));
+    runCheckedProcess(cmd, null, TRANSFER_TIMEOUT_SEC);
   }
 
   private String resolveRemote(String rel) {
@@ -500,25 +800,44 @@ public final class SshRobotTransport implements RobotTransport {
     return remoteHomeDir + "/" + rel;
   }
 
-  private static String shQuote(String s) {
+  static String shQuote(String s) {
     return "'" + s.replace("'", "'\\''") + "'";
   }
 
   private String runSshCommand(String remoteCmd) throws IOException {
-    return runSshCommandOnHost(discoverReachableHost(), remoteCmd);
+    return runSshCommandOnHost(discoverReachableHost(), remoteCmd, null, COMMAND_TIMEOUT_SEC);
   }
 
-  private String runSshCommandOnHost(String host, String remoteCmd) throws IOException {
+  private String runSshTransferCommand(String remoteCmd, byte[] stdin) throws IOException {
+    return runSshCommandOnHost(discoverReachableHost(), remoteCmd, stdin, TRANSFER_TIMEOUT_SEC);
+  }
+
+  private String runSshCommandOnHost(
+      String host, String remoteCmd, byte[] stdin, long timeoutSeconds) throws IOException {
     List<String> cmd = new ArrayList<>();
     cmd.add("ssh");
     cmd.addAll(buildSshOptions());
     cmd.add(user + "@" + host);
     cmd.add(remoteCmd);
-    return runProcess(new ProcessBuilder(cmd), COMMAND_TIMEOUT_SEC);
+    return runCheckedProcess(cmd, stdin, timeoutSeconds);
   }
 
-  private String runProcess(ProcessBuilder pb, long timeoutSeconds) throws IOException {
-    Process p = pb.start();
+  private String runCheckedProcess(List<String> argv, byte[] stdin, long timeoutSeconds)
+      throws IOException {
+    ProcessResult result = processRunner.run(List.copyOf(argv), stdin, Duration.ofSeconds(timeoutSeconds));
+    if (result.exitCode() != 0) {
+      String stderr = result.stderr() != null ? result.stderr() : "";
+      if (result.exitCode() == LOCKOUT_EXIT_CODE || stderr.contains("LOCKOUT:")) {
+        throw new IllegalStateException("LOCKOUT [/tmp/flux-robot-state inline]: " + stderr.trim());
+      }
+      throw new IOException("SSH/SCP exited with " + result.exitCode() + ": " + stderr);
+    }
+    return result.stdout() != null ? result.stdout() : "";
+  }
+
+  private ProcessResult runLocalProcess(List<String> argv, byte[] stdin, Duration timeout)
+      throws IOException {
+    Process p = new ProcessBuilder(argv).start();
     activeProcesses.add(p);
     try {
       final byte[][] stdoutHolder = new byte[1][];
@@ -546,21 +865,26 @@ public final class SshRobotTransport implements RobotTransport {
       outReader.start();
       errReader.start();
 
-      boolean finished = p.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+      try (OutputStream procIn = p.getOutputStream()) {
+        if (stdin != null && stdin.length > 0) {
+          procIn.write(stdin);
+          procIn.flush();
+        }
+      }
+
+      long timeoutMs = Math.max(1L, timeout.toMillis());
+      boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
       if (!finished) {
         p.destroyForcibly();
-        throw new IOException("SSH/SCP command timed out after " + timeoutSeconds + "s");
+        throw new IOException("SSH/SCP command timed out after " + timeout.toSeconds() + "s");
       }
       outReader.join(2_000L);
       errReader.join(2_000L);
       String stdout =
           stdoutHolder[0] != null ? new String(stdoutHolder[0], StandardCharsets.UTF_8) : "";
-      if (p.exitValue() != 0) {
-        String stderr =
-            stderrHolder[0] != null ? new String(stderrHolder[0], StandardCharsets.UTF_8) : "";
-        throw new IOException("SSH/SCP exited with " + p.exitValue() + ": " + stderr);
-      }
-      return stdout;
+      String stderr =
+          stderrHolder[0] != null ? new String(stderrHolder[0], StandardCharsets.UTF_8) : "";
+      return new ProcessResult(p.exitValue(), stdout, stderr);
     } catch (InterruptedException e) {
       p.destroyForcibly();
       Thread.currentThread().interrupt();

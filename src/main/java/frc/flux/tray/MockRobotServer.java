@@ -32,6 +32,7 @@ public final class MockRobotServer implements RobotTransport {
   private final AtomicInteger restartCount = new AtomicInteger(0);
   private volatile String lastRestartedJar = null;
   private final List<String> operationLog = new ArrayList<>();
+  private volatile boolean autoRefreshHeartbeat = true;
 
   public MockRobotServer(Path rootDir, String controllerPlatform) throws IOException {
     this.rootDir = rootDir;
@@ -44,6 +45,8 @@ public final class MockRobotServer implements RobotTransport {
       setRobotCommand(
           "/usr/local/frc/JRE/bin/java -XX:+UseSerialGC -jar /home/lvuser/Flux-RoboRIO-2027.jar\n");
     }
+    setRobotStateFile(
+        false, false, "roborio-2026".equalsIgnoreCase(controllerPlatform) ? "FUEL" : "COMP_2027");
   }
 
   public void simulatePowerCycle(String newBootEpochId) {
@@ -73,6 +76,26 @@ public final class MockRobotServer implements RobotTransport {
 
   public void setRobotStateFile(boolean enabled, boolean fmsAttached, String robotId)
       throws IOException {
+    this.autoRefreshHeartbeat = true;
+    writeRobotStatePayload(enabled, fmsAttached, robotId, System.currentTimeMillis());
+  }
+
+  public void setRobotStateFile(
+      boolean enabled, boolean fmsAttached, String robotId, long explicitEpochMs)
+      throws IOException {
+    this.autoRefreshHeartbeat = false;
+    writeRobotStatePayload(enabled, fmsAttached, robotId, explicitEpochMs);
+  }
+
+  public void setRobotStateRaw(String rawPayload) throws IOException {
+    this.autoRefreshHeartbeat = false;
+    Path stateFile = resolvePath("/tmp/flux-robot-state");
+    Files.createDirectories(stateFile.getParent());
+    Files.writeString(stateFile, rawPayload, StandardCharsets.UTF_8);
+  }
+
+  private void writeRobotStatePayload(
+      boolean enabled, boolean fmsAttached, String robotId, long epochMs) throws IOException {
     String state = fmsAttached ? "FMS" : (enabled ? "ENABLED" : "DISABLED");
     String payload =
         "STATE="
@@ -82,7 +105,7 @@ public final class MockRobotServer implements RobotTransport {
             + "\nFMS="
             + fmsAttached
             + "\nEPOCH_MS="
-            + System.currentTimeMillis()
+            + epochMs
             + "\nROBOT_ID="
             + (robotId != null ? robotId : "FUEL")
             + "\nPID=1234\n";
@@ -92,6 +115,7 @@ public final class MockRobotServer implements RobotTransport {
   }
 
   public void clearRobotStateFile() throws IOException {
+    this.autoRefreshHeartbeat = false;
     Files.deleteIfExists(resolvePath("/tmp/flux-robot-state"));
   }
 
@@ -187,13 +211,26 @@ public final class MockRobotServer implements RobotTransport {
   public void assertRobotDisabledForTransfer(String operationName) throws IOException {
     ensureReachable();
     RobotStateHeartbeat hb = readRobotStateHeartbeat();
-    if (hb.present() && hb.enabled()) {
+    if (!hb.present()) {
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is ABSENT; blocked " + operationName);
+    }
+    if (!hb.valid()) {
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is CORRUPT; blocked " + operationName);
+    }
+    if (hb.enabled()) {
       throw new IllegalStateException(
           "LOCKOUT [/tmp/flux-robot-state]: Robot is ENABLED; blocked " + operationName);
     }
-    if (hb.present() && hb.fmsAttached()) {
+    if (hb.fmsAttached()) {
       throw new IllegalStateException(
           "LOCKOUT [/tmp/flux-robot-state]: Robot is FMS-attached; blocked " + operationName);
+    }
+    if (!autoRefreshHeartbeat
+        && hb.isStale(System.currentTimeMillis(), SshRobotTransport.HEARTBEAT_MAX_AGE_MS)) {
+      throw new IllegalStateException(
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat is STALE; blocked " + operationName);
     }
   }
 
@@ -268,6 +305,7 @@ public final class MockRobotServer implements RobotTransport {
     Path tmp = dst.resolveSibling(dst.getFileName() + ".fluxtray.tmp");
     Files.copy(src, tmp, StandardCopyOption.REPLACE_EXISTING);
     Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING);
+    recordOp("copyFile:" + fromRelativePath + "->" + toRelativePath);
     return true;
   }
 
@@ -322,7 +360,7 @@ public final class MockRobotServer implements RobotTransport {
 
   @Override
   public List<RemoteLogEntry> listRemoteLogEntries() throws IOException {
-    ensureReachable();
+    assertRobotDisabledForTransfer("listRemoteLogEntries");
     Path logsDir = rootDir.resolve("logs");
     if (!Files.isDirectory(logsDir)) {
       return List.of();
@@ -375,7 +413,7 @@ public final class MockRobotServer implements RobotTransport {
 
   @Override
   public String captureSystemSnapshotRaw() throws IOException {
-    ensureReachable();
+    assertRobotDisabledForTransfer("captureSystemSnapshotRaw");
     if (nextSnapshotRaw != null) {
       return nextSnapshotRaw;
     }

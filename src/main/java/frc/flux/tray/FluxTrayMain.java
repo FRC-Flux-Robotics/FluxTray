@@ -7,6 +7,7 @@ import frc.lib.fluxfig.FluxSystemSnapshot;
 import frc.lib.fluxfig.FluxSystemSnapshot.WatchDecision;
 import java.awt.AWTException;
 import java.awt.Color;
+import java.awt.EventQueue;
 import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.GraphicsEnvironment;
@@ -17,6 +18,7 @@ import java.awt.RenderingHints;
 import java.awt.SystemTray;
 import java.awt.TrayIcon;
 import java.awt.image.BufferedImage;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -28,9 +30,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
 /**
@@ -236,47 +241,6 @@ public final class FluxTrayMain {
           System.out.println("Packaged ZIP   -> " + b.zipArchive().toAbsolutePath());
           printSnapshotAudit(b.runId(), b.systemSnapshot());
         }
-      }
-      case "--export-scout-pwa" -> {
-        if (args.length < 2) {
-          throw new IllegalArgumentException(
-              "Usage: --export-scout-pwa <out-dir> [--secret <hex-key>]");
-        }
-        Path outDir = Path.of(args[1]);
-        String secret = getFlagValue(args, "--secret", ScoutingQrManager.DEFAULT_TEAM_SECRET_HEX);
-        Path scoutHtml = ScoutingQrManager.exportOfflineScoutingPwa(outDir, secret);
-        System.out.println(
-            "Exported offline /scout PWA (scout.html, sw.js, manifest.webmanifest, enroll-qr.png) -> "
-                + scoutHtml.toAbsolutePath());
-      }
-      case "--scan-scout-qr" -> {
-        if (args.length < 3) {
-          throw new IllegalArgumentException(
-              "Usage: --scan-scout-qr <qr-image.png | FLUXSCOUT1-payload> <FLUX-10413-Hub-dir> [--secret <hex-key>]");
-        }
-        String input = args[1];
-        Path hubDir = Path.of(args[2]);
-        String secret = getFlagValue(args, "--secret", ScoutingQrManager.DEFAULT_TEAM_SECRET_HEX);
-        String payload =
-            input.startsWith(ScoutingQrManager.PAYLOAD_PREFIX + "|")
-                ? input
-                : ScoutingQrManager.readVisualMatrixPng(Path.of(input));
-        ScoutingQrManager.ScoutingMatchEntry entry =
-            ScoutingQrManager.ingestVerifiedPayload(payload, hubDir, secret);
-        System.out.println(
-            "Verified & ingested scouting QR -> "
-                + entry.eventCode()
-                + " Match "
-                + entry.matchNumber()
-                + " ("
-                + entry.allianceStation()
-                + ", Team "
-                + entry.teamNumber()
-                + ", scouter="
-                + entry.scouterId()
-                + ", seq="
-                + entry.sequenceNumber()
-                + ")");
       }
       case "--self-test" -> runSelfTest();
       case "--tray", "--code-dir", "--logs-dir" -> launchSystemTray(args);
@@ -487,6 +451,234 @@ public final class FluxTrayMain {
     }
   }
 
+  /** Computes the displayed tray icon color without leaving a disconnected robot stuck Red. */
+  static TrayStatus computeTrayStatus(
+      boolean ntConnected, boolean displayedEnabled, boolean displayedFms, boolean busySyncing) {
+    if (!ntConnected) {
+      return busySyncing ? TrayStatus.SYNCING : TrayStatus.DISCONNECTED;
+    }
+    if (displayedEnabled || displayedFms) {
+      return TrayStatus.ENABLED;
+    }
+    if (busySyncing) {
+      return TrayStatus.SYNCING;
+    }
+    return TrayStatus.READY;
+  }
+
+  static void runOnEdt(Runnable action) {
+    if (GraphicsEnvironment.isHeadless() || EventQueue.isDispatchThread()) {
+      action.run();
+    } else {
+      EventQueue.invokeLater(action);
+    }
+  }
+
+  /**
+   * Serializes all tray actions (auto-pulls, DriveWatcher polls, manual log pulls, and manual
+   * Restore STABLE) onto one single-thread worker so Drive polls never race in-flight transfers,
+   * while signaling {@code busySyncing} only during real robot transfers.
+   */
+  static final class TrayActionCoordinator implements Closeable {
+    private final RobotTransport robot;
+    private final PackageDeployer deployer;
+    private final BatteryAndRunManager runMgr;
+    private final MultiMicAudioRecorder audio;
+    private final RobotSafetyLockout lockout;
+    private final Path dsLogDir;
+    private final Path logsDir;
+    private final Path logFile;
+    private final DriveWatcher.NotificationSink notify;
+    private final Consumer<Boolean> busyListener;
+    private final AtomicBoolean busySyncing = new AtomicBoolean(false);
+    private final AtomicBoolean drivePollQueued = new AtomicBoolean(false);
+    private final ExecutorService actionExecutor;
+
+    TrayActionCoordinator(
+        RobotTransport robot,
+        PackageDeployer deployer,
+        BatteryAndRunManager runMgr,
+        MultiMicAudioRecorder audio,
+        RobotSafetyLockout lockout,
+        Path dsLogDir,
+        Path logsDir,
+        Path logFile,
+        DriveWatcher.NotificationSink notify,
+        Consumer<Boolean> busyListener) {
+      this.robot = robot;
+      this.deployer = deployer;
+      this.runMgr = runMgr;
+      this.audio = audio;
+      this.lockout = lockout;
+      this.dsLogDir = dsLogDir;
+      this.logsDir = logsDir;
+      this.logFile = logFile;
+      this.notify = notify != null ? notify : (lvl, title, msg) -> {};
+      this.busyListener = busyListener != null ? busyListener : ignored -> {};
+      this.actionExecutor =
+          Executors.newSingleThreadExecutor(
+              r -> {
+                Thread t = new Thread(r, "fluxtray-action-worker");
+                t.setDaemon(true);
+                return t;
+              });
+    }
+
+    boolean isBusySyncing() {
+      return busySyncing.get();
+    }
+
+    void setBusySyncing(boolean busy) {
+      if (busySyncing.getAndSet(busy) != busy) {
+        busyListener.accept(busy);
+      }
+    }
+
+    Future<?> submitAutoPull() {
+      return actionExecutor.submit(
+          () -> {
+            try {
+              while (audio.isRecording()
+                  && audio.isMicAvailable()
+                  && audio.remainingPostDisableMs(System.currentTimeMillis()) > 0L) {
+                if (lockout.isEnabled() || lockout.isFmsAttached()) {
+                  appendTrayLog(
+                      logFile, "WARN", "Aborted post-disable debrief wait: robot re-enabled");
+                  return;
+                }
+                Thread.sleep(200L);
+              }
+              if (lockout.isEnabled() || lockout.isFmsAttached()) {
+                appendTrayLog(logFile, "WARN", "Aborted auto-pull: robot re-enabled");
+                return;
+              }
+              setBusySyncing(true);
+              try {
+                long pullNow = System.currentTimeMillis();
+                CompletedRunBundle bundle =
+                    runMgr.pullDriveSafeRunZip(
+                        "auto_" + pullNow,
+                        null,
+                        robot,
+                        dsLogDir,
+                        logsDir,
+                        pullNow,
+                        true,
+                        true,
+                        false);
+                if (bundle != null && bundle.zipArchive() != null) {
+                  notify.notify(
+                      "INFO",
+                      "FluxTray Auto-Pull Complete",
+                      "Saved " + bundle.zipArchive().getFileName() + " to " + logsDir);
+                }
+              } finally {
+                setBusySyncing(false);
+              }
+            } catch (Exception ex) {
+              notify.notify("ERROR", "FluxTray Auto-Pull Failed", ex.getMessage());
+            }
+          });
+    }
+
+    Future<?> submitDrivePollIfIdle(DriveWatcher driveWatcher, LongSupplier clockMs) {
+      if (driveWatcher == null || lockout.isEnabled() || lockout.isFmsAttached()) {
+        return null;
+      }
+      if (!drivePollQueued.compareAndSet(false, true)) {
+        return null;
+      }
+      return actionExecutor.submit(
+          () -> {
+            try {
+              if (lockout.isEnabled() || lockout.isFmsAttached()) {
+                return;
+              }
+              PollOutcome outcome = driveWatcher.pollOnce(clockMs.getAsLong());
+              if (outcome.action() != DriveWatcher.ActionType.NONE) {
+                appendTrayLog(
+                    logFile, "INFO", "DriveWatcher " + outcome.action() + ": " + outcome.summary());
+              }
+            } catch (Exception ex) {
+              notify.notify("ERROR", "FluxTray Drive Sync Error", ex.getMessage());
+            } finally {
+              drivePollQueued.set(false);
+            }
+          });
+    }
+
+    Future<?> submitManualPull() {
+      return actionExecutor.submit(
+          () -> {
+            setBusySyncing(true);
+            try {
+              long nowMs = System.currentTimeMillis();
+              CompletedRunBundle bundle =
+                  runMgr.pullDriveSafeRunZip(
+                      "manual_" + nowMs,
+                      null,
+                      robot,
+                      dsLogDir,
+                      logsDir,
+                      nowMs,
+                      false,
+                      false,
+                      false);
+              if (bundle != null && bundle.zipArchive() != null) {
+                notify.notify(
+                    "INFO",
+                    "FluxTray Pull Complete",
+                    "Saved " + bundle.zipArchive().getFileName());
+              }
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Pull Logs Failed", ex.getMessage());
+            } finally {
+              setBusySyncing(false);
+            }
+          });
+    }
+
+    /** Pulls pending robot logs first before restoring {@code jars/prev_stable.jar} + {@code deploy/}. */
+    Future<?> submitManualRestoreStable() {
+      return actionExecutor.submit(
+          () -> {
+            setBusySyncing(true);
+            try {
+              long nowMs = System.currentTimeMillis();
+              CompletedRunBundle preLogs =
+                  runMgr.pullDriveSafeRunZip(
+                      "prerestore_" + nowMs,
+                      null,
+                      robot,
+                      dsLogDir,
+                      logsDir,
+                      nowMs,
+                      false,
+                      true,
+                      true);
+              deployer.restoreStable(robot);
+              String suffix =
+                  (preLogs != null && preLogs.zipArchive() != null)
+                      ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
+                      : "";
+              notify.notify(
+                  "INFO",
+                  "FluxTray Restore STABLE",
+                  "Restored prev_stable.jar + deploy/ and restarted robot" + suffix + ".");
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Restore STABLE Failed", ex.getMessage());
+            } finally {
+              setBusySyncing(false);
+            }
+          });
+    }
+
+    @Override
+    public void close() {
+      actionExecutor.shutdownNow();
+    }
+  }
+
   private static void launchSystemTray(String[] args) throws AWTException {
     if (GraphicsEnvironment.isHeadless() || !SystemTray.isSupported()) {
       System.out.println(
@@ -513,17 +705,12 @@ public final class FluxTrayMain {
                 "--logs-dir",
                 System.getProperty("flux.logs.dir", hubDir.resolve("logs").toString())));
     Path dsLogDir = Path.of(getFlagValue(args, "--ds-logs", DEFAULT_DS_LOGS_DIR));
+    Path stateDir = Path.of(System.getProperty("user.home"), ".fluxtray");
     Path logFile =
         Path.of(
             getFlagValue(
-                args,
-                "--log-file",
-                Path.of(System.getProperty("user.home"), ".fluxtray", "fluxtray.log").toString()));
-    Path ledgerFile =
-        Path.of(
-            System.getProperty("user.home"),
-            ".fluxtray",
-            BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME);
+                args, "--log-file", stateDir.resolve("fluxtray.log").toString()));
+    Path ledgerFile = stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME);
 
     RobotSafetyLockout lockout = new RobotSafetyLockout();
     // Tray mode defaults to roboRIO multi-host discovery (lvuser@) unless --systemcore is given.
@@ -538,24 +725,23 @@ public final class FluxTrayMain {
     Image iconEnabled = createStatusIcon(TrayStatus.ENABLED);
     Image iconSyncing = createStatusIcon(TrayStatus.SYNCING);
     PopupMenu menu = new PopupMenu("FLUX 10413 Tray");
-    TrayIcon icon = new TrayIcon(iconDisconnected, "FLUX 10413 — " + TrayStatus.DISCONNECTED.label(), menu);
+    TrayIcon icon =
+        new TrayIcon(iconDisconnected, "FLUX 10413 — " + TrayStatus.DISCONNECTED.label(), menu);
     icon.setImageAutoSize(true);
 
-    AtomicBoolean busySyncing = new AtomicBoolean(false);
     AtomicBoolean ntConnected = new AtomicBoolean(false);
+    AtomicBoolean displayedEnabled = new AtomicBoolean(false);
+    AtomicBoolean displayedFms = new AtomicBoolean(false);
+    AtomicBoolean busySnapshot = new AtomicBoolean(false);
 
     Runnable refreshIcon =
         () -> {
-          TrayStatus status;
-          if (lockout.isEnabled() || lockout.isFmsAttached()) {
-            status = TrayStatus.ENABLED;
-          } else if (busySyncing.get()) {
-            status = TrayStatus.SYNCING;
-          } else if (ntConnected.get()) {
-            status = TrayStatus.READY;
-          } else {
-            status = TrayStatus.DISCONNECTED;
-          }
+          TrayStatus status =
+              computeTrayStatus(
+                  ntConnected.get(),
+                  displayedEnabled.get(),
+                  displayedFms.get(),
+                  busySnapshot.get());
           Image target =
               switch (status) {
                 case READY -> iconReady;
@@ -563,8 +749,12 @@ public final class FluxTrayMain {
                 case SYNCING -> iconSyncing;
                 case DISCONNECTED -> iconDisconnected;
               };
-          icon.setImage(target);
-          icon.setToolTip("FLUX 10413 — " + status.label() + " (" + robot.activeHost() + ")");
+          String tooltip = "FLUX 10413 — " + status.label() + " (" + robot.activeHost() + ")";
+          runOnEdt(
+              () -> {
+                icon.setImage(target);
+                icon.setToolTip(tooltip);
+              });
         };
 
     DriveWatcher.NotificationSink notify =
@@ -576,11 +766,40 @@ public final class FluxTrayMain {
                   : ("WARN".equalsIgnoreCase(level)
                       ? TrayIcon.MessageType.WARNING
                       : TrayIcon.MessageType.INFO);
-          icon.displayMessage(title, message, type);
+          runOnEdt(() -> icon.displayMessage(title, message, type));
         };
 
+    audio.setErrorListener(msg -> notify.notify("WARN", "FluxTray Audio Warning", msg));
+
+    TrayActionCoordinator coordinator =
+        new TrayActionCoordinator(
+            robot,
+            deployer,
+            runMgr,
+            audio,
+            lockout,
+            dsLogDir,
+            logsDir,
+            logFile,
+            notify,
+            busy -> {
+              busySnapshot.set(busy);
+              refreshIcon.run();
+            });
+
     DriveWatcher driveWatcher =
-        new DriveWatcher(codeDir, logsDir, dsLogDir, robot, deployer, runMgr, lockout, notify);
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsLogDir,
+            robot,
+            deployer,
+            runMgr,
+            lockout,
+            notify,
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS,
+            coordinator::setBusySyncing);
 
     Nt4RobotStateClient ntClient =
         new Nt4RobotStateClient(
@@ -590,22 +809,32 @@ public final class FluxTrayMain {
             (enabled, fms, controlWord, host, nowMs) -> {
               audio.onRobotStateChanged(enabled, nowMs);
               ntConnected.set(true);
+              displayedEnabled.set(enabled);
+              displayedFms.set(fms);
               refreshIcon.run();
             });
     ntClient.setConnectionChangeListener(
         () -> {
-          ntConnected.set(ntClient.isConnected());
+          boolean conn = ntClient.isConnected();
+          ntConnected.set(conn);
+          if (!conn) {
+            // Return icon to Gray on disconnect while robot-side /tmp/flux-robot-state stays fail-closed.
+            displayedEnabled.set(false);
+            displayedFms.set(false);
+          }
           refreshIcon.run();
         });
     ntClient.start();
 
-    ExecutorService trayActionExecutor =
-        Executors.newSingleThreadExecutor(
-            r -> {
-              Thread t = new Thread(r, "fluxtray-action-worker");
-              t.setDaemon(true);
-              return t;
-            });
+    Runtime.getRuntime()
+        .addShutdownHook(
+            new Thread(
+                () -> {
+                  ntClient.close();
+                  audio.close();
+                  coordinator.close();
+                },
+                "fluxtray-shutdown-cleanup"));
 
     ScheduledExecutorService scheduler =
         Executors.newSingleThreadScheduledExecutor(
@@ -619,62 +848,9 @@ public final class FluxTrayMain {
         () -> {
           long nowMs = System.currentTimeMillis();
           if (lockout.claimAutoLogPull(nowMs)) {
-            trayActionExecutor.submit(
-                () -> {
-                  busySyncing.set(true);
-                  refreshIcon.run();
-                  try {
-                    while (audio.isRecording()
-                        && audio.isMicAvailable()
-                        && audio.remainingPostDisableMs(System.currentTimeMillis()) > 0L) {
-                      if (lockout.isEnabled() || lockout.isFmsAttached()) {
-                        appendTrayLog(logFile, "WARN", "Aborted post-disable debrief wait: robot re-enabled");
-                        return;
-                      }
-                      Thread.sleep(200L);
-                    }
-                    long pullNow = System.currentTimeMillis();
-                    CompletedRunBundle bundle =
-                        runMgr.pullDriveSafeRunZip(
-                            "auto_" + pullNow,
-                            null,
-                            robot,
-                            dsLogDir,
-                            logsDir,
-                            pullNow,
-                            true,
-                            true,
-                            false);
-                    if (bundle != null && bundle.zipArchive() != null) {
-                      notify.notify(
-                          "INFO",
-                          "FluxTray Auto-Pull Complete",
-                          "Saved " + bundle.zipArchive().getFileName() + " to " + logsDir);
-                    }
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "FluxTray Auto-Pull Failed", ex.getMessage());
-                  } finally {
-                    busySyncing.set(false);
-                    refreshIcon.run();
-                  }
-                });
+            coordinator.submitAutoPull();
           }
-
-          if (!busySyncing.get() && !lockout.isEnabled() && !lockout.isFmsAttached()) {
-            try {
-              busySyncing.set(true);
-              refreshIcon.run();
-              PollOutcome outcome = driveWatcher.pollOnce(System.currentTimeMillis());
-              if (outcome.action() != DriveWatcher.ActionType.NONE) {
-                appendTrayLog(logFile, "INFO", "DriveWatcher " + outcome.action() + ": " + outcome.summary());
-              }
-            } catch (Exception ex) {
-              notify.notify("ERROR", "FluxTray Drive Sync Error", ex.getMessage());
-            } finally {
-              busySyncing.set(false);
-              refreshIcon.run();
-            }
-          }
+          coordinator.submitDrivePollIfIdle(driveWatcher, System::currentTimeMillis);
         },
         1L,
         1L,
@@ -682,147 +858,24 @@ public final class FluxTrayMain {
 
     MenuItem pullLogsItem = new MenuItem("Pull Logs Now");
     MenuItem restoreItem = new MenuItem("Restore STABLE");
-    MenuItem modeTuningItem = new MenuItem("Switch Mode: TUNING");
-    MenuItem modeProdItem = new MenuItem("Switch Mode: PRODUCTION");
-    MenuItem promoteTuningItem = new MenuItem("Promote Floor Tuning -> vN+1");
-    MenuItem syncFmsItem = new MenuItem("Sync Pending FMS Match Logs");
     MenuItem exitItem = new MenuItem("Exit FluxTray");
 
-    pullLogsItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  busySyncing.set(true);
-                  refreshIcon.run();
-                  try {
-                    long nowMs = System.currentTimeMillis();
-                    CompletedRunBundle bundle =
-                        runMgr.pullDriveSafeRunZip(
-                            "manual_" + nowMs,
-                            null,
-                            robot,
-                            dsLogDir,
-                            logsDir,
-                            nowMs,
-                            false,
-                            false,
-                            false);
-                    if (bundle != null && bundle.zipArchive() != null) {
-                      notify.notify(
-                          "INFO",
-                          "FluxTray Pull Complete",
-                          "Saved " + bundle.zipArchive().getFileName());
-                    }
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Pull Logs Failed", ex.getMessage());
-                  } finally {
-                    busySyncing.set(false);
-                    refreshIcon.run();
-                  }
-                }));
-
-    restoreItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  busySyncing.set(true);
-                  refreshIcon.run();
-                  try {
-                    deployer.restoreStable(robot);
-                    notify.notify(
-                        "INFO",
-                        "FluxTray Restore STABLE",
-                        "Restored prev_stable.jar + deploy/ and restarted robot.");
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Restore STABLE Failed", ex.getMessage());
-                  } finally {
-                    busySyncing.set(false);
-                    refreshIcon.run();
-                  }
-                }));
-
-    modeTuningItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  try {
-                    FluxFig.ActiveProfileDirective dir =
-                        deployer.switchActiveMode(null, FluxFig.Mode.TUNING, null, robot);
-                    notify.notify("INFO", "FluxTray Mode", "Switched " + dir.profile() + " -> TUNING");
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Switch to TUNING Failed", ex.getMessage());
-                  }
-                }));
-
-    modeProdItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  try {
-                    FluxFig.ActiveProfileDirective dir =
-                        deployer.switchActiveMode(null, FluxFig.Mode.PRODUCTION, null, robot);
-                    notify.notify(
-                        "INFO", "FluxTray Mode", "Switched " + dir.profile() + " -> PRODUCTION");
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Switch to PRODUCTION Failed", ex.getMessage());
-                  }
-                }));
-
-    promoteTuningItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  try {
-                    FluxFig.ReleaseEntry rel =
-                        deployer.promoteRemoteTuningSnapshot(
-                            hubDir.resolve("03_FluxFig_Configs"),
-                            "pit-crew",
-                            "Tray promotion",
-                            robot);
-                    notify.notify(
-                        "INFO",
-                        "FluxTray Promoted " + rel.version(),
-                        "Config SHA " + rel.configSha256());
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Promote Tuning Failed", ex.getMessage());
-                  }
-                }));
-
-    syncFmsItem.addActionListener(
-        e ->
-            trayActionExecutor.submit(
-                () -> {
-                  busySyncing.set(true);
-                  refreshIcon.run();
-                  try {
-                    List<CompletedRunBundle> synced = runMgr.syncPendingFmsRuns(robot);
-                    notify.notify(
-                        "INFO", "FluxTray FMS Sync", "Synced " + synced.size() + " pending run(s).");
-                  } catch (Exception ex) {
-                    notify.notify("ERROR", "Sync Pending FMS Failed", ex.getMessage());
-                  } finally {
-                    busySyncing.set(false);
-                    refreshIcon.run();
-                  }
-                }));
+    pullLogsItem.addActionListener(e -> coordinator.submitManualPull());
+    restoreItem.addActionListener(e -> coordinator.submitManualRestoreStable());
 
     exitItem.addActionListener(
         e -> {
           appendTrayLog(logFile, "INFO", "FluxTray exiting by user request.");
           ntClient.close();
           scheduler.shutdownNow();
-          trayActionExecutor.shutdownNow();
+          coordinator.close();
+          audio.close();
           tray.remove(icon);
           System.exit(0);
         });
 
     menu.add(pullLogsItem);
     menu.add(restoreItem);
-    menu.addSeparator();
-    menu.add(modeTuningItem);
-    menu.add(modeProdItem);
-    menu.add(promoteTuningItem);
-    menu.add(syncFmsItem);
     menu.addSeparator();
     menu.add(exitItem);
 
@@ -847,15 +900,14 @@ public final class FluxTrayMain {
     String host = getFlagValue(args, "--host", null);
     boolean isSystemCore =
         hasFlag(args, "--systemcore") || (!hasFlag(args, "--roborio") && defaultSystemCore);
-    if (host != null && !host.isBlank()) {
-      return new SshRobotTransport(host, isSystemCore, lockout);
-    }
-    return new SshRobotTransport(
-        isSystemCore
-            ? SshRobotTransport.SYSTEMCORE_CANDIDATE_HOSTS
-            : SshRobotTransport.ROBORIO_CANDIDATE_HOSTS,
-        isSystemCore,
-        lockout);
+    boolean allowMissingHeartbeat = hasFlag(args, "--allow-missing-heartbeat");
+    List<String> hosts =
+        (host != null && !host.isBlank())
+            ? List.of(host.trim())
+            : (isSystemCore
+                ? SshRobotTransport.SYSTEMCORE_CANDIDATE_HOSTS
+                : SshRobotTransport.ROBORIO_CANDIDATE_HOSTS);
+    return new SshRobotTransport(hosts, isSystemCore, lockout, allowMissingHeartbeat);
   }
 
   private static String resolveLaptopId() {
@@ -897,18 +949,16 @@ public final class FluxTrayMain {
           16 kHz PCM mentor-audio.wav recording, and atomic roboRIO deploy + frcKillRobot.sh restart.
 
         Usage:
-          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--log-file <fluxtray.log>]
-          java -jar dist/FluxTray.jar --pull-logs [<dir>] [--dir <output-dir>] [--file <filename.zip>] [--out <dir-or-zip-path>] [--run-id <id>] [--robot <name>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore]
+          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--log-file <fluxtray.log>]
+          java -jar dist/FluxTray.jar --pull-logs [<dir>] [--dir <output-dir>] [--file <filename.zip>] [--out <dir-or-zip-path>] [--run-id <id>] [--robot <name>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --inspect-snapshot <system-snapshot.txt>
-          java -jar dist/FluxTray.jar --deploy <package.fluxpkg.zip> [--host <ip>] [--roborio|--systemcore] [--force]
-          java -jar dist/FluxTray.jar --push-configs <config-dir> [--profile <id>] [--mode PRODUCTION|TUNING] [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --set-mode <PRODUCTION|TUNING> [--profile <id>] [--config-sha <sha>] [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --promote-tuning <config-dir> [--author <name>] [--notes <text>] [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --restore-stable [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --rollback <1..5> [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --sync-pending [<FLUX-10413-Hub-dir>] [--host <ip>] [--roborio|--systemcore]
-          java -jar dist/FluxTray.jar --export-scout-pwa <out-dir> [--secret <hex-key>]
-          java -jar dist/FluxTray.jar --scan-scout-qr <qr-image.png | FLUXSCOUT1-payload> <FLUX-10413-Hub-dir> [--secret <hex-key>]
+          java -jar dist/FluxTray.jar --deploy <package.fluxpkg.zip> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--force]
+          java -jar dist/FluxTray.jar --push-configs <config-dir> [--profile <id>] [--mode PRODUCTION|TUNING] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --set-mode <PRODUCTION|TUNING> [--profile <id>] [--config-sha <sha>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --promote-tuning <config-dir> [--author <name>] [--notes <text>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --restore-stable [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --rollback <1..5> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --sync-pending [<FLUX-10413-Hub-dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --print-ssh-capture-cmd
           java -jar dist/FluxTray.jar --self-test
         """);

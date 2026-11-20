@@ -15,6 +15,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.sound.sampled.AudioFormat;
@@ -29,7 +30,7 @@ import javax.sound.sampled.TargetDataLine;
  * MB/min}, zero native codec dependencies) automatically while {@code Enabled} plus a {@code
  * 15-second} post-{@code Disabled} narration window.
  */
-public final class MultiMicAudioRecorder {
+public final class MultiMicAudioRecorder implements Closeable {
 
   public static final float SAMPLE_RATE_HZ = 16_000.0f;
   public static final int SAMPLE_SIZE_BITS = 16;
@@ -63,6 +64,9 @@ public final class MultiMicAudioRecorder {
   private final PcmCaptureFactory captureFactory;
   private final List<VoiceCue> recordedCues = new ArrayList<>();
   private final AtomicBoolean captureActive = new AtomicBoolean(false);
+  private volatile Path spoolRootDir = null;
+  private volatile Consumer<String> errorListener = null;
+  private volatile String lastCaptureError = null;
   private boolean recording = false;
   private boolean micAvailable = false;
   private long enableStartEpochMs = 0L;
@@ -80,11 +84,28 @@ public final class MultiMicAudioRecorder {
         captureFactory != null ? captureFactory : MultiMicAudioRecorder::openSystemTargetDataLine;
   }
 
+  public void setSpoolRootDir(Path spoolRootDir) {
+    this.spoolRootDir = spoolRootDir;
+  }
+
+  public Path spoolRootDir() {
+    return spoolRootDir;
+  }
+
+  public void setErrorListener(Consumer<String> errorListener) {
+    this.errorListener = errorListener;
+  }
+
+  public String lastCaptureError() {
+    return lastCaptureError;
+  }
+
   private static PcmCapturePort openSystemTargetDataLine(AudioFormat format)
       throws LineUnavailableException {
     DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
     if (!AudioSystem.isLineSupported(info)) {
-      return null;
+      throw new LineUnavailableException(
+          "No 16 kHz 16-bit mono microphone input line available on this system");
     }
     TargetDataLine line = (TargetDataLine) AudioSystem.getLine(info);
     line.open(format, STREAM_CHUNK_BYTES * 2);
@@ -104,17 +125,62 @@ public final class MultiMicAudioRecorder {
   }
 
   public synchronized void onRobotStateChanged(boolean enabled, long nowMs) {
-    if (enabled && !recording) {
-      stopCaptureWorkerQuietly();
-      cleanupTempPcmQuietly();
-      recording = true;
-      enableStartEpochMs = nowMs;
-      disableStartEpochMs = 0L;
-      recordedCues.clear();
-      startCaptureWorker();
-    } else if (!enabled && recording && disableStartEpochMs == 0L) {
+    if (enabled) {
+      if (recording && disableStartEpochMs > 0L) {
+        // Re-enabled inside the 15 s post-disable debrief window: close and flush Run 1 to the
+        // durable spool first so Run 2 starts with clean enable/disable timestamps and a full debrief.
+        if (spoolRootDir != null) {
+          try {
+            flushToSpool(spoolRootDir);
+          } catch (IOException ex) {
+            notifyCaptureError("Failed to spool Run 1 audio on re-enable: " + ex.getMessage());
+            stopCaptureWorkerQuietly();
+            cleanupTempPcmQuietly();
+            recording = false;
+            enableStartEpochMs = 0L;
+            disableStartEpochMs = 0L;
+          }
+        } else {
+          stopCaptureWorkerQuietly();
+          cleanupTempPcmQuietly();
+          recording = false;
+          enableStartEpochMs = 0L;
+          disableStartEpochMs = 0L;
+        }
+      }
+      if (!recording) {
+        stopCaptureWorkerQuietly();
+        cleanupTempPcmQuietly();
+        recording = true;
+        enableStartEpochMs = nowMs;
+        disableStartEpochMs = 0L;
+        recordedCues.clear();
+        lastCaptureError = null;
+        startCaptureWorker();
+      }
+    } else if (recording && disableStartEpochMs == 0L) {
       disableStartEpochMs = nowMs;
     }
+  }
+
+  /**
+   * Flushes the active recording into a unique durable spool subdirectory {@code
+   * <spoolRoot>/<enableEpochMs>/} so a failed downstream pull never deletes mentor narration.
+   */
+  public synchronized Path flushToSpool(Path spoolRoot) throws IOException {
+    Files.createDirectories(spoolRoot);
+    String baseName =
+        enableStartEpochMs > 0L
+            ? Long.toString(enableStartEpochMs)
+            : "run_" + System.currentTimeMillis();
+    Path runSpoolDir = spoolRoot.resolve(baseName);
+    int suffix = 1;
+    while (Files.exists(runSpoolDir)) {
+      runSpoolDir = spoolRoot.resolve(baseName + "_" + suffix);
+      suffix++;
+    }
+    flushAudioFile(runSpoolDir);
+    return runSpoolDir;
   }
 
   /** Returns {@code true} when the 15-second post-Disable debrief window has completed. */
@@ -201,9 +267,24 @@ public final class MultiMicAudioRecorder {
       Files.writeString(syncFile, syncJson, StandardCharsets.UTF_8);
     } finally {
       recording = false;
+      enableStartEpochMs = 0L;
+      disableStartEpochMs = 0L;
       cleanupTempPcmQuietly();
     }
     return wavFile;
+  }
+
+  @Override
+  public synchronized void close() {
+    recording = false;
+    enableStartEpochMs = 0L;
+    disableStartEpochMs = 0L;
+    stopCaptureWorkerQuietly();
+    cleanupTempPcmQuietly();
+  }
+
+  synchronized Path currentTempPcmFile() {
+    return tempPcmFile;
   }
 
   public synchronized List<VoiceCue> recordedCues() {
@@ -235,6 +316,7 @@ public final class MultiMicAudioRecorder {
       PcmCapturePort port = captureFactory.open(CAPTURE_FORMAT);
       if (port == null) {
         micAvailable = false;
+        notifyCaptureError("No microphone input available — mentor audio will be silent.");
         return;
       }
       Path pcmFile = Files.createTempFile("fluxtray-audio-", ".pcm");
@@ -258,17 +340,35 @@ public final class MultiMicAudioRecorder {
                     }
                   }
                   out.flush();
-                } catch (IOException ignored) {
+                } catch (IOException ex) {
+                  if (captureActive.get()) {
+                    notifyCaptureError("Microphone stream interrupted: " + ex.getMessage());
+                  }
                 }
               },
               "fluxtray-audio-capture");
       t.setDaemon(true);
       this.captureThread = t;
       t.start();
-    } catch (Exception ignored) {
+    } catch (Exception ex) {
       micAvailable = false;
       stopCaptureWorkerQuietly();
       cleanupTempPcmQuietly();
+      String detail = ex.getMessage() != null && !ex.getMessage().isBlank()
+          ? ex.getMessage()
+          : ex.getClass().getSimpleName();
+      notifyCaptureError("Microphone capture failed (" + detail + ") — mentor audio will be silent.");
+    }
+  }
+
+  private void notifyCaptureError(String message) {
+    lastCaptureError = message;
+    Consumer<String> listener = errorListener;
+    if (listener != null) {
+      try {
+        listener.accept(message);
+      } catch (Exception ignored) {
+      }
     }
   }
 

@@ -15,6 +15,7 @@ public interface RobotTransport {
   /** Parsed view of {@code /tmp/flux-robot-state} written atomically by robot code. */
   record RobotStateHeartbeat(
       boolean present,
+      boolean valid,
       String state,
       boolean enabled,
       boolean fmsAttached,
@@ -22,7 +23,7 @@ public interface RobotTransport {
       String robotId,
       long pid) {
     public static RobotStateHeartbeat absent() {
-      return new RobotStateHeartbeat(false, "ABSENT", false, false, 0L, "", 0L);
+      return new RobotStateHeartbeat(false, false, "ABSENT", false, false, 0L, "", 0L);
     }
 
     public static RobotStateHeartbeat parse(String raw) {
@@ -35,28 +36,76 @@ public interface RobotTransport {
       long epochMs = 0L;
       String robotId = "";
       long pid = 0L;
-      for (String line : raw.split("\\R")) {
+      boolean sawState = false;
+      boolean sawEnabled = false;
+      boolean sawFms = false;
+      boolean sawEpochMs = false;
+      boolean parseError = false;
+      for (String rawLine : raw.split("\\R")) {
+        String line = rawLine.trim();
+        if (line.isEmpty()) {
+          continue;
+        }
         int eq = line.indexOf('=');
         if (eq <= 0) {
+          parseError = true;
           continue;
         }
         String k = line.substring(0, eq).trim();
         String v = line.substring(eq + 1).trim();
         switch (k) {
-          case "STATE" -> state = v;
-          case "ENABLED" -> enabled = Boolean.parseBoolean(v);
-          case "FMS" -> fms = Boolean.parseBoolean(v);
+          case "STATE" -> {
+            state = v;
+            sawState = true;
+            if (!"DISABLED".equalsIgnoreCase(v)
+                && !"ENABLED".equalsIgnoreCase(v)
+                && !"FMS".equalsIgnoreCase(v)) {
+              parseError = true;
+            }
+          }
+          case "ENABLED" -> {
+            if ("true".equalsIgnoreCase(v)) {
+              enabled = true;
+              sawEnabled = true;
+            } else if ("false".equalsIgnoreCase(v)) {
+              enabled = false;
+              sawEnabled = true;
+            } else {
+              parseError = true;
+            }
+          }
+          case "FMS" -> {
+            if ("true".equalsIgnoreCase(v)) {
+              fms = true;
+              sawFms = true;
+            } else if ("false".equalsIgnoreCase(v)) {
+              fms = false;
+              sawFms = true;
+            } else {
+              parseError = true;
+            }
+          }
           case "EPOCH_MS" -> {
             try {
               epochMs = Long.parseLong(v);
+              if (epochMs > 0L) {
+                sawEpochMs = true;
+              } else {
+                parseError = true;
+              }
             } catch (NumberFormatException ignored) {
+              parseError = true;
             }
           }
           case "ROBOT_ID" -> robotId = v;
           case "PID" -> {
             try {
               pid = Long.parseLong(v);
+              if (pid <= 0L) {
+                parseError = true;
+              }
             } catch (NumberFormatException ignored) {
+              parseError = true;
             }
           }
           default -> {}
@@ -67,7 +116,17 @@ public interface RobotTransport {
       } else if ("FMS".equalsIgnoreCase(state)) {
         fms = true;
       }
-      return new RobotStateHeartbeat(true, state, enabled, fms, epochMs, robotId, pid);
+      boolean valid = sawState && sawEnabled && sawFms && sawEpochMs && !parseError;
+      return new RobotStateHeartbeat(true, valid, state, enabled, fms, epochMs, robotId, pid);
+    }
+
+    /** Returns {@code true} if the heartbeat is invalid or outside {@code +/- maxAgeMs}. */
+    public boolean isStale(long referenceNowEpochMs, long maxAgeMs) {
+      if (!present || !valid || epochMs <= 0L || referenceNowEpochMs <= 0L) {
+        return true;
+      }
+      long ageMs = referenceNowEpochMs - epochMs;
+      return ageMs > maxAgeMs || ageMs < -maxAgeMs;
     }
   }
 

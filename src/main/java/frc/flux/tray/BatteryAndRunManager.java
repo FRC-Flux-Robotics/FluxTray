@@ -10,12 +10,14 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -41,6 +43,7 @@ public final class BatteryAndRunManager {
   public static final String DEFAULT_HUB_DIR_NAME = "FLUX-10413-Hub";
   public static final String DEFAULT_LOGS_SUBDIR_NAME = "04_Practice_And_Match_Logs";
   public static final String SYNCED_LEDGER_FILE_NAME = "synced-remote-files.json";
+  public static final String PENDING_AUDIO_SPOOL_DIR_NAME = "pending-audio";
   public static final long DSLOG_WINDOW_PAD_MS = 4L * 60L * 1_000L;
 
   private static final DateTimeFormatter ZIP_TS_FMT =
@@ -67,6 +70,7 @@ public final class BatteryAndRunManager {
 
   private final Path hubRootDir;
   private final Path ledgerFile;
+  private final Path pendingAudioSpoolDir;
   private final RobotSafetyLockout lockout;
   private final MultiMicAudioRecorder audioRecorder;
   private volatile String selectedBatteryName = null;
@@ -85,8 +89,24 @@ public final class BatteryAndRunManager {
       MultiMicAudioRecorder audioRecorder) {
     this.hubRootDir = hubRootDir;
     this.ledgerFile = ledgerFile != null ? ledgerFile : defaultLedgerPath(hubRootDir);
+    Path stateParent =
+        this.ledgerFile.getParent() != null
+            ? this.ledgerFile.getParent()
+            : Path.of(System.getProperty("user.home"), ".fluxtray");
+    this.pendingAudioSpoolDir = stateParent.resolve(PENDING_AUDIO_SPOOL_DIR_NAME);
     this.lockout = lockout;
     this.audioRecorder = audioRecorder;
+    if (this.audioRecorder != null && this.audioRecorder.spoolRootDir() == null) {
+      this.audioRecorder.setSpoolRootDir(this.pendingAudioSpoolDir);
+    }
+  }
+
+  public Path stateDir() {
+    return pendingAudioSpoolDir.getParent();
+  }
+
+  public Path pendingAudioSpoolDir() {
+    return pendingAudioSpoolDir;
   }
 
   private static Path defaultLedgerPath(Path hubRootDir) {
@@ -174,14 +194,15 @@ public final class BatteryAndRunManager {
   }
 
   /**
-   * Drive-safe incremental log pull: downloads only new/changed remote files into {@code %TEMP%},
-   * correlates {@code ±4 min} {@code .dslog}/{@code .dsevents}, flushes {@code mentor-audio.wav} +
-   * {@code audio-sync.json}, saves raw {@code system-snapshot.txt}, atomically renames {@code
-   * .zip.part -> .zip} into {@code logsDir} (zero duplicate raw run folders), updates {@code
-   * synced-remote-files.json}, and deletes the temp staging directory in {@code finally}.
+   * Drive-safe incremental log pull: flushes active audio into the durable spool ({@code
+   * <stateDir>/pending-audio/<enableEpochMs>/}), downloads only new/changed remote files into
+   * {@code %TEMP%}, correlates {@code ±4 min} {@code .dslog}/{@code .dsevents}, captures non-fatal
+   * {@code system-snapshot.txt}, builds the complete {@code .zip} inside {@code %TEMP%}, moves it
+   * collision-safely into {@code logsDir}, updates {@code synced-remote-files.json}, and deletes
+   * spooled audio ONLY after the finished {@code .zip} is safely in {@code logsDir}.
    *
    * @return the completed bundle, or {@code null} when {@code skipIfNoNewFiles} is true and no new
-   *     robot logs exist.
+   *     robot logs or pending audio exist.
    */
   public CompletedRunBundle pullDriveSafeRunZip(
       String runId,
@@ -200,12 +221,15 @@ public final class BatteryAndRunManager {
     }
     lockout.beginTransferOrThrow("pullDriveSafeRunZip:" + runId);
     Path tempStageRoot = Files.createTempDirectory("fluxtray-run-stage-");
-    Path partZip = null;
     try {
       robot.assertRobotDisabledForTransfer("pullDriveSafeRunZip:" + runId);
       List<RemoteLogEntry> toDownload =
           incrementalOnly ? findUnsyncedRemoteLogs(robot) : robot.listRemoteLogEntries();
-      if (skipIfNoNewFiles && toDownload.isEmpty() && !audioRecorder.isRecording()) {
+      List<Path> existingSpoolDirs = listPendingAudioSpoolDirs();
+      if (skipIfNoNewFiles
+          && toDownload.isEmpty()
+          && !audioRecorder.isRecording()
+          && existingSpoolDirs.isEmpty()) {
         return null;
       }
 
@@ -214,7 +238,27 @@ public final class BatteryAndRunManager {
 
       long audioEnableMs = audioRecorder.enableStartEpochMs();
       long audioDisableMs = audioRecorder.disableStartEpochMs();
-      audioRecorder.flushAudioFile(runStageDir);
+      if (audioRecorder.isRecording()) {
+        audioRecorder.flushToSpool(pendingAudioSpoolDir);
+      }
+      List<Path> stagedSpoolDirs = listPendingAudioSpoolDirs();
+      if (!stagedSpoolDirs.isEmpty()) {
+        Path latestSpool = stagedSpoolDirs.get(stagedSpoolDirs.size() - 1);
+        copySpoolAudioIntoRunDir(latestSpool, runStageDir);
+        long[] spooledEpochs = readAudioSyncEpochs(runStageDir.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME));
+        if (audioEnableMs <= 0L && spooledEpochs[0] > 0L) {
+          audioEnableMs = spooledEpochs[0];
+        }
+        if (audioDisableMs <= 0L && spooledEpochs[1] > 0L) {
+          audioDisableMs = spooledEpochs[1];
+        }
+        for (int i = 0; i < stagedSpoolDirs.size() - 1; i++) {
+          Path prior = stagedSpoolDirs.get(i);
+          copySpoolAudioIntoRunDir(prior, runStageDir.resolve("prior-audio").resolve(prior.getFileName()));
+        }
+      } else {
+        audioRecorder.flushAudioFile(runStageDir);
+      }
       String batteryName = resolveEffectiveBatteryName();
 
       if (!toDownload.isEmpty()) {
@@ -223,7 +267,7 @@ public final class BatteryAndRunManager {
       copyWindowedLocalDsLogs(localDsLogDir, runStageDir, nowMs, audioEnableMs, audioDisableMs);
 
       Path metaPath = runStageDir.resolve("run-meta.json");
-      Map<String, String> robotMeta = readExistingRunMeta(metaPath);
+      Map<String, String> robotMeta = readDownloadedRunMeta(runStageDir, false);
       String effectiveRobotId =
           resolveEffectiveRobotId(robotName, robotMeta, robot);
       String profile = robotMeta.getOrDefault("profile", effectiveRobotId);
@@ -241,10 +285,10 @@ public final class BatteryAndRunManager {
 
       archiveRemoteTunedSnapshotIfPresent(robot, runStageDir);
 
-      String rawSnapshot = robot.captureSystemSnapshotRaw();
+      String rawSnapshot = captureSystemSnapshotNonFatal(robot);
       Files.writeString(
           runStageDir.resolve("system-snapshot.txt"),
-          rawSnapshot != null ? rawSnapshot : "",
+          rawSnapshot,
           StandardCharsets.UTF_8);
       FluxSystemSnapshot snapshot = FluxSystemSnapshot.parse(rawSnapshot);
       List<WatchDecision> decisions = snapshot.evaluate();
@@ -263,29 +307,28 @@ public final class BatteryAndRunManager {
           "COMPLETE",
           audioRecorder.recordedCues(),
           decisions);
-      audioRecorder.clearRecordedCues();
 
       Path targetDir =
           logsOutputDir != null ? logsOutputDir : hubRootDir.resolve(DEFAULT_LOGS_SUBDIR_NAME);
       Files.createDirectories(targetDir);
-      Path finalZip = targetDir.resolve(defaultZipFileName(effectiveRobotId, nowMs));
-      partZip = targetDir.resolve(finalZip.getFileName().toString() + ".part");
-      packageRunDirectoryToZipAtomic(runStageDir, partZip, finalZip);
-      partZip = null;
+      // Build the completed ZIP in %TEMP% first so Google Drive never sees a .part file.
+      Path tempZip = tempStageRoot.resolve("bundle.zip");
+      writeDirectoryToZip(runStageDir, tempZip);
+      Path finalZip =
+          moveCompletedZipCollisionSafe(
+              tempZip, targetDir, defaultZipFileName(effectiveRobotId, nowMs), false);
 
       if (!toDownload.isEmpty()) {
         recordSyncedEntries(toDownload);
       }
+      for (Path sp : stagedSpoolDirs) {
+        deleteRecursivelyQuietly(sp);
+      }
+      audioRecorder.clearRecordedCues();
 
       return new CompletedRunBundle(
           runId, null, finalZip, batteryName, "COMPLETE", snapshot, decisions);
     } finally {
-      if (partZip != null) {
-        try {
-          Files.deleteIfExists(partZip);
-        } catch (IOException ignored) {
-        }
-      }
       deleteRecursivelyQuietly(tempStageRoot);
       lockout.endTransfer();
     }
@@ -403,7 +446,7 @@ public final class BatteryAndRunManager {
       copyWindowedLocalDsLogs(localDsLogDir, runDir, nowMs, audioEnableMs, audioDisableMs);
 
       Path metaPath = runDir.resolve("run-meta.json");
-      Map<String, String> robotMeta = readExistingRunMeta(metaPath);
+      Map<String, String> robotMeta = readDownloadedRunMeta(runDir, false);
       String effectiveRobotId = resolveEffectiveRobotId(robotName, robotMeta, robot);
       String profile = robotMeta.getOrDefault("profile", effectiveRobotId);
       String effectiveConfigSha =
@@ -426,10 +469,10 @@ public final class BatteryAndRunManager {
 
       archiveRemoteTunedSnapshotIfPresent(robot, runDir);
 
-      String rawSnapshot = robot.captureSystemSnapshotRaw();
+      String rawSnapshot = captureSystemSnapshotNonFatal(robot);
       Files.writeString(
           runDir.resolve("system-snapshot.txt"),
-          rawSnapshot != null ? rawSnapshot : "",
+          rawSnapshot,
           StandardCharsets.UTF_8);
       FluxSystemSnapshot snapshot = FluxSystemSnapshot.parse(rawSnapshot);
       List<WatchDecision> decisions = snapshot.evaluate();
@@ -450,14 +493,25 @@ public final class BatteryAndRunManager {
           decisions);
       audioRecorder.clearRecordedCues();
 
+      boolean hasCustomZip = customZipFileName != null && !customZipFileName.isBlank();
       String zipName =
-          (customZipFileName != null && !customZipFileName.isBlank())
+          hasCustomZip
               ? (customZipFileName.toLowerCase(Locale.ROOT).endsWith(".zip")
                   ? customZipFileName
                   : customZipFileName + ".zip")
               : defaultZipFileName(effectiveRobotId, nowMs);
-      Path zipPath = baseLogsDir.resolve(zipName);
-      packageRunDirectoryToZip(runDir, zipPath);
+      Path zipPath;
+      if (hasCustomZip) {
+        zipPath = packageRunDirectoryToZip(runDir, baseLogsDir.resolve(zipName));
+      } else {
+        Path tempZip = Files.createTempFile("fluxtray-zip-", ".zip");
+        try {
+          writeDirectoryToZip(runDir, tempZip);
+          zipPath = moveCompletedZipCollisionSafe(tempZip, baseLogsDir, zipName, false);
+        } finally {
+          Files.deleteIfExists(tempZip);
+        }
+      }
 
       if (optionalUsbMirrorDir != null) {
         mirrorDirectory(runDir, optionalUsbMirrorDir.resolve(runId));
@@ -539,13 +593,13 @@ public final class BatteryAndRunManager {
           String voiceNotesBlock = extractVoiceNotesBlock(fieldMetaText);
 
           robot.downloadAllLogs(runDir);
-          Map<String, String> robotMeta = readExistingRunMeta(metaPath);
+          Map<String, String> robotMeta = readDownloadedRunMeta(runDir, true);
 
           archiveRemoteTunedSnapshotIfPresent(robot, runDir);
-          String rawSnapshot = robot.captureSystemSnapshotRaw();
+          String rawSnapshot = captureSystemSnapshotNonFatal(robot);
           Files.writeString(
               runDir.resolve("system-snapshot.txt"),
-              rawSnapshot != null ? rawSnapshot : "",
+              rawSnapshot,
               StandardCharsets.UTF_8);
           FluxSystemSnapshot snapshot = FluxSystemSnapshot.parse(rawSnapshot);
           List<WatchDecision> decisions = snapshot.evaluate();
@@ -604,9 +658,16 @@ public final class BatteryAndRunManager {
               decisions.size(),
               voiceNotesBlock);
 
-          Path zipPath =
-              logsRoot.resolve(defaultZipFileName(robotId, System.currentTimeMillis()));
-          packageRunDirectoryToZip(runDir, zipPath);
+          Path tempZip = Files.createTempFile("fluxtray-zip-", ".zip");
+          Path zipPath;
+          try {
+            writeDirectoryToZip(runDir, tempZip);
+            zipPath =
+                moveCompletedZipCollisionSafe(
+                    tempZip, logsRoot, defaultZipFileName(robotId, System.currentTimeMillis()), false);
+          } finally {
+            Files.deleteIfExists(tempZip);
+          }
 
           synced.add(
               new CompletedRunBundle(
@@ -638,26 +699,24 @@ public final class BatteryAndRunManager {
     return "match-logs_" + ldt.format(ZIP_TS_FMT) + "_" + cleanRobot + ".zip";
   }
 
-  /** Atomically writes a run directory into {@code targetZipFile} via {@code .part -> .zip}. */
+  /** Builds the complete ZIP in {@code %TEMP%} and moves it into {@code targetZipFile}. */
   public static Path packageRunDirectoryToZip(Path runDir, Path targetZipFile) throws IOException {
     if (targetZipFile.getParent() != null) {
       Files.createDirectories(targetZipFile.getParent());
     }
-    Path partFile = targetZipFile.resolveSibling(targetZipFile.getFileName().toString() + ".part");
+    Path tempZip = Files.createTempFile("fluxtray-zip-", ".zip");
     try {
-      return packageRunDirectoryToZipAtomic(runDir, partFile, targetZipFile);
+      writeDirectoryToZip(runDir, tempZip);
+      moveFileReplacing(tempZip, targetZipFile);
+      return targetZipFile;
     } finally {
-      Files.deleteIfExists(partFile);
+      Files.deleteIfExists(tempZip);
     }
   }
 
-  private static Path packageRunDirectoryToZipAtomic(
-      Path runDir, Path partZipFile, Path targetZipFile) throws IOException {
-    if (targetZipFile.getParent() != null) {
-      Files.createDirectories(targetZipFile.getParent());
-    }
+  private static void writeDirectoryToZip(Path runDir, Path tempZipFile) throws IOException {
     String rootPrefix = runDir.getFileName().toString() + "/";
-    try (OutputStream fos = Files.newOutputStream(partZipFile);
+    try (OutputStream fos = Files.newOutputStream(tempZipFile);
         ZipOutputStream zos = new ZipOutputStream(fos, StandardCharsets.UTF_8);
         Stream<Path> walk = Files.walk(runDir)) {
       for (Path p : walk.filter(Files::isRegularFile).sorted().toList()) {
@@ -670,16 +729,53 @@ public final class BatteryAndRunManager {
       }
       zos.finish();
     }
+  }
+
+  /**
+   * Moves a completed temporary ZIP into {@code targetDir} using a collision-safe {@code _1},
+   * {@code _2}, ... suffix when {@code baseZipName} already exists (unless {@code allowOverwrite}
+   * is true).
+   */
+  static Path moveCompletedZipCollisionSafe(
+      Path completedTempZip, Path targetDir, String baseZipName, boolean allowOverwrite)
+      throws IOException {
+    Files.createDirectories(targetDir);
+    if (allowOverwrite) {
+      Path target = targetDir.resolve(baseZipName);
+      moveFileReplacing(completedTempZip, target);
+      return target;
+    }
+    String stem = baseZipName.endsWith(".zip")
+        ? baseZipName.substring(0, baseZipName.length() - 4)
+        : baseZipName;
+    String ext = baseZipName.endsWith(".zip") ? ".zip" : "";
+    for (int attempt = 0; attempt < 10_000; attempt++) {
+      String candidateName = attempt == 0 ? baseZipName : stem + "_" + attempt + ext;
+      Path candidate = targetDir.resolve(candidateName);
+      if (Files.exists(candidate)) {
+        continue;
+      }
+      try {
+        try {
+          Files.move(completedTempZip, candidate, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+          Files.move(completedTempZip, candidate);
+        }
+        return candidate;
+      } catch (FileAlreadyExistsException race) {
+        // Another writer won this name; advance to the next numeric suffix.
+      }
+    }
+    throw new IOException("Exhausted collision-safe ZIP names for " + baseZipName);
+  }
+
+  private static void moveFileReplacing(Path src, Path dst) throws IOException {
     try {
       Files.move(
-          partZipFile,
-          targetZipFile,
-          StandardCopyOption.REPLACE_EXISTING,
-          StandardCopyOption.ATOMIC_MOVE);
+          src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     } catch (AtomicMoveNotSupportedException e) {
-      Files.move(partZipFile, targetZipFile, StandardCopyOption.REPLACE_EXISTING);
+      Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING);
     }
-    return targetZipFile;
   }
 
   /**
@@ -693,9 +789,22 @@ public final class BatteryAndRunManager {
       long audioEnableMs,
       long audioDisableMs)
       throws IOException {
+    return copyWindowedLocalDsLogs(
+        localDsLogDir, runDir, fallbackNowMs, audioEnableMs, audioDisableMs, ZoneId.systemDefault());
+  }
+
+  static int copyWindowedLocalDsLogs(
+      Path localDsLogDir,
+      Path runDir,
+      long fallbackNowMs,
+      long audioEnableMs,
+      long audioDisableMs,
+      ZoneId localZone)
+      throws IOException {
     if (localDsLogDir == null || !Files.isDirectory(localDsLogDir)) {
       return 0;
     }
+    ZoneId effectiveZone = localZone != null ? localZone : ZoneId.systemDefault();
     long[] window = resolveRunTimeWindowMs(runDir, fallbackNowMs, audioEnableMs, audioDisableMs);
     long winStart = window[0] - DSLOG_WINDOW_PAD_MS;
     long winEnd = window[1] + DSLOG_WINDOW_PAD_MS;
@@ -712,9 +821,11 @@ public final class BatteryAndRunManager {
               .sorted()
               .toList()) {
         long mtimeMs = Files.getLastModifiedTime(f).toMillis();
-        long nameTsMs = parseDsLogNameEpochMs(f.getFileName().toString());
-        boolean mtimeMatches = mtimeMs >= winStart && mtimeMs <= winEnd;
-        boolean nameMatches = nameTsMs > 0L && nameTsMs >= winStart && nameTsMs <= winEnd;
+        long nameTsMs = parseDsLogNameEpochMs(f.getFileName().toString(), effectiveZone);
+        boolean mtimeMatches =
+            isYearAtLeast2025(mtimeMs) && mtimeMs >= winStart && mtimeMs <= winEnd;
+        boolean nameMatches =
+            nameTsMs > 0L && isYearAtLeast2025(nameTsMs) && nameTsMs >= winStart && nameTsMs <= winEnd;
         if (mtimeMatches || nameMatches) {
           Files.copy(f, runDir.resolve(f.getFileName()), StandardCopyOption.REPLACE_EXISTING);
           copied++;
@@ -724,64 +835,82 @@ public final class BatteryAndRunManager {
     return copied;
   }
 
-  private static long[] resolveRunTimeWindowMs(
+  static long[] resolveRunTimeWindowMs(
       Path runDir, long fallbackNowMs, long audioEnableMs, long audioDisableMs) throws IOException {
+    // Prefer local laptop audio timestamps when present — immune to roboRIO RTC skew.
+    long audioMin = Long.MAX_VALUE;
+    long audioMax = Long.MIN_VALUE;
+    if (isYearAtLeast2025(audioEnableMs)) {
+      audioMin = Math.min(audioMin, audioEnableMs);
+      audioMax = Math.max(audioMax, audioEnableMs);
+    }
+    if (isYearAtLeast2025(audioDisableMs)) {
+      audioMin = Math.min(audioMin, audioDisableMs);
+      audioMax = Math.max(audioMax, audioDisableMs);
+    }
+    if (audioMin != Long.MAX_VALUE) {
+      return new long[] {audioMin, audioMax};
+    }
+
     long minTs = Long.MAX_VALUE;
     long maxTs = Long.MIN_VALUE;
-    if (audioEnableMs > 1_700_000_000_000L) {
-      minTs = Math.min(minTs, audioEnableMs);
-      maxTs = Math.max(maxTs, audioEnableMs);
-    }
-    if (audioDisableMs > 1_700_000_000_000L) {
-      minTs = Math.min(minTs, audioDisableMs);
-      maxTs = Math.max(maxTs, audioDisableMs);
-    }
-    if (Files.isDirectory(runDir)) {
+    if (runDir != null && Files.isDirectory(runDir)) {
       try (Stream<Path> walk = Files.walk(runDir, 3)) {
         for (Path p : walk.filter(Files::isRegularFile).toList()) {
           String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
           if (!n.endsWith(".wpilog") && !n.endsWith(".hoot")) {
             continue;
           }
-          long mtimeMs = Files.getLastModifiedTime(p).toMillis();
           long parsedNameMs = parseRobotLogNameEpochMs(p.getFileName().toString());
-          // Ignore un-synced roboRIO 2024 RTC filename timestamps when mtime is >= 2025.
-          long refMs =
-              (parsedNameMs > 0L && isYearAtLeast2025(parsedNameMs)) ? parsedNameMs : mtimeMs;
+          long mtimeMs = Files.getLastModifiedTime(p).toMillis();
+          long refMs = -1L;
+          if (parsedNameMs > 0L && isYearAtLeast2025(parsedNameMs)) {
+            refMs = parsedNameMs;
+          } else if (isYearAtLeast2025(mtimeMs)) {
+            refMs = mtimeMs;
+          }
           if (refMs > 0L) {
             minTs = Math.min(minTs, refMs);
-            maxTs = Math.max(maxTs, Math.max(refMs, mtimeMs));
+            maxTs = Math.max(maxTs, refMs);
           }
         }
       }
     }
     if (minTs == Long.MAX_VALUE) {
-      long ref = fallbackNowMs > 1_700_000_000_000L ? fallbackNowMs : System.currentTimeMillis();
+      long ref = isYearAtLeast2025(fallbackNowMs) ? fallbackNowMs : System.currentTimeMillis();
       return new long[] {ref, ref};
     }
     return new long[] {minTs, maxTs};
   }
 
-  private static boolean isYearAtLeast2025(long epochMs) {
-    return LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMs), ZoneId.systemDefault()).getYear()
-        >= 2025;
+  static boolean isYearAtLeast2025(long epochMs) {
+    if (epochMs <= 0L) {
+      return false;
+    }
+    return Instant.ofEpochMilli(epochMs).atZone(ZoneOffset.UTC).getYear() >= 2025;
   }
 
   static long parseDsLogNameEpochMs(String fileName) {
+    return parseDsLogNameEpochMs(fileName, ZoneId.systemDefault());
+  }
+
+  static long parseDsLogNameEpochMs(String fileName, ZoneId localZone) {
     Matcher m = DSLOG_TS_PATTERN.matcher(fileName);
     if (!m.find()) {
       return -1L;
     }
+    ZoneId effectiveZone = localZone != null ? localZone : ZoneId.systemDefault();
     return toEpochMs(
         Integer.parseInt(m.group(1)),
         Integer.parseInt(m.group(2)),
         Integer.parseInt(m.group(3)),
         Integer.parseInt(m.group(4)),
         Integer.parseInt(m.group(5)),
-        Integer.parseInt(m.group(6)));
+        Integer.parseInt(m.group(6)),
+        effectiveZone);
   }
 
-  private static long parseRobotLogNameEpochMs(String fileName) {
+  static long parseRobotLogNameEpochMs(String fileName) {
     Matcher akit = AKIT_TS_PATTERN.matcher(fileName);
     if (akit.find()) {
       return toEpochMs(
@@ -790,7 +919,8 @@ public final class BatteryAndRunManager {
           Integer.parseInt(akit.group(3)),
           Integer.parseInt(akit.group(4)),
           Integer.parseInt(akit.group(5)),
-          Integer.parseInt(akit.group(6)));
+          Integer.parseInt(akit.group(6)),
+          ZoneOffset.UTC);
     }
     Matcher iso = ISO_LOG_TS_PATTERN.matcher(fileName);
     if (iso.find()) {
@@ -800,19 +930,89 @@ public final class BatteryAndRunManager {
           Integer.parseInt(iso.group(3)),
           Integer.parseInt(iso.group(4)),
           Integer.parseInt(iso.group(5)),
-          Integer.parseInt(iso.group(6)));
+          Integer.parseInt(iso.group(6)),
+          ZoneOffset.UTC);
     }
     return -1L;
   }
 
-  private static long toEpochMs(int y, int mo, int d, int h, int mi, int s) {
+  private static long toEpochMs(int y, int mo, int d, int h, int mi, int s, ZoneId zone) {
     try {
       return LocalDateTime.of(y, mo, d, h, mi, s)
-          .atZone(ZoneId.systemDefault())
+          .atZone(zone)
           .toInstant()
           .toEpochMilli();
     } catch (Exception e) {
       return -1L;
+    }
+  }
+
+  private List<Path> listPendingAudioSpoolDirs() throws IOException {
+    if (pendingAudioSpoolDir == null || !Files.isDirectory(pendingAudioSpoolDir)) {
+      return List.of();
+    }
+    try (Stream<Path> s = Files.list(pendingAudioSpoolDir)) {
+      return s.filter(Files::isDirectory)
+          .filter(
+              d ->
+                  Files.isRegularFile(d.resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME))
+                      || Files.isRegularFile(d.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME)))
+          .sorted(Comparator.comparing(d -> d.getFileName().toString()))
+          .toList();
+    }
+  }
+
+  private static void copySpoolAudioIntoRunDir(Path spoolDir, Path destDir) throws IOException {
+    Files.createDirectories(destDir);
+    Path wav = spoolDir.resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME);
+    if (Files.isRegularFile(wav)) {
+      Files.copy(
+          wav,
+          destDir.resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME),
+          StandardCopyOption.REPLACE_EXISTING);
+    }
+    Path sync = spoolDir.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME);
+    if (Files.isRegularFile(sync)) {
+      Files.copy(
+          sync,
+          destDir.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME),
+          StandardCopyOption.REPLACE_EXISTING);
+    }
+  }
+
+  private static long[] readAudioSyncEpochs(Path syncFile) {
+    if (!Files.isRegularFile(syncFile)) {
+      return new long[] {0L, 0L};
+    }
+    try {
+      Map<String, String> parsed =
+          PackageDeployer.parseFlatJson(Files.readString(syncFile, StandardCharsets.UTF_8));
+      long en = parseLongSafe(parsed.get("enableEpochMs"), 0L);
+      long dis = parseLongSafe(parsed.get("disableEpochMs"), 0L);
+      return new long[] {en, dis};
+    } catch (IOException ignored) {
+      return new long[] {0L, 0L};
+    }
+  }
+
+  private static long parseLongSafe(String raw, long fallback) {
+    if (raw == null || raw.isBlank()) {
+      return fallback;
+    }
+    try {
+      return Long.parseLong(raw.trim());
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
+  }
+
+  private static String captureSystemSnapshotNonFatal(RobotTransport robot) {
+    try {
+      String raw = robot.captureSystemSnapshotRaw();
+      return raw != null ? raw : "";
+    } catch (IOException | RuntimeException ex) {
+      String detail = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
+      return "# system-snapshot capture failed (non-fatal): " + detail + "\n";
     }
   }
 
@@ -909,11 +1109,47 @@ public final class BatteryAndRunManager {
     }
   }
 
-  private static Map<String, String> readExistingRunMeta(Path metaFile) throws IOException {
-    if (!Files.isRegularFile(metaFile)) {
-      return Map.of();
+  private static Map<String, String> readDownloadedRunMeta(
+      Path runDir, boolean preferNonPendingRobotMeta) throws IOException {
+    List<Path> candidates = new ArrayList<>();
+    for (String rel : List.of("run-meta.json", "usb_U/run-meta.json", "usb_sda1/run-meta.json")) {
+      Path p = runDir.resolve(rel);
+      if (Files.isRegularFile(p)) {
+        candidates.add(p);
+      }
     }
-    return PackageDeployer.parseFlatJson(Files.readString(metaFile, StandardCharsets.UTF_8));
+    if (candidates.isEmpty() && Files.isDirectory(runDir)) {
+      try (Stream<Path> walk = Files.walk(runDir, 3)) {
+        walk.filter(Files::isRegularFile)
+            .filter(p -> "run-meta.json".equals(p.getFileName().toString()))
+            .sorted()
+            .forEach(candidates::add);
+      }
+    }
+    Map<String, String> best = Map.of();
+    long bestMtime = Long.MIN_VALUE;
+    for (Path candidate : candidates) {
+      Map<String, String> parsed =
+          PackageDeployer.parseFlatJson(Files.readString(candidate, StandardCharsets.UTF_8));
+      if (parsed.isEmpty()) {
+        continue;
+      }
+      if (preferNonPendingRobotMeta
+          && "PENDING_ROBOT_LOGS".equals(parsed.get("syncStatus"))
+          && !best.isEmpty()) {
+        continue;
+      }
+      long mtime = Files.getLastModifiedTime(candidate).toMillis();
+      boolean bestIsPending = "PENDING_ROBOT_LOGS".equals(best.get("syncStatus"));
+      boolean candIsPending = "PENDING_ROBOT_LOGS".equals(parsed.get("syncStatus"));
+      if (best.isEmpty()
+          || (preferNonPendingRobotMeta && bestIsPending && !candIsPending)
+          || (!candIsPending && mtime > bestMtime)) {
+        best = parsed;
+        bestMtime = mtime;
+      }
+    }
+    return best;
   }
 
   private static int parsePositiveInt(String val, int fallback) {

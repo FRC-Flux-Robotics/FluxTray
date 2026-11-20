@@ -79,7 +79,7 @@ public final class PackageDeployer {
       }
       return new DeployStamp(
           m.getOrDefault("packageName", ""),
-          m.getOrDefault("channel", "STABLE"),
+          m.getOrDefault("channel", ""),
           m.getOrDefault("gitSha", ""),
           m.getOrDefault("configSha", ""),
           m.getOrDefault("deployedByLaptop", ""),
@@ -181,10 +181,112 @@ public final class PackageDeployer {
   }
 
   /**
+   * Locally validates a {@code .fluxpkg.zip} archive before touching the robot: verifies ZIP
+   * integrity, strict fail-closed {@code manifest.json}, target platform match, {@code
+   * frcUserProgram.jar} presence, required {@code deploy/configs/parameters.csv}, and {@link
+   * FluxFig#validateStrict()}.
+   */
+  public static PackageManifest validatePackageArchiveLocally(
+      Path fluxPkgZip, String expectedControllerPlatform) throws IOException {
+    Path tempExtract = Files.createTempDirectory("fluxpkg-validate-");
+    try {
+      extractZip(fluxPkgZip, tempExtract);
+      return validateExtractedPackage(
+          tempExtract, fluxPkgZip.getFileName().toString(), expectedControllerPlatform);
+    } finally {
+      deleteRecursively(tempExtract);
+    }
+  }
+
+  private static PackageManifest validateExtractedPackage(
+      Path extractedRoot, String sourceName, String expectedControllerPlatform) throws IOException {
+    Path manifestPath = extractedRoot.resolve("manifest.json");
+    if (!Files.isRegularFile(manifestPath)) {
+      throw new IOException("Missing manifest.json inside " + sourceName);
+    }
+    PackageManifest manifest =
+        parseStrictManifest(Files.readString(manifestPath, StandardCharsets.UTF_8), sourceName);
+
+    if (expectedControllerPlatform != null
+        && !manifest.targetPlatform().equalsIgnoreCase(expectedControllerPlatform)) {
+      throw new IllegalArgumentException(
+          "Platform mismatch: package targets '"
+              + manifest.targetPlatform()
+              + "' but robot is '"
+              + expectedControllerPlatform
+              + "'");
+    }
+
+    Path jarPath = extractedRoot.resolve("frcUserProgram.jar");
+    if (!Files.isRegularFile(jarPath)) {
+      throw new IOException("Missing frcUserProgram.jar inside " + sourceName);
+    }
+
+    Path configDir = extractedRoot.resolve("deploy/configs");
+    if (!Files.isDirectory(configDir) || !Files.isRegularFile(configDir.resolve("parameters.csv"))) {
+      throw new IOException(
+          "Invalid package " + sourceName + ": missing required deploy/configs/parameters.csv");
+    }
+    FluxFig fig = new FluxFig(configDir);
+    List<String> errors = fig.validateStrict();
+    if (!errors.isEmpty()) {
+      throw new IllegalStateException("FluxFig strict validation failed: " + errors);
+    }
+    return manifest;
+  }
+
+  static PackageManifest parseStrictManifest(String rawJson, String sourceName) throws IOException {
+    Map<String, String> mf = parseFlatJson(rawJson);
+    if (mf.isEmpty()) {
+      throw new IOException("Malformed manifest.json inside " + sourceName);
+    }
+    String packageName = requireNonBlankField(mf, "packageName", sourceName);
+    String targetPlatform = requireNonBlankField(mf, "targetPlatform", sourceName);
+    String channel = requireNonBlankField(mf, "channel", sourceName);
+    if (!"STABLE".equalsIgnoreCase(channel) && !"EXPERIMENTAL".equalsIgnoreCase(channel)) {
+      throw new IOException(
+          "Malformed manifest.json inside "
+              + sourceName
+              + ": invalid channel '"
+              + channel
+              + "' (expected STABLE or EXPERIMENTAL)");
+    }
+    String gitSha = requireNonBlankField(mf, "gitSha", sourceName);
+    String gitDirtyRaw = requireNonBlankField(mf, "gitDirty", sourceName);
+    boolean gitDirty;
+    if ("true".equalsIgnoreCase(gitDirtyRaw)) {
+      gitDirty = true;
+    } else if ("false".equalsIgnoreCase(gitDirtyRaw)) {
+      gitDirty = false;
+    } else {
+      throw new IOException(
+          "Malformed manifest.json inside "
+              + sourceName
+              + ": invalid gitDirty '"
+              + gitDirtyRaw
+              + "'");
+    }
+    String configSha = requireNonBlankField(mf, "configSha", sourceName);
+    String authorLaptop = mf.getOrDefault("authorLaptop", "");
+    return new PackageManifest(
+        packageName, targetPlatform, channel, gitSha, gitDirty, configSha, authorLaptop);
+  }
+
+  private static String requireNonBlankField(
+      Map<String, String> map, String key, String sourceName) throws IOException {
+    String val = map.get(key);
+    if (val == null || val.isBlank()) {
+      throw new IOException(
+          "Malformed manifest.json inside " + sourceName + ": missing required field '" + key + "'");
+    }
+    return val.trim();
+  }
+
+  /**
    * Atomically deploys a {@code .fluxpkg.zip} bundle onto the exact JAR executed by {@code
    * robotCommand}, stages and atomically swaps {@code deploy/}, rotates both JAR and {@code
-   * deploy/} into the 5-slot rollback ring, protects {@code prev_stable} from dirty {@code
-   * EXPERIMENTAL} packages, and restarts robot code.
+   * deploy/} into the 5-slot rollback ring, rolls back the JAR if {@code deploy/} fails, protects
+   * {@code prev_stable} from dirty {@code EXPERIMENTAL} packages, and restarts robot code.
    */
   public DeployStamp deployPackage(
       Path fluxPkgZip, RobotTransport robot, boolean forceOverwriteOtherLaptop)
@@ -194,38 +296,9 @@ public final class PackageDeployer {
     try {
       robot.assertRobotDisabledForTransfer("deployPackage:" + fluxPkgZip.getFileName());
       extractZip(fluxPkgZip, tempExtract);
-      Path manifestPath = tempExtract.resolve("manifest.json");
-      if (!Files.isRegularFile(manifestPath)) {
-        throw new IOException("Missing manifest.json inside " + fluxPkgZip);
-      }
-      Map<String, String> mf = parseFlatJson(Files.readString(manifestPath, StandardCharsets.UTF_8));
       PackageManifest manifest =
-          new PackageManifest(
-              mf.getOrDefault("packageName", fluxPkgZip.getFileName().toString()),
-              mf.getOrDefault("targetPlatform", "systemcore-2027"),
-              mf.getOrDefault("channel", "STABLE"),
-              mf.getOrDefault("gitSha", "0000000"),
-              Boolean.parseBoolean(mf.getOrDefault("gitDirty", "false")),
-              mf.getOrDefault("configSha", "00000000"),
-              mf.getOrDefault("authorLaptop", laptopId));
-
-      if (!manifest.targetPlatform().equalsIgnoreCase(robot.controllerPlatform())) {
-        throw new IllegalArgumentException(
-            "Platform mismatch: package targets '"
-                + manifest.targetPlatform()
-                + "' but robot is '"
-                + robot.controllerPlatform()
-                + "'");
-      }
-
-      Path configDir = tempExtract.resolve("deploy/configs");
-      if (Files.isDirectory(configDir) && Files.isRegularFile(configDir.resolve("parameters.csv"))) {
-        FluxFig fig = new FluxFig(configDir);
-        List<String> errors = fig.validateStrict();
-        if (!errors.isEmpty()) {
-          throw new IllegalStateException("FluxFig strict validation failed: " + errors);
-        }
-      }
+          validateExtractedPackage(
+              tempExtract, fluxPkgZip.getFileName().toString(), robot.controllerPlatform());
 
       String existingStampJson = robot.readRemoteText("deploy/deploy-stamp.json");
       DeployStamp existing = DeployStamp.fromJson(existingStampJson);
@@ -244,12 +317,10 @@ public final class PackageDeployer {
       }
 
       String activeJarTarget = robot.resolveActiveJarRemotePath();
+      boolean hadPreviousJar = robot.remoteFileExists(activeJarTarget);
       rotateRollbackRing(robot, activeJarTarget);
 
       Path jarPath = tempExtract.resolve("frcUserProgram.jar");
-      if (!Files.isRegularFile(jarPath)) {
-        throw new IOException("Missing frcUserProgram.jar inside " + fluxPkgZip);
-      }
       robot.uploadFileAtomic(jarPath, activeJarTarget);
 
       DeployStamp newStamp =
@@ -265,12 +336,28 @@ public final class PackageDeployer {
       Files.createDirectories(deployDir);
       Files.writeString(
           deployDir.resolve("deploy-stamp.json"), newStamp.toJson(), StandardCharsets.UTF_8);
-      robot.replaceRemoteDirectoryAtomic(deployDir, "deploy");
+      try {
+        robot.replaceRemoteDirectoryAtomic(deployDir, "deploy");
+      } catch (IOException | RuntimeException deployEx) {
+        // Never leave the robot split-brained with the new JAR and previous deploy/ directory.
+        try {
+          if (hadPreviousJar && robot.remoteFileExists("jars/prev_1.jar")) {
+            robot.copyRemoteFile("jars/prev_1.jar", activeJarTarget);
+          } else if (!hadPreviousJar) {
+            robot.deleteRemoteFile(activeJarTarget);
+          }
+        } catch (Exception rollbackEx) {
+          deployEx.addSuppressed(rollbackEx);
+        }
+        throw deployEx;
+      }
 
       boolean cleanStable = "STABLE".equalsIgnoreCase(manifest.channel()) && !manifest.gitDirty();
       if (cleanStable) {
         robot.uploadFileAtomic(jarPath, "jars/prev_stable.jar");
-        robot.copyRemoteDirectory("deploy", "jars/prev_stable_deploy");
+        if (!robot.copyRemoteDirectory("deploy", "jars/prev_stable_deploy")) {
+          throw new IOException("Failed to snapshot deploy/ into jars/prev_stable_deploy.");
+        }
       }
 
       robot.restartRobotCode();
@@ -418,8 +505,12 @@ public final class PackageDeployer {
         throw new IOException("No jars/prev_stable.jar found on robot to restore.");
       }
       String activeJarTarget = robot.resolveActiveJarRemotePath();
-      robot.copyRemoteFile("jars/prev_stable.jar", activeJarTarget);
-      robot.copyRemoteDirectory("jars/prev_stable_deploy", "deploy");
+      if (!robot.copyRemoteFile("jars/prev_stable.jar", activeJarTarget)) {
+        throw new IOException("Failed to restore jars/prev_stable.jar onto " + activeJarTarget);
+      }
+      if (!robot.copyRemoteDirectory("jars/prev_stable_deploy", "deploy")) {
+        throw new IOException("Failed to restore jars/prev_stable_deploy onto deploy/");
+      }
       robot.restartRobotCode();
     } finally {
       lockout.endTransfer();
@@ -440,8 +531,13 @@ public final class PackageDeployer {
         throw new IOException("Rollback slot " + slotPath + " does not exist on robot.");
       }
       String activeJarTarget = robot.resolveActiveJarRemotePath();
-      robot.copyRemoteFile(slotPath, activeJarTarget);
-      robot.copyRemoteDirectory("jars/prev_" + slot + "_deploy", "deploy");
+      if (!robot.copyRemoteFile(slotPath, activeJarTarget)) {
+        throw new IOException("Failed to restore " + slotPath + " onto " + activeJarTarget);
+      }
+      String deploySlot = "jars/prev_" + slot + "_deploy";
+      if (!robot.copyRemoteDirectory(deploySlot, "deploy")) {
+        throw new IOException("Failed to restore " + deploySlot + " onto deploy/");
+      }
       robot.restartRobotCode();
     } finally {
       lockout.endTransfer();
@@ -492,35 +588,170 @@ public final class PackageDeployer {
     zos.closeEntry();
   }
 
+  /**
+   * Parses a flat JSON object ({@code { ... }}) on either single or multiple lines into string
+   * key/value pairs, skipping nested arrays/objects and returning an empty map on malformed syntax.
+   */
   static Map<String, String> parseFlatJson(String json) {
     Map<String, String> map = new LinkedHashMap<>();
     if (json == null) {
       return map;
     }
-    for (String rawLine : json.split("\\R")) {
-      String line = rawLine.trim();
-      if (line.startsWith("{") || line.startsWith("}") || line.isEmpty()) {
-        continue;
-      }
-      int colon = line.indexOf(':');
-      if (colon <= 0) {
-        continue;
-      }
-      String k = stripQuotes(line.substring(0, colon).trim());
-      String v = line.substring(colon + 1).trim();
-      if (v.endsWith(",")) {
-        v = v.substring(0, v.length() - 1).trim();
-      }
-      map.put(k, stripQuotes(v));
+    String s = json.trim();
+    if (s.length() < 2 || s.charAt(0) != '{' || s.charAt(s.length() - 1) != '}') {
+      return map;
     }
-    return map;
+    int len = s.length();
+    int i = 1;
+    while (i < len) {
+      i = skipWhitespace(s, i);
+      if (i >= len) {
+        return Map.of();
+      }
+      char c = s.charAt(i);
+      if (c == '}') {
+        i = skipWhitespace(s, i + 1);
+        return i == len ? map : Map.of();
+      }
+      if (c != '"') {
+        return Map.of();
+      }
+      StringBuilder keyBuf = new StringBuilder();
+      int afterKey = readJsonString(s, i, keyBuf);
+      if (afterKey < 0) {
+        return Map.of();
+      }
+      i = skipWhitespace(s, afterKey);
+      if (i >= len || s.charAt(i) != ':') {
+        return Map.of();
+      }
+      i = skipWhitespace(s, i + 1);
+      if (i >= len) {
+        return Map.of();
+      }
+      char vc = s.charAt(i);
+      if (vc == '"') {
+        StringBuilder valBuf = new StringBuilder();
+        int afterVal = readJsonString(s, i, valBuf);
+        if (afterVal < 0) {
+          return Map.of();
+        }
+        map.put(keyBuf.toString(), valBuf.toString());
+        i = afterVal;
+      } else if (vc == '{' || vc == '[') {
+        int afterNested = skipNestedJson(s, i);
+        if (afterNested < 0) {
+          return Map.of();
+        }
+        i = afterNested;
+      } else {
+        int start = i;
+        while (i < len) {
+          char pc = s.charAt(i);
+          if (pc == ',' || pc == '}' || Character.isWhitespace(pc)) {
+            break;
+          }
+          i++;
+        }
+        String primitive = s.substring(start, i);
+        if (primitive.isEmpty()) {
+          return Map.of();
+        }
+        if (!"null".equals(primitive)) {
+          map.put(keyBuf.toString(), primitive);
+        }
+      }
+      i = skipWhitespace(s, i);
+      if (i >= len) {
+        return Map.of();
+      }
+      if (s.charAt(i) == ',') {
+        i++;
+      } else if (s.charAt(i) == '}') {
+        i = skipWhitespace(s, i + 1);
+        return i == len ? map : Map.of();
+      } else {
+        return Map.of();
+      }
+    }
+    return Map.of();
   }
 
-  private static String stripQuotes(String s) {
-    if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
-      return s.substring(1, s.length() - 1);
+  private static int skipWhitespace(String s, int idx) {
+    while (idx < s.length() && Character.isWhitespace(s.charAt(idx))) {
+      idx++;
     }
-    return s;
+    return idx;
+  }
+
+  private static int readJsonString(String s, int openQuoteIdx, StringBuilder out) {
+    int i = openQuoteIdx + 1;
+    while (i < s.length()) {
+      char c = s.charAt(i++);
+      if (c == '\\') {
+        if (i >= s.length()) {
+          return -1;
+        }
+        char esc = s.charAt(i++);
+        switch (esc) {
+          case '"', '\\', '/' -> out.append(esc);
+          case 'n' -> out.append('\n');
+          case 'r' -> out.append('\r');
+          case 't' -> out.append('\t');
+          case 'b' -> out.append('\b');
+          case 'f' -> out.append('\f');
+          case 'u' -> {
+            if (i + 4 > s.length()) {
+              return -1;
+            }
+            try {
+              out.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+            } catch (NumberFormatException e) {
+              return -1;
+            }
+            i += 4;
+          }
+          default -> out.append(esc);
+        }
+      } else if (c == '"') {
+        return i;
+      } else {
+        out.append(c);
+      }
+    }
+    return -1;
+  }
+
+  private static int skipNestedJson(String s, int openIdx) {
+    int depth = 0;
+    boolean inQuotes = false;
+    boolean escaped = false;
+    for (int i = openIdx; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (inQuotes) {
+        if (c == '\\') {
+          escaped = true;
+        } else if (c == '"') {
+          inQuotes = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        inQuotes = true;
+      } else if (c == '{' || c == '[') {
+        depth++;
+      } else if (c == '}' || c == ']') {
+        depth--;
+        if (depth == 0) {
+          return i + 1;
+        }
+      }
+    }
+    return -1;
   }
 
   private static String escape(String s) {

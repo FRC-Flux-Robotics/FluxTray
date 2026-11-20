@@ -32,17 +32,25 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
+import javax.sound.sampled.LineUnavailableException;
 
 /**
  * Comprehensive verification suite for {@code FluxTray.jar} covering M1.6–M1.10 plus existing
@@ -87,7 +95,19 @@ public final class FluxTrayTest {
       testNt4WebSocketLiveLockoutAndOncePerDisableAutoPull();
       testRoboRioRobotCommandAtomicDeployRestartAndRobotStateLockout();
       testDriveWatcherIncrementalLedgerDsLogFilterAtomicZipAndRealWavAudio();
-      System.out.println("FluxTrayTest: ALL 9 SUITES PASSED");
+      testSshTransportBlocksOnEnabledHeartbeatAndQuotesRemotePaths();
+      testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus();
+      testUtcRobotLogNamesAndLocalDsLogWindowWithMtimeGuard();
+      testTrayActionCoordinatorSerializesDrivePollsAndOnlySetsBusyOnTransfer();
+      testAudioRecorderReEnableInsideDebriefClosesRun1AndStartsRun2();
+      testUsbLogRootDeduplicationAndUsbRunMetaHydration();
+      testDriveWatcherStatePersistenceRejectedLatchPartialConfigsAndDebounce();
+      testFailedPullKeepsMentorAudio();
+      testManualRestoreStablePullsLogsFirst();
+      testZipBuiltInTempBeforeMoveAndAudioFailureNotifies();
+      testMalformedManifestFailsClosedAndRollbackChecksDeployCopy();
+      testTruncatedMsgPackFrameNeverMarksDisabled();
+      System.out.println("FluxTrayTest: ALL 21 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -972,14 +992,18 @@ public final class FluxTrayTest {
         "Invalid code/configs/*.csv blocked locally by FluxFig.validateStrict()");
     assertEquals(restartsBeforeBadCfg, rio.restartCount(), "Robot untouched on invalid config");
 
-    // Emptying code/ (.fluxpkg.zip removed) triggers Restore STABLE after 2 stabilized polls.
+    // Emptying code/ (.fluxpkg.zip removed) waits >= 25 s debounce before Restore STABLE.
     Files.delete(codeDir.resolve("STABLE_v2027.2.0_roborio-2026_fluxpkg.zip"));
     assertEquals(ActionType.NONE, watcher.pollOnce(nowMs + 4_000L).action(), "Empty poll 1 waits");
-    PollOutcome restoreOutcome = watcher.pollOnce(nowMs + 5_000L);
+    assertEquals(
+        ActionType.NONE,
+        watcher.pollOnce(nowMs + 10_000L).action(),
+        "Empty poll at +6s still waits inside 25s debounce");
+    PollOutcome restoreOutcome = watcher.pollOnce(nowMs + 30_000L);
     assertEquals(
         ActionType.RESTORED_STABLE,
         restoreOutcome.action(),
-        "Emptying code/ restores prev_stable and restarts robot");
+        "Emptying code/ restores prev_stable after >= 25s debounce and restarts robot");
     assertEquals(restartsBeforeBadCfg + 1, rio.restartCount(), "Robot restarted on empty-code restore");
 
     // Tray icon colors & persistent fluxtray.log check.
@@ -991,6 +1015,1528 @@ public final class FluxTrayTest {
         Files.readString(trayLogFile, StandardCharsets.UTF_8).contains("Smoke test log entry"),
         "Persistent fluxtray.log written");
     assertTrue(!toasts.isEmpty(), "Toast notifications emitted");
+  }
+
+  private static void testSshTransportBlocksOnEnabledHeartbeatAndQuotesRemotePaths()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-ssh-transport-");
+    Path deployDir = temp.resolve("deploy");
+    Path pathsDir = deployDir.resolve("pathplanner/paths");
+    Files.createDirectories(pathsDir);
+    Files.writeString(
+        pathsDir.resolve("Hub to Depot.path"), "{\"name\":\"Hub to Depot\"}", StandardCharsets.UTF_8);
+    Files.writeString(
+        pathsDir.resolve("Left to Depot.path"),
+        "{\"name\":\"Left to Depot\"}",
+        StandardCharsets.UTF_8);
+    Files.writeString(
+        pathsDir.resolve("Right to Depot.path"),
+        "{\"name\":\"Right to Depot\"}",
+        StandardCharsets.UTF_8);
+
+    long remoteNowSec = 1_763_650_000L;
+    AtomicReference<String> heartbeatOutput =
+        new AtomicReference<>(
+            "REMOTE_EPOCH_SEC="
+                + remoteNowSec
+                + "\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+                + (remoteNowSec * 1_000L - 500L)
+                + "\nROBOT_ID=FUEL\nPID=4321\n");
+
+    record RecordedCall(List<String> argv, byte[] stdin) {}
+    List<RecordedCall> recorded = new ArrayList<>();
+    SshRobotTransport.ProcessRunner runner =
+        (argv, stdin, timeout) -> {
+          recorded.add(new RecordedCall(argv, stdin != null ? stdin.clone() : null));
+          String lastArg = argv.get(argv.size() - 1);
+          if ("ssh".equals(argv.get(0)) && lastArg.contains("HEARTBEAT_PRESENT=")) {
+            return new SshRobotTransport.ProcessResult(0, heartbeatOutput.get(), "");
+          }
+          return new SshRobotTransport.ProcessResult(0, "OK\n", "");
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    SshRobotTransport ssh =
+        new SshRobotTransport(List.of("10.104.13.2"), false, lockout, false, runner);
+
+    // Space-named PathPlanner files stream as one USTAR tar over ssh stdin (zero scp calls).
+    ssh.replaceRemoteDirectoryAtomic(deployDir, "deploy");
+    assertTrue(
+        recorded.stream().noneMatch(c -> "scp".equals(c.argv().get(0))),
+        "replaceRemoteDirectoryAtomic must stream tar over ssh instead of per-file scp");
+    RecordedCall tarCall =
+        recorded.stream()
+            .filter(c -> c.stdin() != null && c.stdin().length > 0)
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("Expected tar stdin payload over ssh"));
+    assertTrue(
+        tarCall.argv().get(tarCall.argv().size() - 1).contains("tar -xf - -C"),
+        "Expected tar -xf - -C staging command");
+    Map<String, String> extractedTar = parseUstarTextEntries(tarCall.stdin());
+    assertEquals(
+        "{\"name\":\"Hub to Depot\"}",
+        extractedTar.get("pathplanner/paths/Hub to Depot.path"),
+        "USTAR tar contains Hub to Depot.path intact");
+    assertEquals(
+        "{\"name\":\"Left to Depot\"}",
+        extractedTar.get("pathplanner/paths/Left to Depot.path"),
+        "USTAR tar contains Left to Depot.path intact");
+    assertEquals(
+        "{\"name\":\"Right to Depot\"}",
+        extractedTar.get("pathplanner/paths/Right to Depot.path"),
+        "USTAR tar contains Right to Depot.path intact");
+    RecordedCall swapCall = recorded.get(recorded.size() - 1);
+    String swapCmd = swapCall.argv().get(swapCall.argv().size() - 1);
+    assertTrue(
+        swapCmd.contains("/tmp/flux-robot-state") && swapCmd.contains("mv "),
+        "Atomic directory swap must inline /tmp/flux-robot-state guard inside the same ssh call");
+
+    // downloadSelectedLogs must POSIX single-quote remote paths containing spaces.
+    recorded.clear();
+    List<RobotTransport.RemoteLogEntry> spaceLogs =
+        List.of(
+            new RobotTransport.RemoteLogEntry(
+                "/U/logs/Hub to Depot.wpilog", "usb_U/Hub to Depot.wpilog", 512L, remoteNowSec));
+    ssh.downloadSelectedLogs(spaceLogs, temp.resolve("dl"));
+    RecordedCall scpCall =
+        recorded.stream()
+            .filter(c -> "scp".equals(c.argv().get(0)))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("Expected scp download call"));
+    assertTrue(
+        scpCall.argv().contains("lvuser@10.104.13.2:'/U/logs/Hub to Depot.wpilog'"),
+        "downloadSelectedLogs must POSIX single-quote space-named remote paths: " + scpCall.argv());
+
+    // restartRobotCode must inline /tmp/flux-robot-state guard right before frcKillRobot.sh.
+    recorded.clear();
+    ssh.restartRobotCode();
+    String restartCmd = recorded.get(recorded.size() - 1).argv().get(recorded.get(recorded.size() - 1).argv().size() - 1);
+    assertTrue(
+        restartCmd.contains("/tmp/flux-robot-state")
+            && restartCmd.contains("/usr/local/frc/bin/frcKillRobot.sh -t -r"),
+        "restartRobotCode must inline /tmp/flux-robot-state guard before frcKillRobot.sh");
+
+    // Fail-closed heartbeat checks: ENABLED, FMS, STALE, CORRUPT, and ABSENT.
+    heartbeatOutput.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nHEARTBEAT_PRESENT=1\nSTATE=ENABLED\nENABLED=true\nFMS=false\nEPOCH_MS="
+            + (remoteNowSec * 1_000L)
+            + "\nROBOT_ID=FUEL\nPID=4321\n");
+    assertThrowsIllegalState(
+        () -> ssh.listRemoteLogEntries(), "ENABLED heartbeat must block listRemoteLogEntries");
+    // Reset local lockout back to disabled before testing remaining robot-side heartbeat states.
+    lockout.updateState(false, false, System.currentTimeMillis());
+
+    heartbeatOutput.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + (remoteNowSec * 1_000L - 10_000L)
+            + "\nROBOT_ID=FUEL\nPID=4321\n");
+    assertThrowsIllegalState(
+        () -> ssh.captureSystemSnapshotRaw(), "Stale (>5s) heartbeat must block captureSystemSnapshotRaw");
+
+    heartbeatOutput.set(
+        "REMOTE_EPOCH_SEC=" + remoteNowSec + "\nHEARTBEAT_PRESENT=1\nCORRUPT_GARBAGE_LINE\n");
+    assertThrowsIllegalState(
+        () -> ssh.assertRobotDisabledForTransfer("corruptTest"),
+        "Corrupt heartbeat must fail closed");
+
+    heartbeatOutput.set("REMOTE_EPOCH_SEC=" + remoteNowSec + "\nHEARTBEAT_PRESENT=0\n");
+    assertThrowsIllegalState(
+        () -> ssh.assertRobotDisabledForTransfer("absentTest"),
+        "Absent heartbeat must fail closed by default");
+
+    // Explicit bootstrap opt-in allows ONLY absent heartbeat, never corrupt heartbeat.
+    SshRobotTransport bootstrapSsh =
+        new SshRobotTransport(List.of("10.104.13.2"), false, lockout, true, runner);
+    bootstrapSsh.assertRobotDisabledForTransfer("bootstrapAbsentAllowed");
+    heartbeatOutput.set(
+        "REMOTE_EPOCH_SEC=" + remoteNowSec + "\nHEARTBEAT_PRESENT=1\nENABLED=notabool\n");
+    assertThrowsIllegalState(
+        () -> bootstrapSsh.assertRobotDisabledForTransfer("bootstrapCorruptBlocked"),
+        "Corrupt heartbeat must stay fail-closed even with --allow-missing-heartbeat");
+
+    // PackageDeployer must roll back the live JAR from prev_1.jar if replaceRemoteDirectoryAtomic fails.
+    MockRobotServer mockRio = new MockRobotServer(temp.resolve("rollback-rio"), "roborio-2026");
+    mockRio.setRobotIdentityFile("FUEL");
+    Path cfgValid = createSampleFluxFigConfigs(temp.resolve("rb-cfg"), "Drivetrain", 60.0);
+    Path jarV1 = temp.resolve("v1.jar");
+    Path jarV2 = temp.resolve("v2.jar");
+    Files.writeString(jarV1, "LIVE_STABLE_JAR_V1", StandardCharsets.UTF_8);
+    Files.writeString(jarV2, "NEW_BROKEN_DEPLOY_JAR_V2", StandardCharsets.UTF_8);
+    Path pkgV1 =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("v1_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_v1", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+            jarV1,
+            cfgValid);
+    Path pkgV2 =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("v2_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "EXP_v2", "roborio-2026", "EXPERIMENTAL", "2222222", true, "cfg22222", "boris"),
+            jarV2,
+            cfgValid);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    deployer.deployPackage(pkgV1, mockRio, true);
+
+    RobotTransport failingDeployTransport =
+        new DelegatingRobotTransport(mockRio) {
+          @Override
+          public void replaceRemoteDirectoryAtomic(Path localDir, String remoteRelativeDir)
+              throws IOException {
+            throw new IOException("Simulated deploy/ upload failure");
+          }
+        };
+    boolean deployFailed = false;
+    try {
+      deployer.deployPackage(pkgV2, failingDeployTransport, true);
+    } catch (IOException expected) {
+      deployFailed = true;
+    }
+    assertTrue(deployFailed, "deployPackage must propagate deploy/ failure");
+    assertEquals(
+        "LIVE_STABLE_JAR_V1",
+        mockRio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        "Live JAR must roll back to prev_1.jar when replaceRemoteDirectoryAtomic fails");
+  }
+
+  private static void testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus()
+      throws Exception {
+    assertEquals(
+        FluxTrayMain.TrayStatus.DISCONNECTED,
+        FluxTrayMain.computeTrayStatus(false, true, false, false),
+        "Disconnected NT4 must show Gray DISCONNECTED (never stuck Red ENABLED)");
+    assertEquals(
+        FluxTrayMain.TrayStatus.DISCONNECTED,
+        FluxTrayMain.computeTrayStatus(false, false, true, false),
+        "Disconnected NT4 must show Gray DISCONNECTED (never stuck Red FMS)");
+    assertEquals(
+        FluxTrayMain.TrayStatus.ENABLED,
+        FluxTrayMain.computeTrayStatus(true, true, false, false),
+        "Connected Enabled robot shows Red ENABLED");
+    assertEquals(
+        FluxTrayMain.TrayStatus.READY,
+        FluxTrayMain.computeTrayStatus(true, false, false, false),
+        "Connected Disabled idle robot shows Green READY");
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    AtomicInteger acceptedConnections = new AtomicInteger(0);
+    CountDownLatch firstConnected = new CountDownLatch(1);
+    CountDownLatch disconnectedAfterSilence = new CountDownLatch(1);
+    CountDownLatch secondDisabledReceived = new CountDownLatch(1);
+
+    try (ServerSocket server = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))) {
+      int port = server.getLocalPort();
+      AtomicBoolean serverStop = new AtomicBoolean(false);
+      Thread serverThread =
+          new Thread(
+              () -> {
+                while (!serverStop.get()) {
+                  try {
+                    Socket client = server.accept();
+                    int connNum = acceptedConnections.incrementAndGet();
+                    Thread handler =
+                        new Thread(
+                            () -> {
+                              try (Socket s = client) {
+                                performWsServerHandshake(s);
+                                OutputStream out = s.getOutputStream();
+                                String announce =
+                                    "[{\"method\":\"announce\",\"params\":{\"name\":\"/FMSInfo/FMSControlData\",\"id\":7,\"type\":\"int\",\"properties\":{}}}]";
+                                sendWsFrame(out, 0x01, announce.getBytes(StandardCharsets.UTF_8));
+                                if (connNum == 1) {
+                                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 1_000_000L, 0x21));
+                                  // Go completely silent: ignore pings and never send pong.
+                                  Thread.sleep(3_000L);
+                                } else {
+                                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 2_000_000L, 0x20));
+                                  secondDisabledReceived.await(3, TimeUnit.SECONDS);
+                                }
+                              } catch (Exception ignored) {
+                              }
+                            },
+                            "silent-nt4-conn-" + connNum);
+                    handler.setDaemon(true);
+                    handler.start();
+                  } catch (IOException ignored) {
+                    break;
+                  }
+                }
+              },
+              "silent-nt4-server");
+      serverThread.setDaemon(true);
+      serverThread.start();
+
+      try (Nt4RobotStateClient ntClient =
+          new Nt4RobotStateClient(
+              List.of("127.0.0.1"),
+              port,
+              lockout,
+              (enabled, fms, word, host, ts) -> {
+                if (enabled && word == 0x21) {
+                  firstConnected.countDown();
+                } else if (!enabled && word == 0x20 && acceptedConnections.get() >= 2) {
+                  secondDisabledReceived.countDown();
+                }
+              },
+              System::currentTimeMillis,
+              100L,
+              300L,
+              50L)) {
+        AtomicBoolean sawConn = new AtomicBoolean(false);
+        ntClient.setConnectionChangeListener(
+            () -> {
+              if (ntClient.isConnected()) {
+                sawConn.set(true);
+              } else if (sawConn.get()) {
+                disconnectedAfterSilence.countDown();
+              }
+            });
+        ntClient.start();
+
+        assertTrue(firstConnected.await(4, TimeUnit.SECONDS), "Initial NT4 connection received Enabled");
+        assertTrue(
+            disconnectedAfterSilence.await(4, TimeUnit.SECONDS),
+            "Silent half-open NT4 socket must abort after idle timeout");
+        assertTrue(
+            secondDisabledReceived.await(4, TimeUnit.SECONDS),
+            "NT4 client must reconnect cleanly after idle timeout and receive Disabled");
+        assertTrue(
+            acceptedConnections.get() >= 2,
+            "Expected >= 2 connections after silent socket abort, got " + acceptedConnections.get());
+      } finally {
+        serverStop.set(true);
+      }
+    }
+  }
+
+  private static void testUtcRobotLogNamesAndLocalDsLogWindowWithMtimeGuard() throws IOException {
+    Path temp = createTempDir("fluxtray-tz-window-");
+    // 18:00:00 UTC on 2026-11-20 equals 13:00:00 EST in America/New_York (UTC-5).
+    ZoneId nyZone = ZoneId.of("America/New_York");
+    long utcTargetMs = Instant.parse("2026-11-20T18:00:00Z").toEpochMilli();
+    assertEquals(
+        utcTargetMs,
+        BatteryAndRunManager.parseRobotLogNameEpochMs("akit_26-11-20_18-00-00.wpilog"),
+        "AdvantageKit robot log filename must parse in UTC regardless of laptop timezone");
+    assertEquals(
+        utcTargetMs,
+        BatteryAndRunManager.parseDsLogNameEpochMs("2026_11_20_13_00_00.dslog", nyZone),
+        "NI Driver Station .dslog filename must parse in local timezone");
+
+    // Case A: Test with JVM default timezone (fails under America/New_York if robot names parsed locally).
+    Path runDirDefaultTz = temp.resolve("run-default-tz");
+    Path dsDirDefaultTz = temp.resolve("ds-default-tz");
+    Files.createDirectories(runDirDefaultTz);
+    Files.createDirectories(dsDirDefaultTz);
+    Path robotWpilog = runDirDefaultTz.resolve("akit_26-11-20_18-00-00.wpilog");
+    Files.writeString(robotWpilog, "WPILOG", StandardCharsets.UTF_8);
+    // Give files 2024 mtime so matching depends strictly on parsed filename timestamps.
+    FileTime stale2024 = FileTime.from(Instant.parse("2024-12-18T14:08:00Z"));
+    Files.setLastModifiedTime(robotWpilog, stale2024);
+
+    DateTimeFormatter dsFmt = DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss", Locale.US);
+    LocalDateTime expectedLocal =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(utcTargetMs), ZoneId.systemDefault());
+    Path matchingLocalDs = dsDirDefaultTz.resolve(expectedLocal.format(dsFmt) + ".dslog");
+    Path shiftedFiveHoursDs =
+        dsDirDefaultTz.resolve(expectedLocal.plusHours(5).format(dsFmt) + ".dslog");
+    Files.writeString(matchingLocalDs, "MATCH_LOCAL", StandardCharsets.UTF_8);
+    Files.writeString(shiftedFiveHoursDs, "SHIFTED_5H", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(matchingLocalDs, stale2024);
+    Files.setLastModifiedTime(shiftedFiveHoursDs, stale2024);
+
+    int copiedDefault =
+        BatteryAndRunManager.copyWindowedLocalDsLogs(
+            dsDirDefaultTz, runDirDefaultTz, 0L, 0L, 0L);
+    assertEquals(1, copiedDefault, "Exactly 1 local .dslog matches UTC robot log under default TZ");
+    assertTrue(
+        Files.isRegularFile(runDirDefaultTz.resolve(matchingLocalDs.getFileName())),
+        "Matching local-time .dslog copied");
+    assertTrue(
+        !Files.isRegularFile(runDirDefaultTz.resolve(shiftedFiveHoursDs.getFileName())),
+        "5-hour-shifted .dslog excluded");
+
+    // Explicit America/New_York zone check even when JVM runs in UTC.
+    Path runDirNy = temp.resolve("run-ny");
+    Path dsDirNy = temp.resolve("ds-ny");
+    Files.createDirectories(runDirNy);
+    Files.createDirectories(dsDirNy);
+    Path nyRobotLog = runDirNy.resolve("akit_26-11-20_18-00-00.wpilog");
+    Files.writeString(nyRobotLog, "WPILOG", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(nyRobotLog, stale2024);
+    Path ny1300 = dsDirNy.resolve("2026_11_20_13_00_00.dslog");
+    Path ny1800 = dsDirNy.resolve("2026_11_20_18_00_00.dslog");
+    Files.writeString(ny1300, "EST_1300", StandardCharsets.UTF_8);
+    Files.writeString(ny1800, "EST_1800_WRONG", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(ny1300, stale2024);
+    Files.setLastModifiedTime(ny1800, stale2024);
+    int copiedNy =
+        BatteryAndRunManager.copyWindowedLocalDsLogs(dsDirNy, runDirNy, 0L, 0L, 0L, nyZone);
+    assertEquals(1, copiedNy, "America/New_York matches 13:00 EST .dslog for 18:00 UTC .wpilog");
+    assertTrue(Files.isRegularFile(runDirNy.resolve("2026_11_20_13_00_00.dslog")), "13:00 EST kept");
+    assertTrue(!Files.isRegularFile(runDirNy.resolve("2026_11_20_18_00_00.dslog")), "18:00 EST excluded");
+
+    // Case B: Unsynced 2024 roboRIO log & 2024 mtime must NOT sweep years of old .dslog files.
+    Path runDir2024 = temp.resolve("run-unsynced-2024");
+    Path dsDir2024 = temp.resolve("ds-unsynced-2024");
+    Files.createDirectories(runDir2024);
+    Files.createDirectories(dsDir2024);
+    Path unsyncedLog = runDir2024.resolve("akit_24-12-18_14-08-00.wpilog");
+    Files.writeString(unsyncedLog, "UNSYNCED_2024", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(unsyncedLog, stale2024);
+    Path old2024Ds = dsDir2024.resolve("2024_12_18_09_08_00.dslog");
+    Path old2025Ds = dsDir2024.resolve("2025_06_01_12_00_00.dslog");
+    Path current2026Ds = dsDir2024.resolve("2026_11_20_13_00_00.dslog");
+    Files.writeString(old2024Ds, "OLD2024", StandardCharsets.UTF_8);
+    Files.writeString(old2025Ds, "OLD2025", StandardCharsets.UTF_8);
+    Files.writeString(current2026Ds, "CUR2026", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(old2024Ds, stale2024);
+    Files.setLastModifiedTime(old2025Ds, FileTime.from(Instant.parse("2025-06-01T16:00:00Z")));
+    Files.setLastModifiedTime(current2026Ds, FileTime.fromMillis(utcTargetMs));
+
+    int copiedFallback =
+        BatteryAndRunManager.copyWindowedLocalDsLogs(
+            dsDir2024, runDir2024, utcTargetMs, 0L, 0L, nyZone);
+    assertEquals(1, copiedFallback, "Guarded mtime falls back to 2026 nowMs without sweeping 2024/2025");
+    assertTrue(Files.isRegularFile(runDir2024.resolve("2026_11_20_13_00_00.dslog")), "Only 2026 .dslog copied");
+    assertTrue(!Files.isRegularFile(runDir2024.resolve("2024_12_18_09_08_00.dslog")), "2024 .dslog excluded");
+    assertTrue(!Files.isRegularFile(runDir2024.resolve("2025_06_01_12_00_00.dslog")), "2025 .dslog excluded");
+
+    // Case C: Local audio timestamps take precedence over skewed robot log timestamps.
+    long audioEnable = Instant.parse("2026-11-20T18:00:00Z").toEpochMilli();
+    long audioDisable = audioEnable + 15_000L;
+    long[] audioWindow =
+        BatteryAndRunManager.resolveRunTimeWindowMs(
+            runDir2024, Instant.parse("2026-11-21T10:00:00Z").toEpochMilli(), audioEnable, audioDisable);
+    assertEquals(audioEnable, audioWindow[0], "Local audio enable timestamp preferred");
+    assertEquals(audioDisable, audioWindow[1], "Local audio disable timestamp preferred");
+  }
+
+  private static void testTrayActionCoordinatorSerializesDrivePollsAndOnlySetsBusyOnTransfer()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-coordinator-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.seedSimulatedMatchLogs("2026-11-20_18-00-00", "FUEL", "11223344");
+
+    CountDownLatch pullEnteredDownload = new CountDownLatch(1);
+    CountDownLatch releasePullDownload = new CountDownLatch(1);
+    List<String> timeline = new CopyOnWriteArrayList<>();
+
+    RobotTransport blockingRobot =
+        new DelegatingRobotTransport(rio) {
+          private final AtomicBoolean blockedOnce = new AtomicBoolean(false);
+
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RemoteLogEntry> entries, Path localDestinationDir) throws IOException {
+            if (blockedOnce.compareAndSet(false, true)) {
+              timeline.add("PULL_START");
+              pullEnteredDownload.countDown();
+              try {
+                releasePullDownload.await(5, TimeUnit.SECONDS);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+              Map<String, Path> res = super.downloadSelectedLogs(entries, localDestinationDir);
+              timeline.add("PULL_END");
+              return res;
+            }
+            return super.downloadSelectedLogs(entries, localDestinationDir);
+          }
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    List<Boolean> busyTransitions = new CopyOnWriteArrayList<>();
+
+    try (FluxTrayMain.TrayActionCoordinator coordinator =
+        new FluxTrayMain.TrayActionCoordinator(
+            blockingRobot,
+            deployer,
+            runMgr,
+            audio,
+            lockout,
+            dsDir,
+            logsDir,
+            stateDir.resolve("fluxtray.log"),
+            (lvl, title, msg) -> {},
+            busyTransitions::add)) {
+
+      DriveWatcher watcher =
+          new DriveWatcher(
+              codeDir,
+              logsDir,
+              dsDir,
+              blockingRobot,
+              deployer,
+              runMgr,
+              lockout,
+              (lvl, title, msg) -> {},
+              stateDir,
+              DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS,
+              coordinator::setBusySyncing);
+
+      // Idle Drive poll must NEVER flip busySyncing to true (no Yellow strobe).
+      Future<?> idlePoll =
+          coordinator.submitDrivePollIfIdle(
+              watcher,
+              () -> {
+                timeline.add("IDLE_POLL");
+                return 1_763_650_000_000L;
+              });
+      idlePoll.get(5, TimeUnit.SECONDS);
+      assertTrue(
+          busyTransitions.isEmpty(),
+          "Idle Drive poll must never set busySyncing/Yellow, got " + busyTransitions);
+
+      // Submit manual pull; while it is blocked in downloadSelectedLogs, fire Drive polls.
+      Future<?> pullFuture = coordinator.submitManualPull();
+      assertTrue(
+          pullEnteredDownload.await(5, TimeUnit.SECONDS), "Manual pull entered download phase");
+      Future<?> queuedPoll =
+          coordinator.submitDrivePollIfIdle(
+              watcher,
+              () -> {
+                timeline.add("DRIVE_POLL");
+                return 1_763_650_001_000L;
+              });
+      // A second poll while one is already queued must coalesce cleanly (returns null).
+      Future<?> coalescedPoll =
+          coordinator.submitDrivePollIfIdle(watcher, () -> 1_763_650_002_000L);
+      assertEquals(null, coalescedPoll, "Duplicate queued Drive poll coalesced");
+
+      // Wait briefly to prove DRIVE_POLL does NOT sneak in while PULL is in progress.
+      Thread.sleep(150L);
+      assertTrue(
+          !timeline.contains("DRIVE_POLL"),
+          "Drive poll must NOT execute concurrently between PULL_START and PULL_END: " + timeline);
+
+      releasePullDownload.countDown();
+      pullFuture.get(5, TimeUnit.SECONDS);
+      queuedPoll.get(5, TimeUnit.SECONDS);
+
+      int startIdx = timeline.indexOf("PULL_START");
+      int endIdx = timeline.indexOf("PULL_END");
+      int pollIdx = timeline.indexOf("DRIVE_POLL");
+      assertTrue(
+          startIdx >= 0 && endIdx > startIdx && pollIdx > endIdx,
+          "Expected PULL_START -> PULL_END -> DRIVE_POLL strictly serialized, got " + timeline);
+
+      // Actual Drive package deploy MUST turn busySyncing true during transfer and false after.
+      busyTransitions.clear();
+      Path cfg = createSampleFluxFigConfigs(temp.resolve("coord-cfg"), "Drivetrain", 60.0);
+      Path jar = temp.resolve("coord.jar");
+      Files.writeString(jar, "COORD_DEPLOY_JAR", StandardCharsets.UTF_8);
+      PackageDeployer.createFluxPkgZip(
+          codeDir.resolve("STABLE_coord_roborio-2026_fluxpkg.zip"),
+          new PackageManifest(
+              "STABLE_coord", "roborio-2026", "STABLE", "abc1234", false, "11223344", "boris"),
+          jar,
+          cfg);
+      coordinator.submitDrivePollIfIdle(watcher, () -> 1_763_650_010_000L).get(5, TimeUnit.SECONDS);
+      assertTrue(
+          busyTransitions.isEmpty(), "Stabilizing poll 1 (no transfer) must not set busySyncing");
+      coordinator.submitDrivePollIfIdle(watcher, () -> 1_763_650_011_000L).get(5, TimeUnit.SECONDS);
+      assertEquals(
+          List.of(Boolean.TRUE, Boolean.FALSE),
+          busyTransitions,
+          "Actual Drive deploy must set busySyncing=true during transfer and false afterward");
+    }
+  }
+
+  private static void testAudioRecorderReEnableInsideDebriefClosesRun1AndStartsRun2()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-reenable-debrief-");
+    Path spoolRoot = temp.resolve("pending-audio");
+    byte[] run1Pcm = generateSinePcm16kHz(0.20, 440.0);
+    byte[] run2Pcm = generateSinePcm16kHz(0.25, 880.0);
+    AtomicInteger openCount = new AtomicInteger(0);
+
+    MultiMicAudioRecorder recorder =
+        new MultiMicAudioRecorder(
+            fmt -> {
+              byte[] source = openCount.incrementAndGet() == 1 ? run1Pcm : run2Pcm;
+              AtomicInteger off = new AtomicInteger(0);
+              return new MultiMicAudioRecorder.PcmCapturePort() {
+                @Override
+                public int read(byte[] buf, int offset, int length) {
+                  int cur = off.get();
+                  if (cur >= source.length) {
+                    return -1;
+                  }
+                  int n = Math.min(length, source.length - cur);
+                  System.arraycopy(source, cur, buf, offset, n);
+                  off.addAndGet(n);
+                  return n;
+                }
+
+                @Override
+                public void close() {}
+              };
+            });
+    recorder.setSpoolRootDir(spoolRoot);
+
+    long t1Enable = 1_763_650_000_000L;
+    long t2Disable = t1Enable + 10_000L;
+    long t3ReEnable = t2Disable + 4_000L; // Inside the 15 s debrief window!
+    long t4Disable = t3ReEnable + 8_000L;
+
+    recorder.onRobotStateChanged(true, t1Enable);
+    Thread.sleep(60L);
+    recorder.onRobotStateChanged(false, t2Disable);
+    assertEquals(11_000L, recorder.remainingPostDisableMs(t3ReEnable), "Run 1 still inside debrief");
+
+    // Re-enable inside 15 s debrief: Run 1 must flush to spool and Run 2 must start fresh.
+    recorder.onRobotStateChanged(true, t3ReEnable);
+    Thread.sleep(60L);
+
+    Path run1Spool = spoolRoot.resolve(Long.toString(t1Enable));
+    assertTrue(
+        Files.isRegularFile(run1Spool.resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME))
+            && Files.size(run1Spool.resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME)) > 44L,
+        "Run 1 audio flushed safely to durable spool on re-enable");
+    String run1Sync =
+        Files.readString(
+            run1Spool.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME), StandardCharsets.UTF_8);
+    assertTrue(
+        run1Sync.contains("\"enableEpochMs\": " + t1Enable)
+            && run1Sync.contains("\"disableEpochMs\": " + t2Disable),
+        "Run 1 audio-sync.json preserves Run 1 enable/disable timestamps: " + run1Sync);
+
+    assertTrue(recorder.isRecording(), "Run 2 actively recording");
+    assertEquals(t3ReEnable, recorder.enableStartEpochMs(), "Run 2 has fresh enableEpochMs");
+    assertEquals(0L, recorder.disableStartEpochMs(), "Run 2 has reset disableStartEpochMs=0");
+
+    recorder.onRobotStateChanged(false, t4Disable);
+    assertEquals(
+        MultiMicAudioRecorder.POST_DISABLE_DEBRIEF_WINDOW_MS,
+        recorder.remainingPostDisableMs(t4Disable),
+        "Run 2 gets full 15 s debrief window");
+    assertTrue(
+        !recorder.isPostDisableWindowComplete(t4Disable + 5_000L),
+        "Run 2 debrief not complete at +5s");
+    assertTrue(
+        recorder.isPostDisableWindowComplete(t4Disable + 15_000L),
+        "Run 2 debrief completes at +15s");
+
+    Path run2Out = temp.resolve("run2");
+    Path run2Wav = recorder.flushAudioFile(run2Out);
+    assertTrue(Files.size(run2Wav) > 44L, "Run 2 WAV has real PCM payload");
+    String run2Sync =
+        Files.readString(
+            run2Out.resolve(MultiMicAudioRecorder.AUDIO_SYNC_FILE_NAME), StandardCharsets.UTF_8);
+    assertTrue(
+        run2Sync.contains("\"enableEpochMs\": " + t3ReEnable)
+            && run2Sync.contains("\"disableEpochMs\": " + t4Disable),
+        "Run 2 audio-sync.json contains exact Run 2 timestamps: " + run2Sync);
+  }
+
+  private static void testUsbLogRootDeduplicationAndUsbRunMetaHydration() throws Exception {
+    Path temp = createTempDir("fluxtray-usb-dedup-");
+    long nowSec = 1_763_650_000L;
+    AtomicReference<String> probeCommandSeen = new AtomicReference<>("");
+    SshRobotTransport.ProcessRunner runner =
+        (argv, stdin, timeout) -> {
+          String cmd = argv.get(argv.size() - 1);
+          if ("ssh".equals(argv.get(0)) && cmd.contains("HEARTBEAT_PRESENT=")) {
+            return new SshRobotTransport.ProcessResult(
+                0,
+                "REMOTE_EPOCH_SEC="
+                    + nowSec
+                    + "\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+                    + (nowSec * 1_000L)
+                    + "\nROBOT_ID=CORAL\nPID=99\n",
+                "");
+          }
+          if ("ssh".equals(argv.get(0)) && cmd.contains("readlink -f")) {
+            probeCommandSeen.set(cmd);
+            // Simulate /U/logs and /media/sda1 resolving to the same canonical USB files.
+            String stdout =
+                "/U/logs|/media/sda1/logs|/media/sda1/logs/akit_26-11-20_18-00-00.wpilog|2048|"
+                    + nowSec
+                    + "\n"
+                    + "/U/logs|/media/sda1/logs|/media/sda1/logs/run-meta.json|220|"
+                    + nowSec
+                    + "\n"
+                    + "/media/sda1|/media/sda1|/media/sda1/logs/akit_26-11-20_18-00-00.wpilog|2048|"
+                    + nowSec
+                    + "\n"
+                    + "/media/sda1|/media/sda1|/media/sda1/logs/run-meta.json|220|"
+                    + nowSec
+                    + "\n";
+            return new SshRobotTransport.ProcessResult(0, stdout, "");
+          }
+          return new SshRobotTransport.ProcessResult(0, "", "");
+        };
+
+    SshRobotTransport ssh =
+        new SshRobotTransport(List.of("10.104.13.2"), false, new RobotSafetyLockout(), false, runner);
+    List<RobotTransport.RemoteLogEntry> entries = ssh.listRemoteLogEntries();
+    assertTrue(
+        probeCommandSeen.get().contains("readlink -f"),
+        "listRemoteLogEntries must canonicalize roots/files with readlink -f");
+    assertEquals(2, entries.size(), "Duplicate /U/logs and /media/sda1 entries deduplicated to 2");
+    assertEquals("usb_U/akit_26-11-20_18-00-00.wpilog", entries.get(0).relativeKey(), "1x USB wpilog");
+    assertEquals("usb_U/run-meta.json", entries.get(1).relativeKey(), "1x USB run-meta.json");
+
+    // Verify BatteryAndRunManager hydrates root run-meta.json from usb_U/run-meta.json.
+    MockRobotServer baseRio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    RobotTransport usbOnlyTransport =
+        new DelegatingRobotTransport(baseRio) {
+          @Override
+          public List<RemoteLogEntry> listRemoteLogEntries() {
+            return entries;
+          }
+
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RemoteLogEntry> selected, Path localDestinationDir) throws IOException {
+            Map<String, Path> out = new LinkedHashMap<>();
+            Path usbDir = localDestinationDir.resolve("usb_U");
+            Files.createDirectories(usbDir);
+            Path wpilog = usbDir.resolve("akit_26-11-20_18-00-00.wpilog");
+            Files.writeString(wpilog, "USB_WPILOG_BYTES", StandardCharsets.UTF_8);
+            Path usbMeta = usbDir.resolve("run-meta.json");
+            Files.writeString(
+                usbMeta,
+                "{\"robotId\":\"CORAL\",\"profile\":\"CORAL\",\"gitSha\":\"7777777\",\"configSha256\":\"deadbeef\",\"batteryName\":\"2026-B09\",\"loopPeriodMs\":20,\"bootTimestampIso\":\"2026-11-20T18:00:00Z\"}\n",
+                StandardCharsets.UTF_8);
+            out.put("usb_U/akit_26-11-20_18-00-00.wpilog", wpilog);
+            out.put("usb_U/run-meta.json", usbMeta);
+            return out;
+          }
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"), temp.resolve("state/synced.json"), lockout, audio);
+    Path logsOut = temp.resolve("drive-logs");
+    CompletedRunBundle bundle =
+        runMgr.pullDriveSafeRunZip(
+            "usb_run",
+            null,
+            usbOnlyTransport,
+            temp.resolve("empty-ds"),
+            logsOut,
+            nowSec * 1_000L,
+            false,
+            true,
+            false);
+    assertTrue(
+        bundle.zipArchive().getFileName().toString().endsWith("_CORAL.zip"),
+        "ZIP filename hydrated robotId=CORAL from usb_U/run-meta.json: "
+            + bundle.zipArchive().getFileName());
+    String rootMeta = readZipEntryText(bundle.zipArchive(), "usb_run/run-meta.json");
+    assertTrue(
+        rootMeta.contains("\"robotId\": \"CORAL\"")
+            && rootMeta.contains("\"gitSha\": \"7777777\"")
+            && rootMeta.contains("\"configSha256\": \"deadbeef\"")
+            && rootMeta.contains("\"batteryName\": \"2026-B09\""),
+        "Root run-meta.json hydrated from usb_U/run-meta.json: " + rootMeta);
+  }
+
+  private static void testDriveWatcherStatePersistenceRejectedLatchPartialConfigsAndDebounce()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-dw-persist-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+
+    Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg-ok"), "Drivetrain", 60.0);
+    Path jar = temp.resolve("ok.jar");
+    Files.writeString(jar, "PERSIST_STABLE_JAR", StandardCharsets.UTF_8);
+    Path validPkg =
+        PackageDeployer.createFluxPkgZip(
+            codeDir.resolve("STABLE_persist_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_persist", "roborio-2026", "STABLE", "aaa1111", false, "cfg11111", "boris"),
+            jar,
+            cfg);
+
+    List<String> toasts1 = new ArrayList<>();
+    DriveWatcher watcher1 =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            rio,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> toasts1.add(lvl + ":" + title + ":" + msg),
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+
+    long t = 1_763_650_000_000L;
+    assertEquals(ActionType.NONE, watcher1.pollOnce(t).action(), "Poll 1 stabilizes");
+    assertEquals(
+        ActionType.DEPLOYED_PACKAGE, watcher1.pollOnce(t + 1_000L).action(), "Poll 2 deploys");
+    assertEquals(1, rio.restartCount(), "1 restart after initial deploy");
+    assertTrue(Files.isRegularFile(watcher1.stateFile()), "drive-watcher-state.json persisted");
+
+    // Simulate laptop reboot: new DriveWatcher on same code/ and stateDir must NOT redeploy.
+    List<String> toasts2 = new ArrayList<>();
+    DriveWatcher watcher2 =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            rio,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> toasts2.add(lvl + ":" + title + ":" + msg),
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+    for (int i = 0; i < 4; i++) {
+      assertEquals(
+          ActionType.NONE,
+          watcher2.pollOnce(t + 10_000L + i * 1_000L).action(),
+          "New DriveWatcher after reboot must not redeploy same package");
+    }
+    assertEquals(1, rio.restartCount(), "Still 1 restart after reboot polls");
+
+    // Corrupt ZIP fires ONE error toast and stays latched across polls and reboots.
+    Path corruptPkg = codeDir.resolve("CORRUPT_roborio-2026_fluxpkg.zip");
+    Files.writeString(corruptPkg, "NOT_A_VALID_ZIP_ARCHIVE", StandardCharsets.UTF_8);
+    Files.setLastModifiedTime(corruptPkg, FileTime.fromMillis(System.currentTimeMillis() + 5_000L));
+    assertEquals(ActionType.NONE, watcher2.pollOnce(t + 20_000L).action(), "Corrupt poll 1 stabilizes");
+    assertEquals(
+        ActionType.REJECTED_INVALID_PACKAGE,
+        watcher2.pollOnce(t + 21_000L).action(),
+        "Corrupt ZIP rejected once");
+    assertEquals(1, toasts2.size(), "Corrupt ZIP emitted exactly 1 error toast");
+    assertEquals(ActionType.NONE, watcher2.pollOnce(t + 22_000L).action(), "Corrupt ZIP latched poll 3");
+    assertEquals(ActionType.NONE, watcher2.pollOnce(t + 23_000L).action(), "Corrupt ZIP latched poll 4");
+    assertEquals(1, toasts2.size(), "No toast spam while corrupt ZIP remains in code/");
+
+    List<String> toasts3 = new ArrayList<>();
+    DriveWatcher watcher3 =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            rio,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> toasts3.add(lvl + ":" + title + ":" + msg),
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+    watcher3.pollOnce(t + 30_000L);
+    watcher3.pollOnce(t + 31_000L);
+    assertTrue(toasts3.isEmpty(), "Rejected corrupt ZIP hash remains latched across reboot");
+
+    // Partial code/configs/ without parameters.csv emits ONE loud error toast and latches.
+    Path partialConfigs = codeDir.resolve("configs");
+    Files.createDirectories(partialConfigs);
+    Files.writeString(
+        partialConfigs.resolve("range_table.csv"),
+        "distanceMeters,shooterRps,hoodRotations,timeOfFlightSec\n2.0,35.0,0.15,0.32\n",
+        StandardCharsets.UTF_8);
+    assertEquals(ActionType.NONE, watcher3.pollOnce(t + 40_000L).action(), "Partial cfg poll 1 stabilizes");
+    PollOutcome partialOutcome = watcher3.pollOnce(t + 41_000L);
+    assertEquals(
+        ActionType.REJECTED_INVALID_CONFIG,
+        partialOutcome.action(),
+        "Partial code/configs/ without parameters.csv rejected loudly");
+    assertEquals(
+        DriveWatcher.PARTIAL_CONFIGS_ERROR_MESSAGE,
+        partialOutcome.summary(),
+        "Exact partial code/configs/ toast message");
+    assertEquals(1, toasts3.size(), "Partial config emitted exactly 1 error toast");
+    assertEquals(ActionType.NONE, watcher3.pollOnce(t + 42_000L).action(), "Partial config latched");
+    assertEquals(1, toasts3.size(), "No toast spam on latched partial config");
+
+    // Emptying code/ waits full >= 25 s debounce before Restore STABLE.
+    Files.deleteIfExists(corruptPkg);
+    Files.deleteIfExists(validPkg);
+    assertEquals(ActionType.NONE, watcher3.pollOnce(t + 50_000L).action(), "Empty poll at +0s waits");
+    assertEquals(ActionType.NONE, watcher3.pollOnce(t + 52_000L).action(), "Empty poll at +2s waits");
+    assertEquals(ActionType.NONE, watcher3.pollOnce(t + 70_000L).action(), "Empty poll at +20s waits");
+    assertEquals(1, rio.restartCount(), "No accidental Restore STABLE before 25s debounce");
+    PollOutcome restored = watcher3.pollOnce(t + 75_000L);
+    assertEquals(
+        ActionType.RESTORED_STABLE,
+        restored.action(),
+        "Empty code/ triggers Restore STABLE after >= 25s debounce");
+    assertEquals(2, rio.restartCount(), "Robot restarted after 25s empty-code Restore STABLE");
+  }
+
+  private static void testFailedPullKeepsMentorAudio() throws Exception {
+    Path temp = createTempDir("fluxtray-pt1-audio-spool-");
+    Path logsDir = temp.resolve("drive-logs");
+    Path stateDir = temp.resolve("state");
+    Path dsDir = temp.resolve("ds");
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.seedSimulatedMatchLogs("2026-11-20_18-00-00", "FUEL", "cafebabe");
+
+    byte[] realPcm = generateSinePcm16kHz(0.30, 520.0);
+    MultiMicAudioRecorder audio =
+        new MultiMicAudioRecorder(
+            fmt -> {
+              AtomicInteger off = new AtomicInteger(0);
+              return new MultiMicAudioRecorder.PcmCapturePort() {
+                @Override
+                public int read(byte[] buf, int offset, int length) {
+                  int cur = off.get();
+                  if (cur >= realPcm.length) {
+                    return -1;
+                  }
+                  int n = Math.min(length, realPcm.length - cur);
+                  System.arraycopy(realPcm, cur, buf, offset, n);
+                  off.addAndGet(n);
+                  return n;
+                }
+
+                @Override
+                public void close() {}
+              };
+            });
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+
+    long nowMs = Instant.parse("2026-11-20T18:01:00Z").toEpochMilli();
+    audio.onRobotStateChanged(true, nowMs - 20_000L);
+    Thread.sleep(60L);
+    audio.onRobotStateChanged(false, nowMs - 5_000L);
+
+    AtomicInteger downloadAttempts = new AtomicInteger(0);
+    RobotTransport flakyRobot =
+        new DelegatingRobotTransport(rio) {
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RemoteLogEntry> entries, Path localDestinationDir) throws IOException {
+            if (downloadAttempts.incrementAndGet() == 1) {
+              throw new IOException("Simulated Wi-Fi drop mid-scp");
+            }
+            return super.downloadSelectedLogs(entries, localDestinationDir);
+          }
+
+          @Override
+          public String captureSystemSnapshotRaw() throws IOException {
+            throw new IOException("Simulated non-fatal snapshot SSH timeout");
+          }
+        };
+
+    boolean attempt1Failed = false;
+    try {
+      runMgr.pullDriveSafeRunZip(
+          "attempt1", null, flakyRobot, dsDir, logsDir, nowMs, false, true, false);
+    } catch (IOException expected) {
+      attempt1Failed = true;
+    }
+    assertTrue(attempt1Failed, "Attempt 1 failed inside downloadSelectedLogs");
+
+    // Durable spool MUST retain mentor-audio.wav (> 44 B) after failed pull!
+    List<Path> spooledDirs;
+    try (Stream<Path> s = Files.list(runMgr.pendingAudioSpoolDir())) {
+      spooledDirs = s.filter(Files::isDirectory).toList();
+    }
+    assertEquals(1, spooledDirs.size(), "Durable pending-audio spool kept Run 1 audio after failure");
+    Path spooledWav = spooledDirs.get(0).resolve(MultiMicAudioRecorder.AUDIO_FILE_NAME);
+    assertTrue(
+        Files.isRegularFile(spooledWav) && Files.size(spooledWav) > 44L,
+        "Spooled mentor-audio.wav exceeds 44-byte WAV header");
+
+    // Attempt 2 succeeds (even with non-fatal captureSystemSnapshotRaw throwing!) and packages audio.
+    CompletedRunBundle retryBundle =
+        runMgr.pullDriveSafeRunZip(
+            "attempt2", null, flakyRobot, dsDir, logsDir, nowMs + 2_000L, false, true, false);
+    assertTrue(
+        retryBundle != null && Files.isRegularFile(retryBundle.zipArchive()),
+        "Retry pull succeeded even when captureSystemSnapshotRaw threw");
+    byte[] wavInZip =
+        readZipEntryBytes(
+            retryBundle.zipArchive(), "attempt2/" + MultiMicAudioRecorder.AUDIO_FILE_NAME);
+    assertTrue(
+        wavInZip.length > 44,
+        "Retry ZIP contains full mentor-audio.wav > 44 bytes (got " + wavInZip.length + " bytes)");
+    String snapInZip = readZipEntryText(retryBundle.zipArchive(), "attempt2/system-snapshot.txt");
+    assertTrue(
+        snapInZip.contains("non-fatal"),
+        "Non-fatal snapshot failure logged cleanly in system-snapshot.txt");
+
+    List<Path> remainingSpool;
+    try (Stream<Path> s = Files.list(runMgr.pendingAudioSpoolDir())) {
+      remainingSpool = s.filter(Files::isDirectory).toList();
+    }
+    assertEquals(0, remainingSpool.size(), "Spool deleted only after finished ZIP moved to logs/");
+  }
+
+  private static void testManualRestoreStablePullsLogsFirst() throws Exception {
+    Path temp = createTempDir("fluxtray-manual-restore-");
+    Path logsDir = temp.resolve("drive-logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+
+    Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
+    Path jar = temp.resolve("stable.jar");
+    Files.writeString(jar, "STABLE_BASELINE_JAR", StandardCharsets.UTF_8);
+    Path stablePkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("STABLE_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+            jar,
+            cfg);
+    deployer.deployPackage(stablePkg, rio, true);
+
+    // Seed pending robot match logs that must be pulled BEFORE manual Restore STABLE mutates robot.
+    rio.seedSimulatedMatchLogs("2026-11-20_18-05-00", "FUEL", "cfg11111");
+    int opsBeforeRestore = rio.operationLog().size();
+
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+
+    try (FluxTrayMain.TrayActionCoordinator coordinator =
+        new FluxTrayMain.TrayActionCoordinator(
+            rio,
+            deployer,
+            runMgr,
+            audio,
+            lockout,
+            dsDir,
+            logsDir,
+            stateDir.resolve("fluxtray.log"),
+            (lvl, title, msg) -> {},
+            busy -> {})) {
+      coordinator.submitManualRestoreStable().get(5, TimeUnit.SECONDS);
+    }
+
+    List<String> restoreOps = rio.operationLog().subList(opsBeforeRestore, rio.operationLog().size());
+    int pullIdx = indexOfPrefix(restoreOps, "downloadSelectedLogs:");
+    int copyStableIdx = indexOfPrefix(restoreOps, "copyFile:jars/prev_stable.jar->");
+    int restartIdx = indexOfPrefix(restoreOps, "restart:");
+    assertTrue(
+        pullIdx >= 0 && copyStableIdx > pullIdx && restartIdx > copyStableIdx,
+        "Manual Restore STABLE must pull logs before restoring prev_stable.jar and restarting: "
+            + restoreOps);
+    List<Path> zips;
+    try (Stream<Path> s = Files.list(logsDir)) {
+      zips = s.filter(p -> p.getFileName().toString().endsWith(".zip")).toList();
+    }
+    assertEquals(1, zips.size(), "Manual Restore STABLE saved pending logs ZIP before restoring");
+  }
+
+  private static void testZipBuiltInTempBeforeMoveAndAudioFailureNotifies() throws Exception {
+    Path temp = createTempDir("fluxtray-tray10-");
+    Path logsDir = temp.resolve("drive-logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.seedSimulatedMatchLogs("2026-11-20_18-10-00", "FUEL", "12345678");
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder silentAudio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            silentAudio);
+
+    long sameSecondMs = Instant.parse("2026-11-20T18:10:05Z").toEpochMilli();
+    CompletedRunBundle first =
+        runMgr.pullDriveSafeRunZip(
+            "runA", null, rio, dsDir, logsDir, sameSecondMs, false, false, false);
+    CompletedRunBundle second =
+        runMgr.pullDriveSafeRunZip(
+            "runB", null, rio, dsDir, logsDir, sameSecondMs, false, false, false);
+
+    assertTrue(
+        !first.zipArchive().equals(second.zipArchive()),
+        "Same-second pulls must receive collision-safe suffix instead of overwriting");
+    assertTrue(
+        Files.isRegularFile(first.zipArchive()) && Files.isRegularFile(second.zipArchive()),
+        "Both same-second ZIP archives preserved");
+    assertTrue(
+        second.zipArchive().getFileName().toString().endsWith("_FUEL_1.zip"),
+        "Second same-second ZIP gets _1 suffix: " + second.zipArchive().getFileName());
+    List<Path> children;
+    try (Stream<Path> s = Files.list(logsDir)) {
+      children = s.toList();
+    }
+    assertTrue(
+        children.stream().noneMatch(p -> p.getFileName().toString().endsWith(".part")),
+        "No .part files left inside Drive logs/");
+
+    // LineUnavailableException must notify loudly via errorListener (never silently swallowed).
+    List<String> audioErrors = new CopyOnWriteArrayList<>();
+    MultiMicAudioRecorder failingAudio =
+        new MultiMicAudioRecorder(
+            fmt -> {
+              throw new LineUnavailableException("USB headset mic disconnected");
+            });
+    failingAudio.setErrorListener(audioErrors::add);
+    failingAudio.onRobotStateChanged(true, sameSecondMs);
+    assertTrue(!failingAudio.isMicAvailable(), "micAvailable is false after LineUnavailableException");
+    assertTrue(
+        audioErrors.size() == 1 && audioErrors.get(0).contains("USB headset mic disconnected"),
+        "Audio failure listener notified loudly: " + audioErrors);
+
+    // Temp .pcm file must be cleaned up when close() is called mid-recording.
+    CountDownLatch startedRead = new CountDownLatch(1);
+    MultiMicAudioRecorder activeAudio =
+        new MultiMicAudioRecorder(
+            fmt ->
+                new MultiMicAudioRecorder.PcmCapturePort() {
+                  @Override
+                  public int read(byte[] buf, int off, int len) {
+                    startedRead.countDown();
+                    try {
+                      Thread.sleep(50L);
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                      return -1;
+                    }
+                    return 0;
+                  }
+
+                  @Override
+                  public void close() {}
+                });
+    activeAudio.onRobotStateChanged(true, sameSecondMs);
+    assertTrue(startedRead.await(3, TimeUnit.SECONDS), "Capture thread started");
+    Path pcmPath = activeAudio.currentTempPcmFile();
+    assertTrue(pcmPath != null && Files.isRegularFile(pcmPath), "Temp .pcm file exists while recording");
+    activeAudio.close();
+    assertTrue(!Files.exists(pcmPath), "Temp .pcm file deleted on close()/shutdown");
+  }
+
+  private static void testMalformedManifestFailsClosedAndRollbackChecksDeployCopy()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-tray09-");
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+
+    Path validCfg = createSampleFluxFigConfigs(temp.resolve("valid-cfg"), "Drivetrain", 60.0);
+    Path jarV1 = temp.resolve("stable.jar");
+    Path jarExp = temp.resolve("exp.jar");
+    Files.writeString(jarV1, "STABLE_JAR_BASE", StandardCharsets.UTF_8);
+    Files.writeString(jarExp, "EXP_SINGLE_LINE_JAR", StandardCharsets.UTF_8);
+
+    Path stableZip =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("stable_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+            jarV1,
+            validCfg);
+    deployer.deployPackage(stableZip, rio, true);
+
+    // Single-line JSON manifest parses EXPERIMENTAL + gitDirty=true and must NOT overwrite prev_stable.
+    String singleLineExpManifest =
+        "{\"packageName\":\"EXP_one_line\",\"targetPlatform\":\"roborio-2026\",\"channel\":\"EXPERIMENTAL\",\"gitSha\":\"9999999\",\"gitDirty\":true,\"configSha\":\"cfg99999\",\"authorLaptop\":\"boris\"}";
+    Path singleLineZip =
+        createCustomFluxPkgZip(
+            temp.resolve("single_line_exp_fluxpkg.zip"), singleLineExpManifest, jarExp, validCfg);
+    PackageDeployer.DeployStamp expStamp = deployer.deployPackage(singleLineZip, rio, true);
+    assertEquals("EXPERIMENTAL", expStamp.channel(), "Single-line manifest parsed EXPERIMENTAL");
+    assertEquals(
+        "STABLE_JAR_BASE",
+        rio.readRemoteText("jars/prev_stable.jar"),
+        "Single-line dirty EXPERIMENTAL package must NOT overwrite prev_stable.jar");
+
+    // Malformed manifest missing channel/gitDirty/targetPlatform must fail closed (never default to STABLE).
+    Path malformedManifestZip =
+        createCustomFluxPkgZip(
+            temp.resolve("malformed_manifest_fluxpkg.zip"),
+            "{\"packageName\":\"BAD_MANIFEST\",\"gitSha\":\"0000000\"}",
+            jarExp,
+            validCfg);
+    boolean malformedBlocked = false;
+    try {
+      deployer.deployPackage(malformedManifestZip, rio, true);
+    } catch (IOException expected) {
+      malformedBlocked = true;
+    }
+    assertTrue(malformedBlocked, "Malformed manifest missing required fields must fail closed");
+
+    // Package ZIP missing deploy/configs/parameters.csv must fail closed.
+    Path noParamsCfg = temp.resolve("no-params-cfg");
+    Files.createDirectories(noParamsCfg);
+    Files.writeString(
+        noParamsCfg.resolve("range_table.csv"),
+        "distanceMeters,shooterRps,hoodRotations,timeOfFlightSec\n2.0,35.0,0.15,0.32\n",
+        StandardCharsets.UTF_8);
+    Path noParamsZip =
+        createCustomFluxPkgZip(
+            temp.resolve("no_params_fluxpkg.zip"), singleLineExpManifest, jarExp, noParamsCfg);
+    boolean missingParamsBlocked = false;
+    try {
+      deployer.deployPackage(noParamsZip, rio, true);
+    } catch (IOException expected) {
+      missingParamsBlocked = expected.getMessage().contains("parameters.csv");
+    }
+    assertTrue(missingParamsBlocked, "Package without deploy/configs/parameters.csv must fail closed");
+
+    // restoreStable and rollbackToSlot must fail loudly when copyRemoteDirectory returns false.
+    int restartsBefore = rio.restartCount();
+    RobotTransport failDeployCopyRobot =
+        new DelegatingRobotTransport(rio) {
+          @Override
+          public boolean copyRemoteDirectory(String fromRelativeDir, String toRelativeDir) {
+            return false;
+          }
+        };
+    boolean restoreFailed = false;
+    try {
+      deployer.restoreStable(failDeployCopyRobot);
+    } catch (IOException expected) {
+      restoreFailed = true;
+    }
+    assertTrue(restoreFailed, "restoreStable must fail loudly when copyRemoteDirectory returns false");
+    boolean slotFailed = false;
+    try {
+      deployer.rollbackToSlot(1, failDeployCopyRobot);
+    } catch (IOException expected) {
+      slotFailed = true;
+    }
+    assertTrue(slotFailed, "rollbackToSlot must fail loudly when copyRemoteDirectory returns false");
+    assertEquals(
+        restartsBefore,
+        rio.restartCount(),
+        "Robot must NOT restart when rollback deploy/ copy fails");
+  }
+
+  private static void testTruncatedMsgPackFrameNeverMarksDisabled() {
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    Nt4RobotStateClient ntClient =
+        new Nt4RobotStateClient(List.of("127.0.0.1"), 5810, lockout, null, () -> 50_000L);
+    ntClient.handleJsonControlMessage(
+        "[{\"method\":\"announce\",\"params\":{\"name\":\"/FMSInfo/FMSControlData\",\"id\":7,\"type\":\"int\",\"properties\":{}}}]");
+
+    // Put robot into ENABLED state (0x21).
+    ntClient.handleBinaryMessage(encodeNt4IntFrame(7, 1_000_000L, 0x21), "127.0.0.1");
+    assertTrue(lockout.isEnabled(), "Robot is ENABLED after valid 0x21 frame");
+    assertEquals(0x21, ntClient.lastControlWord(), "Control word is 0x21");
+
+    // Truncated uint8 value: [7, uint64_ts, 1, 0xCC] missing the trailing uint8 byte.
+    byte[] truncatedUint8Value = new byte[] {(byte) 0x94, 7, 1, 1, (byte) 0xCC};
+    boolean threwUint8 = false;
+    try {
+      Nt4RobotStateClient.decodeMsgPackFrames(truncatedUint8Value);
+    } catch (IllegalArgumentException expected) {
+      threwUint8 = true;
+    }
+    assertTrue(threwUint8, "decodeMsgPackFrames must throw on unexpected EOF in readU8()");
+
+    // Truncated uint64 timestamp inside 4-element array.
+    byte[] truncatedTs = new byte[] {(byte) 0x94, 7, (byte) 0xCF, 0, 0, 1};
+    boolean threwTs = false;
+    try {
+      Nt4RobotStateClient.decodeMsgPackFrames(truncatedTs);
+    } catch (IllegalArgumentException expected) {
+      threwTs = true;
+    }
+    assertTrue(threwTs, "decodeMsgPackFrames must throw on truncated uint64 timestamp");
+
+    // Truncated 4-element array with only 3 elements present.
+    byte[] truncatedArray = new byte[] {(byte) 0x94, 7, 1, 1};
+    boolean threwArr = false;
+    try {
+      Nt4RobotStateClient.decodeMsgPackFrames(truncatedArray);
+    } catch (IllegalArgumentException expected) {
+      threwArr = true;
+    }
+    assertTrue(threwArr, "decodeMsgPackFrames must throw on truncated array");
+
+    // Feeding any truncated frame to handleBinaryMessage must discard it without clearing ENABLED.
+    ntClient.handleBinaryMessage(truncatedUint8Value, "127.0.0.1");
+    ntClient.handleBinaryMessage(truncatedTs, "127.0.0.1");
+    ntClient.handleBinaryMessage(truncatedArray, "127.0.0.1");
+    assertTrue(
+        lockout.isEnabled(), "Truncated MsgPack frames must NEVER flip ENABLED robot to DISABLED");
+    assertEquals(0x21, ntClient.lastControlWord(), "Last control word remains 0x21");
+  }
+
+  private static Path createCustomFluxPkgZip(
+      Path outputZip, String manifestJson, Path jarFile, Path configDir) throws IOException {
+    Files.createDirectories(outputZip.getParent());
+    try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(outputZip))) {
+      zos.putNextEntry(new ZipEntry("manifest.json"));
+      zos.write(manifestJson.getBytes(StandardCharsets.UTF_8));
+      zos.closeEntry();
+      zos.putNextEntry(new ZipEntry("frcUserProgram.jar"));
+      Files.copy(jarFile, zos);
+      zos.closeEntry();
+      if (configDir != null && Files.isDirectory(configDir)) {
+        try (Stream<Path> walk = Files.walk(configDir)) {
+          for (Path file : walk.filter(Files::isRegularFile).sorted().toList()) {
+            String rel = configDir.relativize(file).toString().replace('\\', '/');
+            String entryName =
+                (!rel.contains("/") && rel.endsWith(".csv")) ? "deploy/configs/" + rel : "deploy/" + rel;
+            zos.putNextEntry(new ZipEntry(entryName));
+            Files.copy(file, zos);
+            zos.closeEntry();
+          }
+        }
+      }
+    }
+    return outputZip;
+  }
+
+  private static Map<String, String> parseUstarTextEntries(byte[] tarBytes) {
+    Map<String, String> entries = new LinkedHashMap<>();
+    int pos = 0;
+    while (pos + 512 <= tarBytes.length) {
+      boolean allZero = true;
+      for (int i = 0; i < 512; i++) {
+        if (tarBytes[pos + i] != 0) {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero) {
+        break;
+      }
+      String name = readNullTerminated(tarBytes, pos, 100);
+      String prefix = readNullTerminated(tarBytes, pos + 345, 155);
+      String fullName = prefix.isEmpty() ? name : prefix + "/" + name;
+      String sizeOctal = readNullTerminated(tarBytes, pos + 124, 12).trim();
+      int size = sizeOctal.isEmpty() ? 0 : Integer.parseInt(sizeOctal, 8);
+      byte typeFlag = tarBytes[pos + 156];
+      long storedSum = Long.parseLong(readNullTerminated(tarBytes, pos + 148, 8).trim(), 8);
+      long computedSum = 0L;
+      for (int i = 0; i < 512; i++) {
+        computedSum += (i >= 148 && i < 156) ? ' ' : (tarBytes[pos + i] & 0xFF);
+      }
+      assertEquals(computedSum, storedSum, "Valid USTAR header checksum for " + fullName);
+      pos += 512;
+      if (typeFlag != (byte) '5') {
+        String content = new String(tarBytes, pos, size, StandardCharsets.UTF_8);
+        entries.put(fullName, content);
+      }
+      int blocks = (size + 511) / 512;
+      pos += blocks * 512;
+    }
+    return entries;
+  }
+
+  private static String readNullTerminated(byte[] buf, int off, int maxLen) {
+    int end = off;
+    while (end < off + maxLen && buf[end] != 0) {
+      end++;
+    }
+    return new String(buf, off, end - off, StandardCharsets.UTF_8);
+  }
+
+  private static byte[] readZipEntryBytes(Path zipPath, String entryName) throws IOException {
+    try (ZipFile zf = new ZipFile(zipPath.toFile())) {
+      ZipEntry ze = zf.getEntry(entryName);
+      assertTrue(ze != null, "Expected ZIP entry " + entryName + " in " + zipPath);
+      return zf.getInputStream(ze).readAllBytes();
+    }
+  }
+
+  private static String readZipEntryText(Path zipPath, String entryName) throws IOException {
+    return new String(readZipEntryBytes(zipPath, entryName), StandardCharsets.UTF_8);
+  }
+
+  @FunctionalInterface
+  private interface ThrowingRunnable {
+    void run() throws Exception;
+  }
+
+  private static void assertThrowsIllegalState(ThrowingRunnable action, String msg) {
+    try {
+      action.run();
+    } catch (IllegalStateException expected) {
+      return;
+    } catch (Exception other) {
+      throw new AssertionError(
+          "Assertion failed (" + msg + "): expected IllegalStateException, got " + other, other);
+    }
+    throw new AssertionError("Assertion failed (" + msg + "): did not throw IllegalStateException");
+  }
+
+  private static class DelegatingRobotTransport implements RobotTransport {
+    private final RobotTransport delegate;
+
+    private DelegatingRobotTransport(RobotTransport delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public String controllerPlatform() {
+      return delegate.controllerPlatform();
+    }
+
+    @Override
+    public String currentBootEpochId() {
+      return delegate.currentBootEpochId();
+    }
+
+    @Override
+    public boolean isReachable() {
+      return delegate.isReachable();
+    }
+
+    @Override
+    public RobotStateHeartbeat readRobotStateHeartbeat() throws IOException {
+      return delegate.readRobotStateHeartbeat();
+    }
+
+    @Override
+    public void assertRobotDisabledForTransfer(String operationName) throws IOException {
+      delegate.assertRobotDisabledForTransfer(operationName);
+    }
+
+    @Override
+    public String detectRobotIdentity() throws IOException {
+      return delegate.detectRobotIdentity();
+    }
+
+    @Override
+    public String resolveActiveJarRemotePath() throws IOException {
+      return delegate.resolveActiveJarRemotePath();
+    }
+
+    @Override
+    public String readRemoteText(String remoteRelativePath) throws IOException {
+      return delegate.readRemoteText(remoteRelativePath);
+    }
+
+    @Override
+    public void writeRemoteText(String remoteRelativePath, String content) throws IOException {
+      delegate.writeRemoteText(remoteRelativePath, content);
+    }
+
+    @Override
+    public void uploadFile(Path localFile, String remoteRelativePath) throws IOException {
+      delegate.uploadFile(localFile, remoteRelativePath);
+    }
+
+    @Override
+    public void uploadFileAtomic(Path localFile, String remoteRelativePath) throws IOException {
+      delegate.uploadFileAtomic(localFile, remoteRelativePath);
+    }
+
+    @Override
+    public void replaceRemoteDirectoryAtomic(Path localDir, String remoteRelativeDir)
+        throws IOException {
+      delegate.replaceRemoteDirectoryAtomic(localDir, remoteRelativeDir);
+    }
+
+    @Override
+    public boolean copyRemoteFile(String fromRelativePath, String toRelativePath)
+        throws IOException {
+      return delegate.copyRemoteFile(fromRelativePath, toRelativePath);
+    }
+
+    @Override
+    public boolean copyRemoteDirectory(String fromRelativeDir, String toRelativeDir)
+        throws IOException {
+      return delegate.copyRemoteDirectory(fromRelativeDir, toRelativeDir);
+    }
+
+    @Override
+    public boolean remoteFileExists(String remoteRelativePath) throws IOException {
+      return delegate.remoteFileExists(remoteRelativePath);
+    }
+
+    @Override
+    public boolean deleteRemoteFile(String remoteRelativePath) throws IOException {
+      return delegate.deleteRemoteFile(remoteRelativePath);
+    }
+
+    @Override
+    public void restartRobotCode() throws IOException {
+      delegate.restartRobotCode();
+    }
+
+    @Override
+    public List<String> listRemoteLogFiles() throws IOException {
+      return delegate.listRemoteLogFiles();
+    }
+
+    @Override
+    public List<RemoteLogEntry> listRemoteLogEntries() throws IOException {
+      return delegate.listRemoteLogEntries();
+    }
+
+    @Override
+    public Map<String, Path> downloadAllLogs(Path localDestinationDir) throws IOException {
+      return delegate.downloadAllLogs(localDestinationDir);
+    }
+
+    @Override
+    public Map<String, Path> downloadSelectedLogs(
+        List<RemoteLogEntry> entries, Path localDestinationDir) throws IOException {
+      return delegate.downloadSelectedLogs(entries, localDestinationDir);
+    }
+
+    @Override
+    public String captureSystemSnapshotRaw() throws IOException {
+      return delegate.captureSystemSnapshotRaw();
+    }
   }
 
   private static byte[] generateSinePcm16kHz(double seconds, double freqHz) {
