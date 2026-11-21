@@ -109,7 +109,8 @@ public final class FluxTrayTest {
       testTruncatedMsgPackFrameNeverMarksDisabled();
       testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell();
       testGitHubReleaseUpdaterIntegritySafetyLockoutAndRealPosixSwap();
-      System.out.println("FluxTrayTest: ALL 23 SUITES PASSED");
+      testInspectRobotCodeDistinguishesLegacyFromFlux2027();
+      System.out.println("FluxTrayTest: ALL 24 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -3095,6 +3096,77 @@ public final class FluxTrayTest {
     frame.write(payload);
     out.write(frame.toByteArray());
     out.flush();
+  }
+
+  private static void testInspectRobotCodeDistinguishesLegacyFromFlux2027() throws Exception {
+    Path workDir = createTempDir("fluxtray-inspect-code-");
+    MockRobotServer robot = new MockRobotServer(workDir.resolve("mock-robot"), "roborio-2026");
+
+    // 1. Unreachable robot.
+    robot.setReachable(false);
+    PackageDeployer.RobotCodeStatus unreachable = PackageDeployer.inspectRobotCode(robot);
+    assertEquals(
+        PackageDeployer.CodeGeneration.UNREACHABLE,
+        unreachable.generation(),
+        "Unreachable robot must report UNREACHABLE");
+
+    // 2. Legacy / New_Robot: reachable, no /tmp/flux-robot-state, no deploy-stamp.json.
+    robot.setReachable(true);
+    robot.clearRobotStateFile();
+    robot.setRobotCommand("/usr/local/frc/JRE/bin/java -jar /home/lvuser/frcUserProgram.jar\n");
+    Path mockLogs = workDir.resolve("mock-robot").resolve("logs");
+    Files.createDirectories(mockLogs);
+    Files.write(mockLogs.resolve("akit_legacy.wpilog"), new byte[2048]);
+    Files.write(mockLogs.resolve("Drivetrain_legacy.hoot"), new byte[1024]);
+    PackageDeployer.RobotCodeStatus legacy = PackageDeployer.inspectRobotCode(robot);
+    assertEquals(
+        PackageDeployer.CodeGeneration.LEGACY_OR_NON_FLUX,
+        legacy.generation(),
+        "Missing heartbeat and deploy-stamp must report LEGACY_OR_NON_FLUX");
+    assertTrue(legacy.isLegacyOrNonFlux(), "isLegacyOrNonFlux() must be true");
+    assertEquals("frcUserProgram.jar", legacy.activeJar(), "Active JAR parsed from robotCommand");
+    assertTrue(
+        legacy.diagnostics().internalFreeMb() >= 0L,
+        "Legacy robot diagnostics must report internal free space");
+    assertEquals(1, legacy.diagnostics().wpilogCount(), "Legacy .wpilog count");
+    assertEquals(1, legacy.diagnostics().hootCount(), "Legacy .hoot count");
+
+    // 3. Unstamped 2027 Gradle deploy: heartbeat present, no deploy-stamp.json.
+    robot.setRobotStateFile(false, false, "FUEL");
+    PackageDeployer.RobotCodeStatus unstamped = PackageDeployer.inspectRobotCode(robot);
+    assertEquals(
+        PackageDeployer.CodeGeneration.FLUX_2027_UNSTAMPED,
+        unstamped.generation(),
+        "Heartbeat present without deploy-stamp must report FLUX_2027_UNSTAMPED");
+    assertTrue(!unstamped.isLegacyOrNonFlux(), "Unstamped 2027 code is not legacy");
+
+    // 4. Full .fluxpkg.zip deploy: deploy-stamp.json present.
+    Path pkgDir = createTempDir("fluxtray-inspect-pkg-");
+    Path cfgDir = createSampleFluxFigConfigs(pkgDir.resolve("configs"), "FUEL", 50.0);
+    Path fakeJar = pkgDir.resolve("Flux-RoboRIO-2027.jar");
+    Files.writeString(fakeJar, "FAKE_JAR", StandardCharsets.UTF_8);
+    Path pkgZip =
+        PackageDeployer.createFluxPkgZip(
+            pkgDir.resolve("STABLE_v2027.1.0_roborio-2026_fluxpkg.zip"),
+            new PackageDeployer.PackageManifest(
+                "STABLE_v2027.1.0_roborio-2026",
+                "roborio-2026",
+                "STABLE",
+                "abc1234",
+                false,
+                "cfg999",
+                "test-laptop"),
+            fakeJar,
+            cfgDir);
+    PackageDeployer deployer = new PackageDeployer(new RobotSafetyLockout(), "test-laptop");
+    deployer.deployPackage(pkgZip, robot, true);
+    PackageDeployer.RobotCodeStatus packaged = PackageDeployer.inspectRobotCode(robot);
+    assertEquals(
+        PackageDeployer.CodeGeneration.FLUX_2027_PACKAGE,
+        packaged.generation(),
+        "Deployed package must report FLUX_2027_PACKAGE");
+    assertTrue(packaged.hasPrevStable(), "STABLE deploy must record prev_stable.jar");
+    assertEquals("abc1234", packaged.deployStamp().gitSha(), "gitSha read from deploy-stamp.json");
   }
 
   private static byte[] encodeNt4IntFrame(int topicId, long timestampUs, int intVal) {

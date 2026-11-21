@@ -719,6 +719,88 @@ public final class SshRobotTransport implements RobotTransport {
     return runSshCommand(FluxSystemSnapshot.REMOTE_CAPTURE_SH_COMMAND);
   }
 
+  @Override
+  public RobotDiagnostics readDiagnostics() throws IOException {
+    String homeLogs = shQuote(remoteHomeDir + "/logs");
+    String script =
+        "hdev=$(df -Pm "
+            + shQuote(remoteHomeDir)
+            + " 2>/dev/null | awk 'NR==2{print $1}'); "
+            + "df -Pm "
+            + shQuote(remoteHomeDir)
+            + " 2>/dev/null | awk 'NR==2{printf \"INT=%s|%s\\n\", $4, $2}'; "
+            + "usb='0|-1|-1'; "
+            + "for u in /U /media/sda1; do "
+            + "  [ -d \"$u\" ] || continue; "
+            + "  udev=$(df -Pm \"$u\" 2>/dev/null | awk 'NR==2{print $1}'); "
+            + "  if [ -n \"$udev\" ] && [ \"$udev\" != \"$hdev\" ]; then "
+            + "    usb=$(df -Pm \"$u\" 2>/dev/null | awk 'NR==2{printf \"1|%s|%s\", $4, $2}'); "
+            + "    break; "
+            + "  fi; "
+            + "done; "
+            + "printf 'USB=%s\\n' \"$usb\"; "
+            + "w=$(find -L "
+            + homeLogs
+            + " /U/logs /media/sda1 -maxdepth 3 -type f -name '*.wpilog' -exec ls -ln {} + 2>/dev/null "
+            + "| awk '{c++; s+=$5} END{printf \"%d|%d\", c+0, s+0}'); "
+            + "printf 'WPI=%s\\n' \"${w:-0|0}\"; "
+            + "h=$(find -L "
+            + homeLogs
+            + " /U/logs /media/sda1 -maxdepth 3 -type f -name '*.hoot' -exec ls -ln {} + 2>/dev/null "
+            + "| awk '{c++; s+=$5} END{printf \"%d|%d\", c+0, s+0}'); "
+            + "printf 'HOOT=%s\\n' \"${h:-0|0}\"; "
+            + "jpid=$(ps 2>/dev/null | awk '/[j]ava/{print $1; exit}'); "
+            + "printf 'PID=%s\\n' \"${jpid:--1}\"; "
+            + "printf 'UP=%s\\n' \"$(uptime 2>/dev/null || true)\"";
+    String out = runSshCommand(script);
+    long intFree = -1L;
+    long intTotal = -1L;
+    boolean usbMounted = false;
+    long usbFree = -1L;
+    long usbTotal = -1L;
+    int wpiCount = 0;
+    long wpiBytes = 0L;
+    int hootCount = 0;
+    long hootBytes = 0L;
+    long javaPid = -1L;
+    String uptime = "";
+    for (String line : out.split("\\R")) {
+      if (line.startsWith("INT=")) {
+        String[] p = line.substring(4).split("\\|");
+        if (p.length >= 2) {
+          intFree = parseLongSafe(p[0], -1L);
+          intTotal = parseLongSafe(p[1], -1L);
+        }
+      } else if (line.startsWith("USB=")) {
+        String[] p = line.substring(4).split("\\|");
+        if (p.length >= 3) {
+          usbMounted = "1".equals(p[0]);
+          usbFree = parseLongSafe(p[1], -1L);
+          usbTotal = parseLongSafe(p[2], -1L);
+        }
+      } else if (line.startsWith("WPI=")) {
+        String[] p = line.substring(4).split("\\|");
+        if (p.length >= 2) {
+          wpiCount = (int) parseLongSafe(p[0], 0L);
+          wpiBytes = parseLongSafe(p[1], 0L);
+        }
+      } else if (line.startsWith("HOOT=")) {
+        String[] p = line.substring(5).split("\\|");
+        if (p.length >= 2) {
+          hootCount = (int) parseLongSafe(p[0], 0L);
+          hootBytes = parseLongSafe(p[1], 0L);
+        }
+      } else if (line.startsWith("PID=")) {
+        javaPid = parseLongSafe(line.substring(4), -1L);
+      } else if (line.startsWith("UP=")) {
+        uptime = line.substring(3).trim();
+      }
+    }
+    return new RobotDiagnostics(
+        intFree, intTotal, usbMounted, usbFree, usbTotal, wpiCount, wpiBytes, hootCount, hootBytes,
+        javaPid, uptime);
+  }
+
   /** Builds a pure-Java POSIX/USTAR tar archive for all directories and files under {@code localDir}. */
   static byte[] buildUstarTarArchive(Path localDir) throws IOException {
     if (localDir == null || !Files.isDirectory(localDir)) {

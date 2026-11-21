@@ -134,6 +134,27 @@ public interface RobotTransport {
   record RemoteLogEntry(
       String remoteFullPath, String relativeKey, long sizeBytes, long mtimeEpochSec) {}
 
+  /**
+   * Read-only controller storage, log count/size, and Java process summary (works on legacy {@code
+   * New_Robot} and 2027 controllers without {@code /tmp/flux-robot-state}).
+   */
+  record RobotDiagnostics(
+      long internalFreeMb,
+      long internalTotalMb,
+      boolean usbMounted,
+      long usbFreeMb,
+      long usbTotalMb,
+      int wpilogCount,
+      long wpilogBytes,
+      int hootCount,
+      long hootBytes,
+      long javaPid,
+      String uptimeLine) {
+    public static RobotDiagnostics empty() {
+      return new RobotDiagnostics(-1L, -1L, false, -1L, -1L, 0, 0L, 0, 0L, -1L, "");
+    }
+  }
+
   /** Target controller profile (`systemcore-2027` vs `roborio-2026`). */
   String controllerPlatform();
 
@@ -224,5 +245,10 @@ public interface RobotTransport {
   /** Executes {@link #captureSystemSnapshotRaw()} and returns the parsed snapshot. */
   default FluxSystemSnapshot captureSystemSnapshot() throws IOException {
     return FluxSystemSnapshot.parse(captureSystemSnapshotRaw());
+  }
+
+  /** Reads controller free space, log counts/sizes, and running robot Java PID without mutating state. */
+  default RobotDiagnostics readDiagnostics() throws IOException {
+    return RobotDiagnostics.empty();
   }
 }

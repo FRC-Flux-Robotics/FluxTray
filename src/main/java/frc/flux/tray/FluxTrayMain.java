@@ -243,6 +243,7 @@ public final class FluxTrayMain {
         }
       }
       case "--self-test" -> runSelfTest();
+      case "--robot-status" -> printRobotStatus(args);
       case "--version" -> System.out.println("FluxTray " + GitHubReleaseUpdater.detectCurrentVersion());
       case "--check-update" -> {
         String repo = getFlagValue(args, "--update-repo", GitHubReleaseUpdater.resolveDefaultRepo());
@@ -274,6 +275,62 @@ public final class FluxTrayMain {
         printUsage();
         System.exit(1);
       }
+    }
+  }
+
+  private static void printRobotStatus(String[] args) throws IOException {
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    RobotTransport robot = parseTransportArgs(args, lockout, false);
+    PackageDeployer.RobotCodeStatus status = PackageDeployer.inspectRobotCode(robot);
+    System.out.println("Robot Code Status : " + status.summary());
+    System.out.println("Generation        : " + status.generation());
+    System.out.println("Platform          : " + status.platform());
+    if (status.generation() != PackageDeployer.CodeGeneration.UNREACHABLE) {
+      System.out.println("Active JAR        : " + status.activeJar());
+      System.out.println(
+          "Heartbeat (/tmp/flux-robot-state): "
+              + (status.heartbeat() != null && status.heartbeat().present()
+                  ? status.heartbeat().state() + " (robotId=" + status.heartbeat().robotId() + ")"
+                  : "ABSENT"));
+      System.out.println(
+          "Deploy Stamp      : "
+              + (status.deployStamp() != null
+                  ? status.deployStamp().packageName()
+                      + " ["
+                      + status.deployStamp().channel()
+                      + "] git="
+                      + status.deployStamp().gitSha()
+                  : "ABSENT"));
+      System.out.println("prev_stable.jar   : " + (status.hasPrevStable() ? "PRESENT" : "ABSENT"));
+      RobotTransport.RobotDiagnostics d = status.diagnostics();
+      if (d != null) {
+        System.out.println(
+            "Internal Storage  : "
+                + (d.internalFreeMb() >= 0L
+                    ? d.internalFreeMb() + " MB free / " + d.internalTotalMb() + " MB total"
+                    : "unknown"));
+        System.out.println(
+            "USB Stick         : "
+                + (d.usbMounted()
+                    ? d.usbFreeMb() + " MB free / " + d.usbTotalMb() + " MB total"
+                    : "not mounted"));
+        System.out.println(
+            String.format(
+                Locale.US,
+                "Logs on Robot     : %d .wpilog (%.1f MB), %d .hoot (%.1f MB)",
+                d.wpilogCount(),
+                d.wpilogBytes() / (1024.0 * 1024.0),
+                d.hootCount(),
+                d.hootBytes() / (1024.0 * 1024.0)));
+        System.out.println(
+            "Robot Java PID    : " + (d.javaPid() > 0L ? d.javaPid() : "not running"));
+        if (d.uptimeLine() != null && !d.uptimeLine().isBlank()) {
+          System.out.println("Uptime            : " + d.uptimeLine());
+        }
+      }
+    }
+    if (status.generation() == PackageDeployer.CodeGeneration.UNREACHABLE) {
+      System.exit(2);
     }
   }
 
@@ -664,6 +721,24 @@ public final class FluxTrayMain {
           });
     }
 
+    /** Checks whether the connected controller runs 2027 FLUX code or legacy {@code New_Robot} code. */
+    Future<?> submitRobotStatusCheck() {
+      return actionExecutor.submit(
+          () -> {
+            try {
+              PackageDeployer.RobotCodeStatus status = PackageDeployer.inspectRobotCode(robot);
+              String level =
+                  (status.generation() == PackageDeployer.CodeGeneration.LEGACY_OR_NON_FLUX
+                          || status.generation() == PackageDeployer.CodeGeneration.UNREACHABLE)
+                      ? "WARN"
+                      : "INFO";
+              notify.notify("INFO".equals(level) ? "INFO" : "WARN", "Robot Code Status", status.summary());
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Robot Code Check Failed", ex.getMessage());
+            }
+          });
+    }
+
     /** Pulls pending robot logs first before restoring {@code jars/prev_stable.jar} + {@code deploy/}. */
     Future<?> submitManualRestoreStable() {
       return actionExecutor.submit(
@@ -965,10 +1040,12 @@ public final class FluxTrayMain {
     }
 
     MenuItem pullLogsItem = new MenuItem("Pull Logs Now");
+    MenuItem checkCodeItem = new MenuItem("Check Robot Code");
     MenuItem restoreItem = new MenuItem("Restore STABLE");
     MenuItem exitItem = new MenuItem("Exit FluxTray");
 
     pullLogsItem.addActionListener(e -> coordinator.submitManualPull());
+    checkCodeItem.addActionListener(e -> coordinator.submitRobotStatusCheck());
     restoreItem.addActionListener(e -> coordinator.submitManualRestoreStable());
 
     exitItem.addActionListener(
@@ -983,6 +1060,7 @@ public final class FluxTrayMain {
         });
 
     menu.add(pullLogsItem);
+    menu.add(checkCodeItem);
     menu.add(restoreItem);
     menu.addSeparator();
     menu.add(exitItem);
@@ -1069,6 +1147,7 @@ public final class FluxTrayMain {
           java -jar dist/FluxTray.jar --sync-pending [<FLUX-10413-Hub-dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --check-update [--update-repo <owner/repo>]
           java -jar dist/FluxTray.jar --self-update [--update-repo <owner/repo>]
+          java -jar dist/FluxTray.jar --robot-status [--host <ip>] [--roborio|--systemcore]
           java -jar dist/FluxTray.jar --version
           java -jar dist/FluxTray.jar --print-ssh-capture-cmd
           java -jar dist/FluxTray.jar --self-test

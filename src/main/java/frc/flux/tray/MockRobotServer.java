@@ -420,6 +420,38 @@ public final class MockRobotServer implements RobotTransport {
     return nextSnapshot != null ? nextSnapshot.serialize() : "";
   }
 
+  @Override
+  public RobotDiagnostics readDiagnostics() throws IOException {
+    ensureReachable();
+    java.nio.file.FileStore store = Files.getFileStore(rootDir);
+    long freeMb = store.getUsableSpace() / (1024L * 1024L);
+    long totalMb = store.getTotalSpace() / (1024L * 1024L);
+    int wpiCount = 0;
+    long wpiBytes = 0L;
+    int hootCount = 0;
+    long hootBytes = 0L;
+    Path logsDir = rootDir.resolve("logs");
+    if (Files.isDirectory(logsDir)) {
+      try (Stream<Path> walk = Files.walk(logsDir, 3)) {
+        for (Path p : walk.filter(Files::isRegularFile).toList()) {
+          String name = p.getFileName().toString().toLowerCase(java.util.Locale.ROOT);
+          long sz = Files.size(p);
+          if (name.endsWith(".wpilog")) {
+            wpiCount++;
+            wpiBytes += sz;
+          } else if (name.endsWith(".hoot")) {
+            hootCount++;
+            hootBytes += sz;
+          }
+        }
+      }
+    }
+    RobotStateHeartbeat hb = readRobotStateHeartbeat();
+    long pid = hb.present() ? hb.pid() : -1L;
+    return new RobotDiagnostics(
+        freeMb, totalMb, false, -1L, -1L, wpiCount, wpiBytes, hootCount, hootBytes, pid, "mock-up");
+  }
+
   private Path resolvePath(String rel) {
     String clean = rel;
     if (clean.startsWith("/home/lvuser/")) {

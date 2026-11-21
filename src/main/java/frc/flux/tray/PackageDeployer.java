@@ -87,6 +87,94 @@ public final class PackageDeployer {
     }
   }
 
+  /** Classification of what robot code is currently installed on the connected controller. */
+  public enum CodeGeneration {
+    FLUX_2027_PACKAGE,
+    FLUX_2027_UNSTAMPED,
+    LEGACY_OR_NON_FLUX,
+    UNREACHABLE
+  }
+
+  /** Read-only snapshot of the robot controller's installed code, active JAR, and heartbeat. */
+  public record RobotCodeStatus(
+      CodeGeneration generation,
+      String platform,
+      String activeJar,
+      RobotTransport.RobotStateHeartbeat heartbeat,
+      DeployStamp deployStamp,
+      boolean hasPrevStable,
+      RobotTransport.RobotDiagnostics diagnostics) {
+
+    public boolean isLegacyOrNonFlux() {
+      return generation == CodeGeneration.LEGACY_OR_NON_FLUX;
+    }
+
+    public String summary() {
+      String freePart =
+          (diagnostics != null && diagnostics.internalFreeMb() >= 0L)
+              ? " free=" + diagnostics.internalFreeMb() + "MB"
+              : "";
+      return switch (generation) {
+        case UNREACHABLE -> "UNREACHABLE (" + platform + ")";
+        case FLUX_2027_PACKAGE ->
+            "FLUX 2027 package '"
+                + deployStamp.packageName()
+                + "' ["
+                + deployStamp.channel()
+                + "] git="
+                + deployStamp.gitSha()
+                + " jar="
+                + activeJar
+                + (heartbeat != null && heartbeat.present()
+                    ? " heartbeat=" + heartbeat.state()
+                    : " heartbeat=ABSENT")
+                + freePart;
+        case FLUX_2027_UNSTAMPED ->
+            "FLUX 2027 (unstamped/Gradle deploy, no deploy-stamp.json) jar="
+                + activeJar
+                + " heartbeat="
+                + heartbeat.state()
+                + freePart;
+        case LEGACY_OR_NON_FLUX ->
+            "LEGACY / NON-FLUX (e.g. New_Robot 2026: no /tmp/flux-robot-state, no deploy-stamp.json) jar="
+                + activeJar
+                + freePart;
+      };
+    }
+  }
+
+  /**
+   * Read-only inspection of the robot controller to distinguish 2027 FLUX code from legacy {@code
+   * New_Robot} code without requiring {@code /tmp/flux-robot-state} or mutating any files.
+   */
+  public static RobotCodeStatus inspectRobotCode(RobotTransport robot) throws IOException {
+    String platform = robot.controllerPlatform();
+    if (!robot.isReachable()) {
+      return new RobotCodeStatus(
+          CodeGeneration.UNREACHABLE,
+          platform,
+          "",
+          RobotTransport.RobotStateHeartbeat.absent(),
+          null,
+          false,
+          RobotTransport.RobotDiagnostics.empty());
+    }
+    String activeJar = robot.resolveActiveJarRemotePath();
+    RobotTransport.RobotStateHeartbeat hb = robot.readRobotStateHeartbeat();
+    DeployStamp stamp = DeployStamp.fromJson(robot.readRemoteText("deploy/deploy-stamp.json"));
+    boolean hasPrevStable = robot.remoteFileExists("jars/prev_stable.jar");
+    RobotTransport.RobotDiagnostics diag = robot.readDiagnostics();
+    CodeGeneration gen;
+    if (stamp != null) {
+      gen = CodeGeneration.FLUX_2027_PACKAGE;
+    } else if (hb != null && hb.present()) {
+      gen = CodeGeneration.FLUX_2027_UNSTAMPED;
+    } else {
+      gen = CodeGeneration.LEGACY_OR_NON_FLUX;
+    }
+    return new RobotCodeStatus(gen, platform, activeJar, hb, stamp, hasPrevStable, diag);
+  }
+
   private final RobotSafetyLockout lockout;
   private final String laptopId;
 
