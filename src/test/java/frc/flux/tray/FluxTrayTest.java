@@ -107,7 +107,8 @@ public final class FluxTrayTest {
       testZipBuiltInTempBeforeMoveAndAudioFailureNotifies();
       testMalformedManifestFailsClosedAndRollbackChecksDeployCopy();
       testTruncatedMsgPackFrameNeverMarksDisabled();
-      System.out.println("FluxTrayTest: ALL 21 SUITES PASSED");
+      testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell();
+      System.out.println("FluxTrayTest: ALL 22 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -1091,21 +1092,28 @@ public final class FluxTrayTest {
         swapCmd.contains("/tmp/flux-robot-state") && swapCmd.contains("mv "),
         "Atomic directory swap must inline /tmp/flux-robot-state guard inside the same ssh call");
 
-    // downloadSelectedLogs must POSIX single-quote remote paths containing spaces.
+    // downloadSelectedLogs must stream over ssh (zero scp calls) with POSIX-quoted space paths.
     recorded.clear();
     List<RobotTransport.RemoteLogEntry> spaceLogs =
         List.of(
             new RobotTransport.RemoteLogEntry(
                 "/U/logs/Hub to Depot.wpilog", "usb_U/Hub to Depot.wpilog", 512L, remoteNowSec));
     ssh.downloadSelectedLogs(spaceLogs, temp.resolve("dl"));
-    RecordedCall scpCall =
-        recorded.stream()
-            .filter(c -> "scp".equals(c.argv().get(0)))
-            .findFirst()
-            .orElseThrow(() -> new AssertionError("Expected scp download call"));
     assertTrue(
-        scpCall.argv().contains("lvuser@10.104.13.2:'/U/logs/Hub to Depot.wpilog'"),
-        "downloadSelectedLogs must POSIX single-quote space-named remote paths: " + scpCall.argv());
+        recorded.stream().noneMatch(c -> "scp".equals(c.argv().get(0))),
+        "downloadSelectedLogs must stream over ssh instead of OpenSSH scp: " + recorded);
+    RecordedCall catCall =
+        recorded.stream()
+            .filter(
+                c ->
+                    "ssh".equals(c.argv().get(0))
+                        && c.argv().get(c.argv().size() - 1).contains("cat '/U/logs/Hub to Depot.wpilog'"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("Expected ssh cat download call"));
+    String catCmd = catCall.argv().get(catCall.argv().size() - 1);
+    assertTrue(
+        catCmd.contains("/tmp/flux-robot-state") && catCmd.contains("${_ep%???}"),
+        "ssh download must inline BusyBox-safe /tmp/flux-robot-state guard: " + catCmd);
 
     // restartRobotCode must inline /tmp/flux-robot-state guard right before frcKillRobot.sh.
     recorded.clear();
@@ -1202,6 +1210,169 @@ public final class FluxTrayTest {
         "LIVE_STABLE_JAR_V1",
         mockRio.readRemoteText("Flux-RoboRIO-2027.jar"),
         "Live JAR must roll back to prev_1.jar when replaceRemoteDirectoryAtomic fails");
+  }
+
+  private static void testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-real-sh-stream-");
+    Path remoteRoot = temp.resolve("remote-root");
+    Files.createDirectories(remoteRoot);
+    Path hbFile = temp.resolve("flux-robot-state");
+
+    long nowMs = System.currentTimeMillis();
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + nowMs
+            + "\nROBOT_ID=FUEL\nPID=1234\n",
+        StandardCharsets.UTF_8);
+
+    List<List<String>> executedArgvs = new ArrayList<>();
+    SshRobotTransport.ProcessRunner realShellRunner =
+        (argv, stdin, timeout) -> {
+          executedArgvs.add(List.copyOf(argv));
+          assertEquals("ssh", argv.get(0), "SshRobotTransport must never invoke scp");
+          String remoteCmd = argv.get(argv.size() - 1);
+          Process p = new ProcessBuilder("/bin/sh", "-c", remoteCmd).start();
+          ByteArrayOutputStream outBuf = new ByteArrayOutputStream();
+          ByteArrayOutputStream errBuf = new ByteArrayOutputStream();
+          Thread outReader =
+              new Thread(
+                  () -> {
+                    try {
+                      p.getInputStream().transferTo(outBuf);
+                    } catch (IOException ignored) {
+                    }
+                  });
+          Thread errReader =
+              new Thread(
+                  () -> {
+                    try {
+                      p.getErrorStream().transferTo(errBuf);
+                    } catch (IOException ignored) {
+                    }
+                  });
+          outReader.start();
+          errReader.start();
+          try (OutputStream procIn = p.getOutputStream()) {
+            if (stdin != null && stdin.length > 0) {
+              procIn.write(stdin);
+              procIn.flush();
+            }
+          }
+          try {
+            assertTrue(p.waitFor(10, TimeUnit.SECONDS), "Local /bin/sh command must complete");
+            outReader.join(2_000L);
+            errReader.join(2_000L);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted waiting for /bin/sh", e);
+          }
+          byte[] rawOut = outBuf.toByteArray();
+          return new SshRobotTransport.ProcessResult(
+              p.exitValue(),
+              new String(rawOut, StandardCharsets.UTF_8),
+              errBuf.toString(StandardCharsets.UTF_8),
+              rawOut);
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    SshRobotTransport ssh =
+        new SshRobotTransport(
+            List.of("127.0.0.1"), false, lockout, false, hbFile.toString(), realShellRunner);
+
+    String guard = ssh.buildInlineHeartbeatGuard();
+    assertTrue(!guard.contains("_ep / 1000"), "Inline guard must not use 41-bit division");
+    assertTrue(guard.contains("${_ep%???}"), "Inline guard must strip ms with POSIX expansion");
+
+    // Binary payload with all 256 byte values + invalid UTF-8 sequences to prove lossless streaming.
+    byte[] binaryPayload = new byte[1024];
+    for (int i = 0; i < binaryPayload.length; i++) {
+      binaryPayload[i] = (byte) (i & 0xFF);
+    }
+    Path localJar = temp.resolve("Flux-RoboRIO-2027.jar");
+    Files.write(localJar, binaryPayload);
+
+    // Atomic single-file upload to a path containing spaces and a single quote.
+    Path remoteJar = remoteRoot.resolve("Hub to Depot's/Flux-RoboRIO-2027.jar");
+    ssh.uploadFileAtomic(localJar, remoteJar.toAbsolutePath().toString());
+    assertTrue(Files.isRegularFile(remoteJar), "Uploaded binary file exists at quoted remote path");
+    assertTrue(
+        java.util.Arrays.equals(binaryPayload, Files.readAllBytes(remoteJar)),
+        "Uploaded binary bytes match input byte-for-byte");
+
+    // Binary single-file download from a path containing spaces and a single quote + mtime.
+    Path remoteLog = remoteRoot.resolve("U logs/Hub to Depot's 2026.wpilog");
+    Files.createDirectories(remoteLog.getParent());
+    Files.write(remoteLog, binaryPayload);
+    long expectedMtimeSec = 1_763_650_123L;
+    Path dlDir = temp.resolve("downloaded");
+    Map<String, Path> downloaded =
+        ssh.downloadSelectedLogs(
+            List.of(
+                new RobotTransport.RemoteLogEntry(
+                    remoteLog.toAbsolutePath().toString(),
+                    "usb_U/Hub to Depot's 2026.wpilog",
+                    binaryPayload.length,
+                    expectedMtimeSec)),
+            dlDir);
+    Path dlFile = downloaded.get("usb_U/Hub to Depot's 2026.wpilog");
+    assertTrue(dlFile != null && Files.isRegularFile(dlFile), "Downloaded log exists locally");
+    assertTrue(
+        java.util.Arrays.equals(binaryPayload, Files.readAllBytes(dlFile)),
+        "Downloaded binary .wpilog bytes match source byte-for-byte without UTF-8 corruption");
+    assertEquals(
+        expectedMtimeSec,
+        Files.getLastModifiedTime(dlFile).toInstant().getEpochSecond(),
+        "Downloaded log preserves remote mtime");
+    assertTrue(
+        executedArgvs.stream().noneMatch(a -> "scp".equals(a.get(0))),
+        "Zero scp invocations during upload and download");
+
+    // Real /bin/sh execution of buildInlineHeartbeatGuard: ENABLED, STALE, and CORRUPT fail closed.
+    Files.writeString(
+        hbFile,
+        "STATE=ENABLED\nENABLED=true\nFMS=false\nEPOCH_MS=" + System.currentTimeMillis() + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult enabledRes =
+        realShellRunner.run(List.of("ssh", "lvuser@127.0.0.1", guard), null, java.time.Duration.ofSeconds(5));
+    assertEquals(
+        SshRobotTransport.LOCKOUT_EXIT_CODE,
+        enabledRes.exitCode(),
+        "Inline guard must exit 42 on ENABLED");
+
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + (System.currentTimeMillis() - 12_000L)
+            + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult staleRes =
+        realShellRunner.run(List.of("ssh", "lvuser@127.0.0.1", guard), null, java.time.Duration.ofSeconds(5));
+    assertEquals(
+        SshRobotTransport.LOCKOUT_EXIT_CODE,
+        staleRes.exitCode(),
+        "Inline guard must exit 42 on stale (>5s) heartbeat");
+
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS=01795000000123\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult leadingZeroRes =
+        realShellRunner.run(List.of("ssh", "lvuser@127.0.0.1", guard), null, java.time.Duration.ofSeconds(5));
+    assertEquals(
+        SshRobotTransport.LOCKOUT_EXIT_CODE,
+        leadingZeroRes.exitCode(),
+        "Inline guard must exit 42 on leading-zero corrupt EPOCH_MS");
+
+    // Fresh 41-bit EPOCH_MS passes real /bin/sh guard with zero 41-bit math.
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS=" + System.currentTimeMillis() + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult okRes =
+        realShellRunner.run(List.of("ssh", "lvuser@127.0.0.1", guard), null, java.time.Duration.ofSeconds(5));
+    assertEquals(0, okRes.exitCode(), "Fresh 41-bit EPOCH_MS must pass real /bin/sh guard");
   }
 
   private static void testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus()

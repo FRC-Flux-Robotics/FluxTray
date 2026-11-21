@@ -9,7 +9,9 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -22,12 +24,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
- * Live SSH/SCP transport supporting multi-host roboRIO 2.0 ({@code lvuser@}, {@code /home/lvuser})
- * and SystemCore ({@code systemcore@}, {@code /home/systemcore}) with split command ({@code 15 s})
- * vs. transfer ({@code 300 s}) timeouts, platform-safe {@code UserKnownHostsFile}, pure-Java USTAR
- * tar-over-SSH {@code deploy/} streaming, POSIX-quoted remote paths, canonicalized USB log root
- * discovery, fail-closed {@code /tmp/flux-robot-state} staleness verification, and atomic inlined
- * SSH lockout guards right before every swap and JVM restart.
+ * Live SSH transport supporting multi-host roboRIO 2.0 ({@code lvuser@}, {@code /home/lvuser}) and
+ * SystemCore ({@code systemcore@}, {@code /home/systemcore}) with split command ({@code 15 s}) vs.
+ * transfer ({@code 300 s}) timeouts, platform-safe {@code UserKnownHostsFile}, binary stdin/stdout
+ * streaming over {@code ssh} (avoiding OpenSSH 8.x vs. 9.x {@code scp} quoting divergence),
+ * pure-Java USTAR tar-over-SSH {@code deploy/} streaming, POSIX-quoted remote paths, canonicalized
+ * USB log root discovery, fail-closed {@code /tmp/flux-robot-state} staleness verification, and
+ * atomic inlined BusyBox-safe SSH lockout guards right before every transfer, swap, and JVM
+ * restart.
  */
 public final class SshRobotTransport implements RobotTransport {
 
@@ -42,13 +46,22 @@ public final class SshRobotTransport implements RobotTransport {
   public static final long HEARTBEAT_MAX_AGE_MS = 5_000L;
   public static final long HEARTBEAT_MAX_AGE_SEC = 5L;
   public static final int LOCKOUT_EXIT_CODE = 42;
+  static final String DEFAULT_HEARTBEAT_FILE = "/tmp/flux-robot-state";
   private static final int TCP_PROBE_TIMEOUT_MS = 1_200;
   private static final int TAR_BLOCK_SIZE = 512;
 
-  /** Captured result of one local {@code ssh}/{@code scp} subprocess invocation. */
-  public record ProcessResult(int exitCode, String stdout, String stderr) {}
+  /** Captured result of one local {@code ssh} subprocess invocation (text + lossless raw bytes). */
+  public record ProcessResult(int exitCode, String stdout, String stderr, byte[] stdoutBytes) {
+    public ProcessResult(int exitCode, String stdout, String stderr) {
+      this(
+          exitCode,
+          stdout != null ? stdout : "",
+          stderr != null ? stderr : "",
+          stdout != null ? stdout.getBytes(StandardCharsets.UTF_8) : new byte[0]);
+    }
+  }
 
-  /** Port executing {@code ssh}/{@code scp} commands (backed by {@link ProcessBuilder} by default). */
+  /** Port executing {@code ssh} commands (backed by {@link ProcessBuilder} by default). */
   @FunctionalInterface
   public interface ProcessRunner {
     ProcessResult run(List<String> argv, byte[] stdin, Duration timeout) throws IOException;
@@ -64,6 +77,7 @@ public final class SshRobotTransport implements RobotTransport {
   private final boolean isSystemCore;
   private final RobotSafetyLockout lockout;
   private final boolean allowMissingHeartbeat;
+  private final String heartbeatFilePath;
   private final ProcessRunner processRunner;
   private final Set<Process> activeProcesses = ConcurrentHashMap.newKeySet();
   private final Set<String> createdRemoteDirs = ConcurrentHashMap.newKeySet();
@@ -102,6 +116,22 @@ public final class SshRobotTransport implements RobotTransport {
       RobotSafetyLockout lockout,
       boolean allowMissingHeartbeat,
       ProcessRunner processRunner) {
+    this(
+        candidateHosts,
+        isSystemCore,
+        lockout,
+        allowMissingHeartbeat,
+        DEFAULT_HEARTBEAT_FILE,
+        processRunner);
+  }
+
+  SshRobotTransport(
+      List<String> candidateHosts,
+      boolean isSystemCore,
+      RobotSafetyLockout lockout,
+      boolean allowMissingHeartbeat,
+      String heartbeatFilePath,
+      ProcessRunner processRunner) {
     List<String> resolved =
         (candidateHosts == null || candidateHosts.isEmpty())
             ? (isSystemCore ? SYSTEMCORE_CANDIDATE_HOSTS : ROBORIO_CANDIDATE_HOSTS)
@@ -114,6 +144,10 @@ public final class SshRobotTransport implements RobotTransport {
     this.platform = isSystemCore ? "systemcore-2027" : "roborio-2026";
     this.lockout = lockout;
     this.allowMissingHeartbeat = allowMissingHeartbeat;
+    this.heartbeatFilePath =
+        (heartbeatFilePath != null && !heartbeatFilePath.isBlank())
+            ? heartbeatFilePath
+            : DEFAULT_HEARTBEAT_FILE;
     this.processRunner = processRunner != null ? processRunner : this::runLocalProcess;
     if (lockout != null) {
       lockout.addAbortListener(this::abortActiveProcesses);
@@ -242,9 +276,14 @@ public final class SshRobotTransport implements RobotTransport {
   }
 
   private HeartbeatSample readRobotStateHeartbeatWithClock() throws IOException {
+    String quotedHb = shQuote(heartbeatFilePath);
     String cmd =
         "printf 'REMOTE_EPOCH_SEC=%s\\n' \"$(date +%s)\" && "
-            + "if [ -f '/tmp/flux-robot-state' ]; then printf 'HEARTBEAT_PRESENT=1\\n'; cat '/tmp/flux-robot-state'; "
+            + "if [ -f "
+            + quotedHb
+            + " ]; then printf 'HEARTBEAT_PRESENT=1\\n'; cat "
+            + quotedHb
+            + "; "
             + "else printf 'HEARTBEAT_PRESENT=0\\n'; fi";
     String out = runSshCommand(cmd);
     long remoteEpochSec = -1L;
@@ -317,9 +356,12 @@ public final class SshRobotTransport implements RobotTransport {
 
   /**
    * Builds a pure POSIX/BusyBox shell guard checking {@code /tmp/flux-robot-state} atomically
-   * inside the same SSH command immediately before a mutating {@code mv} or robot JVM restart.
+   * inside the same SSH command immediately before a transfer, swap, or robot JVM restart. Uses
+   * POSIX parameter expansion ({@code ${_ep%???}}) rather than 41-bit division so 32-bit BusyBox
+   * {@code ash} on ARMv7 roboRIO 2.0 never overflows.
    */
   String buildInlineHeartbeatGuard() {
+    String quotedHb = shQuote(heartbeatFilePath);
     String verifyBody =
         "_st=''; _en=''; _fm=''; _ep=''; "
             + "while IFS='=' read -r _k _v || [ -n \"$_k\" ]; do "
@@ -328,15 +370,17 @@ public final class SshRobotTransport implements RobotTransport {
             + "ENABLED) _en=\"$_v\";; "
             + "FMS) _fm=\"$_v\";; "
             + "EPOCH_MS) _ep=\"$_v\";; "
-            + "esac; done < /tmp/flux-robot-state; "
+            + "esac; done < "
+            + quotedHb
+            + "; "
             + "[ \"$_st\" = 'DISABLED' ] && [ \"$_en\" = 'false' ] && [ \"$_fm\" = 'false' ] "
             + "|| { echo \"LOCKOUT: state=$_st enabled=$_en fms=$_fm\" >&2; exit "
             + LOCKOUT_EXIT_CODE
             + "; }; "
-            + "case \"$_ep\" in ''|*[!0-9]*) echo 'LOCKOUT: corrupt EPOCH_MS' >&2; exit "
+            + "case \"$_ep\" in ''|0*|*[!0-9]*) echo 'LOCKOUT: corrupt EPOCH_MS' >&2; exit "
             + LOCKOUT_EXIT_CODE
             + ";; esac; "
-            + "_now=$(date +%s); _hb=$((_ep / 1000)); _age=$((_now - _hb)); "
+            + "_hb=${_ep%???}; [ -n \"$_hb\" ] || _hb=0; _now=$(date +%s); _age=$((_now - _hb)); "
             + "[ \"$_age\" -le "
             + HEARTBEAT_MAX_AGE_SEC
             + " ] && [ \"$_age\" -ge -"
@@ -345,9 +389,11 @@ public final class SshRobotTransport implements RobotTransport {
             + LOCKOUT_EXIT_CODE
             + "; }";
     if (allowMissingHeartbeat) {
-      return "( if [ -f /tmp/flux-robot-state ]; then " + verifyBody + "; fi )";
+      return "( if [ -f " + quotedHb + " ]; then " + verifyBody + "; fi )";
     }
-    return "( [ -f /tmp/flux-robot-state ] || { echo 'LOCKOUT: /tmp/flux-robot-state absent' >&2; exit "
+    return "( [ -f "
+        + quotedHb
+        + " ] || { echo 'LOCKOUT: /tmp/flux-robot-state absent' >&2; exit "
         + LOCKOUT_EXIT_CODE
         + "; }; "
         + verifyBody
@@ -378,7 +424,7 @@ public final class SshRobotTransport implements RobotTransport {
     assertRobotDisabledForTransfer("uploadFile:" + remoteRelativePath);
     String full = resolveRemote(remoteRelativePath);
     ensureRemoteParentDir(full);
-    runScpUpload(localFile, full);
+    runSshFileUpload(localFile, full);
   }
 
   @Override
@@ -387,7 +433,7 @@ public final class SshRobotTransport implements RobotTransport {
     String full = resolveRemote(remoteRelativePath);
     String staged = full + ".fluxtray.tmp";
     ensureRemoteParentDir(full);
-    runScpUpload(localFile, staged);
+    runSshFileUpload(localFile, staged);
     assertRobotDisabledForTransfer("commitAtomic:" + remoteRelativePath);
     runSshCommand(buildInlineHeartbeatGuard() + " && mv -f " + shQuote(staged) + " " + shQuote(full));
   }
@@ -645,21 +691,21 @@ public final class SshRobotTransport implements RobotTransport {
     if (entries == null || entries.isEmpty()) {
       return downloaded;
     }
-    String host = discoverReachableHost();
     for (RemoteLogEntry entry : entries) {
-      assertRobotDisabledForTransfer("scpDownload:" + entry.relativeKey());
+      assertRobotDisabledForTransfer("sshDownload:" + entry.relativeKey());
       Path target = localDestinationDir.resolve(entry.relativeKey()).normalize();
       if (!target.startsWith(localDestinationDir.normalize())) {
         throw new IOException("Blocked unsafe remote log path: " + entry.relativeKey());
       }
       Files.createDirectories(target.getParent());
-      List<String> cmd = new ArrayList<>();
-      cmd.add("scp");
-      cmd.add("-p");
-      cmd.addAll(buildSshOptions());
-      cmd.add(user + "@" + host + ":" + shQuote(entry.remoteFullPath()));
-      cmd.add(target.toAbsolutePath().toString());
-      runCheckedProcess(cmd, null, TRANSFER_TIMEOUT_SEC);
+      byte[] payload =
+          runSshTransferDownload(
+              buildInlineHeartbeatGuard() + " && cat " + shQuote(entry.remoteFullPath()));
+      Files.write(target, payload);
+      if (entry.mtimeEpochSec() > 0L) {
+        Files.setLastModifiedTime(
+            target, FileTime.from(Instant.ofEpochSecond(entry.mtimeEpochSec())));
+      }
       downloaded.put(entry.relativeKey(), target);
     }
     return downloaded;
@@ -780,14 +826,10 @@ public final class SshRobotTransport implements RobotTransport {
     }
   }
 
-  private void runScpUpload(Path localFile, String fullRemotePath) throws IOException {
-    String host = discoverReachableHost();
-    List<String> cmd = new ArrayList<>();
-    cmd.add("scp");
-    cmd.addAll(buildSshOptions());
-    cmd.add(localFile.toAbsolutePath().toString());
-    cmd.add(user + "@" + host + ":" + shQuote(fullRemotePath));
-    runCheckedProcess(cmd, null, TRANSFER_TIMEOUT_SEC);
+  private void runSshFileUpload(Path localFile, String fullRemotePath) throws IOException {
+    byte[] payload = Files.readAllBytes(localFile);
+    runSshTransferCommand(
+        buildInlineHeartbeatGuard() + " && cat > " + shQuote(fullRemotePath), payload);
   }
 
   private String resolveRemote(String rel) {
@@ -812,27 +854,50 @@ public final class SshRobotTransport implements RobotTransport {
     return runSshCommandOnHost(discoverReachableHost(), remoteCmd, stdin, TRANSFER_TIMEOUT_SEC);
   }
 
+  private byte[] runSshTransferDownload(String remoteCmd) throws IOException {
+    List<String> cmd = buildSshInvocation(discoverReachableHost(), remoteCmd);
+    return runCheckedProcessRaw(cmd, null, TRANSFER_TIMEOUT_SEC);
+  }
+
   private String runSshCommandOnHost(
       String host, String remoteCmd, byte[] stdin, long timeoutSeconds) throws IOException {
+    List<String> cmd = buildSshInvocation(host, remoteCmd);
+    return runCheckedProcess(cmd, stdin, timeoutSeconds);
+  }
+
+  private List<String> buildSshInvocation(String host, String remoteCmd) {
     List<String> cmd = new ArrayList<>();
     cmd.add("ssh");
     cmd.addAll(buildSshOptions());
     cmd.add(user + "@" + host);
     cmd.add(remoteCmd);
-    return runCheckedProcess(cmd, stdin, timeoutSeconds);
+    return cmd;
   }
 
   private String runCheckedProcess(List<String> argv, byte[] stdin, long timeoutSeconds)
       throws IOException {
-    ProcessResult result = processRunner.run(List.copyOf(argv), stdin, Duration.ofSeconds(timeoutSeconds));
+    ProcessResult result = runCheckedResult(argv, stdin, timeoutSeconds);
+    return result.stdout() != null ? result.stdout() : "";
+  }
+
+  private byte[] runCheckedProcessRaw(List<String> argv, byte[] stdin, long timeoutSeconds)
+      throws IOException {
+    ProcessResult result = runCheckedResult(argv, stdin, timeoutSeconds);
+    return result.stdoutBytes() != null ? result.stdoutBytes() : new byte[0];
+  }
+
+  private ProcessResult runCheckedResult(List<String> argv, byte[] stdin, long timeoutSeconds)
+      throws IOException {
+    ProcessResult result =
+        processRunner.run(List.copyOf(argv), stdin, Duration.ofSeconds(timeoutSeconds));
     if (result.exitCode() != 0) {
       String stderr = result.stderr() != null ? result.stderr() : "";
       if (result.exitCode() == LOCKOUT_EXIT_CODE || stderr.contains("LOCKOUT:")) {
         throw new IllegalStateException("LOCKOUT [/tmp/flux-robot-state inline]: " + stderr.trim());
       }
-      throw new IOException("SSH/SCP exited with " + result.exitCode() + ": " + stderr);
+      throw new IOException("SSH exited with " + result.exitCode() + ": " + stderr);
     }
-    return result.stdout() != null ? result.stdout() : "";
+    return result;
   }
 
   private ProcessResult runLocalProcess(List<String> argv, byte[] stdin, Duration timeout)
@@ -880,11 +945,11 @@ public final class SshRobotTransport implements RobotTransport {
       }
       outReader.join(2_000L);
       errReader.join(2_000L);
-      String stdout =
-          stdoutHolder[0] != null ? new String(stdoutHolder[0], StandardCharsets.UTF_8) : "";
+      byte[] rawStdout = stdoutHolder[0] != null ? stdoutHolder[0] : new byte[0];
+      String stdout = new String(rawStdout, StandardCharsets.UTF_8);
       String stderr =
           stderrHolder[0] != null ? new String(stderrHolder[0], StandardCharsets.UTF_8) : "";
-      return new ProcessResult(p.exitValue(), stdout, stderr);
+      return new ProcessResult(p.exitValue(), stdout, stderr, rawStdout);
     } catch (InterruptedException e) {
       p.destroyForcibly();
       Thread.currentThread().interrupt();
