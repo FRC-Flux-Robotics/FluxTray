@@ -12,6 +12,7 @@ import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.GraphicsEnvironment;
 import java.awt.Image;
+import java.awt.Menu;
 import java.awt.MenuItem;
 import java.awt.PopupMenu;
 import java.awt.RenderingHints;
@@ -193,6 +194,61 @@ public final class FluxTrayMain {
                 + mode
                 + " and restarted robot on "
                 + robot.controllerPlatform());
+      }
+      case "--switch-stable-config" -> {
+        RobotSafetyLockout lockout = new RobotSafetyLockout();
+        RobotTransport robot = parseTransportArgs(args, lockout, false);
+        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
+        PackageDeployer.ConfigSwitchResult res = deployer.switchToStableConfig(robot);
+        System.out.println(
+            "Switched "
+                + res.robotId()
+                + " to STABLE locked base (sha="
+                + res.configSha256()
+                + ", mode="
+                + res.mode()
+                + ") and restarted robot");
+      }
+      case "--switch-preset" -> {
+        if (args.length < 2) {
+          throw new IllegalArgumentException(
+              "Usage: --switch-preset <preset.csv> [--mode <PRODUCTION|TUNING>] [--host <ip>] [--roborio|--systemcore]");
+        }
+        Path presetCsv = Path.of(args[1]);
+        FluxFig.Mode mode =
+            FluxFig.Mode.valueOf(
+                getFlagValue(args, "--mode", "PRODUCTION").trim().toUpperCase(Locale.ROOT));
+        RobotSafetyLockout lockout = new RobotSafetyLockout();
+        RobotTransport robot = parseTransportArgs(args, lockout, false);
+        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
+        PackageDeployer.ConfigSwitchResult res =
+            deployer.switchToBehavioralPreset(presetCsv, mode, robot);
+        System.out.println(
+            "Switched "
+                + res.robotId()
+                + " to preset '"
+                + res.preset()
+                + "' ["
+                + res.channel()
+                + "] (sha="
+                + res.configSha256()
+                + ", mode="
+                + res.mode()
+                + ") and restarted robot");
+      }
+      case "--switch-live-tuning" -> {
+        RobotSafetyLockout lockout = new RobotSafetyLockout();
+        RobotTransport robot = parseTransportArgs(args, lockout, false);
+        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
+        PackageDeployer.ConfigSwitchResult res = deployer.switchToLiveTuning(robot);
+        System.out.println(
+            "Switched "
+                + res.robotId()
+                + " to Live Tuning ["
+                + res.channel()
+                + "] (sha="
+                + res.configSha256()
+                + ") and restarted robot");
       }
       case "--promote-tuning" -> {
         if (args.length < 2) {
@@ -768,6 +824,7 @@ public final class FluxTrayMain {
     private final AtomicBoolean busySyncing = new AtomicBoolean(false);
     private final AtomicBoolean drivePollQueued = new AtomicBoolean(false);
     private final AtomicBoolean updateCheckQueued = new AtomicBoolean(false);
+    private volatile String lastDrivePollErrorMsg = null;
     private final ExecutorService actionExecutor;
 
     TrayActionCoordinator(
@@ -871,12 +928,17 @@ public final class FluxTrayMain {
                 return;
               }
               PollOutcome outcome = driveWatcher.pollOnce(clockMs.getAsLong());
+              lastDrivePollErrorMsg = null;
               if (outcome.action() != DriveWatcher.ActionType.NONE) {
                 appendTrayLog(
                     logFile, "INFO", "DriveWatcher " + outcome.action() + ": " + outcome.summary());
               }
             } catch (Exception ex) {
-              notify.notify("ERROR", "FluxTray Drive Sync Error", ex.getMessage());
+              String msg = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
+              if (!msg.equals(lastDrivePollErrorMsg)) {
+                lastDrivePollErrorMsg = msg;
+                notify.notify("ERROR", "FluxTray Drive Sync Error", msg);
+              }
             } finally {
               drivePollQueued.set(false);
             }
@@ -932,45 +994,50 @@ public final class FluxTrayMain {
           });
     }
 
+    private CompletedRunBundle pullPendingLogsBeforeMutation(
+        String runPrefix, String warnTitle, String actionLabel) {
+      long nowMs = System.currentTimeMillis();
+      try {
+        return runMgr.pullDriveSafeRunZip(
+            runPrefix + "_" + nowMs,
+            null,
+            robot,
+            dsLogDir,
+            logsDir,
+            nowMs,
+            false,
+            true,
+            true);
+      } catch (IllegalStateException lockoutEx) {
+        String msg = lockoutEx.getMessage();
+        boolean isLockout =
+            lockout.isEnabled()
+                || lockout.isFmsAttached()
+                || (msg != null && msg.toUpperCase(Locale.ROOT).contains("LOCKOUT"));
+        if (isLockout) {
+          throw lockoutEx;
+        }
+        notify.notify(
+            "WARN", warnTitle, "Continuing " + actionLabel + " after log pull error: " + msg);
+        return null;
+      } catch (Exception pullEx) {
+        notify.notify(
+            "WARN",
+            warnTitle,
+            "Continuing " + actionLabel + " after log pull error: " + pullEx.getMessage());
+        return null;
+      }
+    }
+
     /** Pulls pending robot logs first before restoring {@code jars/prev_stable.jar} + {@code deploy/}. */
     Future<?> submitManualRestoreStable() {
       return actionExecutor.submit(
           () -> {
             setBusySyncing(true);
             try {
-              long nowMs = System.currentTimeMillis();
-              CompletedRunBundle preLogs = null;
-              try {
-                preLogs =
-                    runMgr.pullDriveSafeRunZip(
-                        "prerestore_" + nowMs,
-                        null,
-                        robot,
-                        dsLogDir,
-                        logsDir,
-                        nowMs,
-                        false,
-                        true,
-                        true);
-              } catch (IllegalStateException lockoutEx) {
-                String msg = lockoutEx.getMessage();
-                boolean isLockout =
-                    lockout.isEnabled()
-                        || lockout.isFmsAttached()
-                        || (msg != null && msg.toUpperCase(Locale.ROOT).contains("LOCKOUT"));
-                if (isLockout) {
-                  throw lockoutEx;
-                }
-                notify.notify(
-                    "WARN",
-                    "Pre-Restore Log Pull Skipped",
-                    "Continuing Restore STABLE after log pull error: " + msg);
-              } catch (Exception pullEx) {
-                notify.notify(
-                    "WARN",
-                    "Pre-Restore Log Pull Skipped",
-                    "Continuing Restore STABLE after log pull error: " + pullEx.getMessage());
-              }
+              CompletedRunBundle preLogs =
+                  pullPendingLogsBeforeMutation(
+                      "prerestore", "Pre-Restore Log Pull Skipped", "Restore STABLE");
               deployer.restoreStable(robot);
               String suffix =
                   (preLogs != null && preLogs.zipArchive() != null)
@@ -982,6 +1049,105 @@ public final class FluxTrayMain {
                   "Restored prev_stable.jar + deploy/ and restarted robot" + suffix + ".");
             } catch (Exception ex) {
               notify.notify("ERROR", "Restore STABLE Failed", ex.getMessage());
+            } finally {
+              setBusySyncing(false);
+            }
+          });
+    }
+
+    /** Pulls pending robot logs first, restores the locked {@code STABLE} base config, and restarts. */
+    Future<?> submitSwitchToStableConfig() {
+      return actionExecutor.submit(
+          () -> {
+            setBusySyncing(true);
+            try {
+              CompletedRunBundle preLogs =
+                  pullPendingLogsBeforeMutation(
+                      "preswitch", "Pre-Switch Log Pull Skipped", "Switch Config (STABLE)");
+              PackageDeployer.ConfigSwitchResult res = deployer.switchToStableConfig(robot);
+              String suffix =
+                  (preLogs != null && preLogs.zipArchive() != null)
+                      ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
+                      : "";
+              notify.notify(
+                  "INFO",
+                  "FluxTray Config Switched",
+                  "Switched "
+                      + res.robotId()
+                      + " to STABLE (sha="
+                      + res.configSha256()
+                      + ") and restarted robot"
+                      + suffix
+                      + ".");
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Switch Config Failed", ex.getMessage());
+            } finally {
+              setBusySyncing(false);
+            }
+          });
+    }
+
+    /** Pulls pending robot logs first, merges a behavioral preset CSV, validates, uploads, and restarts. */
+    Future<?> submitSwitchToPreset(Path presetCsv, FluxFig.Mode mode) {
+      return actionExecutor.submit(
+          () -> {
+            setBusySyncing(true);
+            try {
+              CompletedRunBundle preLogs =
+                  pullPendingLogsBeforeMutation(
+                      "preswitch", "Pre-Switch Log Pull Skipped", "Switch Config preset");
+              PackageDeployer.ConfigSwitchResult res =
+                  deployer.switchToBehavioralPreset(presetCsv, mode, robot);
+              String suffix =
+                  (preLogs != null && preLogs.zipArchive() != null)
+                      ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
+                      : "";
+              notify.notify(
+                  "INFO",
+                  "FluxTray Preset Active",
+                  "Switched "
+                      + res.robotId()
+                      + " to "
+                      + res.preset()
+                      + " ["
+                      + res.channel()
+                      + "] (sha="
+                      + res.configSha256()
+                      + ") and restarted robot"
+                      + suffix
+                      + ".");
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Switch Config Failed", ex.getMessage());
+            } finally {
+              setBusySyncing(false);
+            }
+          });
+    }
+
+    /** Pulls pending robot logs first, switches to {@code Mode.TUNING} ({@code EXPERIMENTAL}), and restarts. */
+    Future<?> submitSwitchToLiveTuning() {
+      return actionExecutor.submit(
+          () -> {
+            setBusySyncing(true);
+            try {
+              CompletedRunBundle preLogs =
+                  pullPendingLogsBeforeMutation(
+                      "preswitch", "Pre-Switch Log Pull Skipped", "Live Tuning");
+              PackageDeployer.ConfigSwitchResult res = deployer.switchToLiveTuning(robot);
+              String suffix =
+                  (preLogs != null && preLogs.zipArchive() != null)
+                      ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
+                      : "";
+              notify.notify(
+                  "INFO",
+                  "FluxTray Live Tuning Enabled",
+                  "Switched "
+                      + res.robotId()
+                      + " to Live Tuning [EXPERIMENTAL] and restarted robot"
+                      + suffix
+                      + ".");
+            } catch (Exception ex) {
+              notify.notify("ERROR", "Live Tuning Switch Failed", ex.getMessage());
             } finally {
               setBusySyncing(false);
             }
@@ -1284,10 +1450,12 @@ public final class FluxTrayMain {
     }
 
     MenuItem pullLogsItem = new MenuItem("Pull Logs Now");
+    Menu switchConfigMenu = new Menu("Switch Config");
     MenuItem checkCodeItem = new MenuItem("Check Robot Code");
     MenuItem restoreItem = new MenuItem("Restore STABLE");
     MenuItem exitItem = new MenuItem("Exit FluxTray");
 
+    populateSwitchConfigMenu(switchConfigMenu, codeDir, coordinator);
     pullLogsItem.addActionListener(e -> coordinator.submitManualPull());
     checkCodeItem.addActionListener(e -> coordinator.submitRobotStatusCheck());
     restoreItem.addActionListener(e -> coordinator.submitManualRestoreStable());
@@ -1305,6 +1473,7 @@ public final class FluxTrayMain {
         });
 
     menu.add(pullLogsItem);
+    menu.add(switchConfigMenu);
     menu.add(checkCodeItem);
     menu.add(restoreItem);
     menu.addSeparator();
@@ -1324,6 +1493,40 @@ public final class FluxTrayMain {
             + logsDir
             + ")");
     System.out.println("FluxTray running in system tray (log: " + logFile + ").");
+  }
+
+  private static void populateSwitchConfigMenu(
+      Menu switchConfigMenu, Path codeDir, TrayActionCoordinator coordinator) {
+    switchConfigMenu.removeAll();
+    MenuItem stableItem = new MenuItem("STABLE (Locked Base)");
+    stableItem.addActionListener(e -> coordinator.submitSwitchToStableConfig());
+    switchConfigMenu.add(stableItem);
+    switchConfigMenu.addSeparator();
+
+    List<PackageDeployer.ConfigPresetInfo> presets =
+        PackageDeployer.discoverBehavioralPresets(codeDir);
+    if (presets.isEmpty()) {
+      MenuItem emptyItem = new MenuItem("(No presets in code/configs/presets/)");
+      emptyItem.setEnabled(false);
+      switchConfigMenu.add(emptyItem);
+    } else {
+      for (PackageDeployer.ConfigPresetInfo preset : presets) {
+        MenuItem presetItem = new MenuItem(preset.displayName());
+        presetItem.addActionListener(
+            e -> coordinator.submitSwitchToPreset(preset.filePath(), FluxFig.Mode.PRODUCTION));
+        switchConfigMenu.add(presetItem);
+      }
+    }
+
+    switchConfigMenu.addSeparator();
+    MenuItem liveTuningItem = new MenuItem("Live Tuning (EXPERIMENTAL)");
+    liveTuningItem.addActionListener(e -> coordinator.submitSwitchToLiveTuning());
+    switchConfigMenu.add(liveTuningItem);
+
+    MenuItem refreshItem = new MenuItem("Refresh Presets");
+    refreshItem.addActionListener(
+        e -> runOnEdt(() -> populateSwitchConfigMenu(switchConfigMenu, codeDir, coordinator)));
+    switchConfigMenu.add(refreshItem);
   }
 
   private static SshRobotTransport parseTransportArgs(
@@ -1385,6 +1588,9 @@ public final class FluxTrayMain {
           java -jar dist/FluxTray.jar --inspect-snapshot <system-snapshot.txt>
           java -jar dist/FluxTray.jar --deploy <package.fluxpkg.zip> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--force]
           java -jar dist/FluxTray.jar --push-configs <config-dir> [--profile <id>] [--mode PRODUCTION|TUNING] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --switch-stable-config [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --switch-preset <preset.csv> [--mode PRODUCTION|TUNING] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --switch-live-tuning [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --set-mode <PRODUCTION|TUNING> [--profile <id>] [--config-sha <sha>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --promote-tuning <config-dir> [--author <name>] [--notes <text>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --restore-stable [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]

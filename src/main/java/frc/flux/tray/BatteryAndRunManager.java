@@ -280,6 +280,7 @@ public final class BatteryAndRunManager {
       int defaultLoopMs = "systemcore-2027".equalsIgnoreCase(robot.controllerPlatform()) ? 5 : 20;
       int loopPeriodMs = parsePositiveInt(robotMeta.get("loopPeriodMs"), defaultLoopMs);
       String bootTimestampIso = robotMeta.getOrDefault("bootTimestampIso", "");
+      String[] configChannelPreset = resolveConfigChannelAndPreset(robotMeta, robot);
 
       archiveRemoteTunedSnapshotIfPresent(robot, runStageDir);
 
@@ -299,6 +300,8 @@ public final class BatteryAndRunManager {
           batteryName,
           effectiveGitSha,
           effectiveConfigSha,
+          configChannelPreset[0],
+          configChannelPreset[1],
           loopPeriodMs,
           bootTimestampIso,
           false,
@@ -464,6 +467,7 @@ public final class BatteryAndRunManager {
       int defaultLoopMs = "systemcore-2027".equalsIgnoreCase(robot.controllerPlatform()) ? 5 : 20;
       int loopPeriodMs = parsePositiveInt(robotMeta.get("loopPeriodMs"), defaultLoopMs);
       String bootTimestampIso = robotMeta.getOrDefault("bootTimestampIso", "");
+      String[] configChannelPreset = resolveConfigChannelAndPreset(robotMeta, robot);
 
       archiveRemoteTunedSnapshotIfPresent(robot, runDir);
 
@@ -483,6 +487,8 @@ public final class BatteryAndRunManager {
           batteryName,
           effectiveGitSha,
           effectiveConfigSha,
+          configChannelPreset[0],
+          configChannelPreset[1],
           loopPeriodMs,
           bootTimestampIso,
           false,
@@ -555,6 +561,8 @@ public final class BatteryAndRunManager {
         batteryName,
         gitSha,
         configSha,
+        "STABLE",
+        "STABLE",
         20,
         "",
         true,
@@ -640,6 +648,7 @@ public final class BatteryAndRunManager {
           String bootTimestampIso =
               robotMeta.getOrDefault(
                   "bootTimestampIso", fieldMeta.getOrDefault("bootTimestampIso", ""));
+          String[] configChannelPreset = resolveConfigChannelAndPreset(robotMeta, robot);
 
           writeMergedRunMetaJson(
               metaPath,
@@ -649,6 +658,8 @@ public final class BatteryAndRunManager {
               batteryName,
               gitSha,
               configSha256,
+              configChannelPreset[0],
+              configChannelPreset[1],
               loopPeriodMs,
               bootTimestampIso,
               true,
@@ -1105,14 +1116,42 @@ public final class BatteryAndRunManager {
     try {
       return robot.detectRobotIdentity();
     } catch (IOException ignored) {
-      return "roborio-2026".equalsIgnoreCase(robot.controllerPlatform()) ? "FUEL" : "COMP_2027";
+      return RobotTransport.UNKNOWN_ROBOT_IDENTITY;
     }
+  }
+
+  private static String[] resolveConfigChannelAndPreset(
+      Map<String, String> robotMeta, RobotTransport robot) {
+    String channel = robotMeta.getOrDefault("configChannel", "").trim();
+    String preset = robotMeta.getOrDefault("configPreset", "").trim();
+    if (channel.isEmpty() || preset.isEmpty()) {
+      try {
+        String activeRaw = robot.readRemoteText("deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE);
+        if (activeRaw != null && !activeRaw.isBlank()) {
+          FluxFig.ActiveProfileDirective dir = FluxFig.parseActiveProfileDirective(activeRaw);
+          if (channel.isEmpty() && dir.channel() != null && !dir.channel().isBlank()) {
+            channel = dir.channel().trim();
+          }
+          if (preset.isEmpty() && dir.preset() != null && !dir.preset().isBlank()) {
+            preset = dir.preset().trim();
+          }
+        }
+      } catch (IOException | RuntimeException ignored) {
+      }
+    }
+    if (channel.isEmpty()) {
+      channel = "STABLE";
+    }
+    if (preset.isEmpty()) {
+      preset = "STABLE";
+    }
+    return new String[] {channel, preset};
   }
 
   private static void archiveRemoteTunedSnapshotIfPresent(RobotTransport robot, Path runDir)
       throws IOException {
-    String tunedSnapshot =
-        robot.readRemoteText(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_PATH.toString());
+    // Always use the POSIX remote path literal so Windows File.separator never produces \tmp\...
+    String tunedSnapshot = robot.readRemoteText(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
     if (tunedSnapshot != null && !tunedSnapshot.isBlank()) {
       Files.writeString(
           runDir.resolve("tuned-snapshot.txt"), tunedSnapshot, StandardCharsets.UTF_8);
@@ -1234,6 +1273,8 @@ public final class BatteryAndRunManager {
       String batteryName,
       String gitSha,
       String configSha256,
+      String configChannel,
+      String configPreset,
       int loopPeriodMs,
       String bootTimestampIso,
       boolean isFmsMatch,
@@ -1264,6 +1305,8 @@ public final class BatteryAndRunManager {
         batteryName,
         gitSha,
         configSha256,
+        configChannel,
+        configPreset,
         loopPeriodMs,
         bootTimestampIso,
         isFmsMatch,
@@ -1280,6 +1323,8 @@ public final class BatteryAndRunManager {
       String batteryName,
       String gitSha,
       String configSha256,
+      String configChannel,
+      String configPreset,
       int loopPeriodMs,
       String bootTimestampIso,
       boolean isFmsMatch,
@@ -1287,6 +1332,10 @@ public final class BatteryAndRunManager {
       int watchAlertCount,
       String voiceNotesBlock)
       throws IOException {
+    String effectiveChannel =
+        (configChannel == null || configChannel.isBlank()) ? "STABLE" : configChannel.trim();
+    String effectivePreset =
+        (configPreset == null || configPreset.isBlank()) ? "STABLE" : configPreset.trim();
     StringBuilder sb = new StringBuilder(1024);
     sb.append("{\n");
     sb.append("  \"runId\": \"").append(esc(runId)).append("\",\n");
@@ -1295,6 +1344,8 @@ public final class BatteryAndRunManager {
     sb.append("  \"batteryName\": \"").append(esc(batteryName)).append("\",\n");
     sb.append("  \"gitSha\": \"").append(esc(gitSha)).append("\",\n");
     sb.append("  \"configSha256\": \"").append(esc(configSha256)).append("\",\n");
+    sb.append("  \"configChannel\": \"").append(esc(effectiveChannel)).append("\",\n");
+    sb.append("  \"configPreset\": \"").append(esc(effectivePreset)).append("\",\n");
     sb.append("  \"loopPeriodMs\": ").append(loopPeriodMs).append(",\n");
     sb.append("  \"bootTimestampIso\": \"").append(esc(bootTimestampIso)).append("\",\n");
     sb.append("  \"isFmsMatch\": ").append(isFmsMatch).append(",\n");

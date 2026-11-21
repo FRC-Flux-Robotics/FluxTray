@@ -12,6 +12,15 @@ import java.util.Map;
  */
 public interface RobotTransport {
 
+  /** Canonical sentinel returned when neither {@code robot-identity.txt} nor heartbeat identifies the robot. */
+  String UNKNOWN_ROBOT_IDENTITY = "unknown";
+
+  static boolean isUnknownRobotIdentity(String robotId) {
+    return robotId == null
+        || robotId.isBlank()
+        || UNKNOWN_ROBOT_IDENTITY.equalsIgnoreCase(robotId.trim());
+  }
+
   /** Parsed view of {@code /tmp/flux-robot-state} written atomically by robot code. */
   record RobotStateHeartbeat(
       boolean present,
@@ -175,19 +184,33 @@ public interface RobotTransport {
   void assertRobotDisabledForTransfer(String operationName) throws IOException;
 
   /**
-   * Resolves the connected robot's identity ({@code FUEL}, {@code CORAL}, {@code COMP_2027}, etc.)
-   * from {@code robot-identity.txt}, {@code /tmp/flux-robot-state}, or {@code logs/run-meta.json}.
+   * Resolves the connected robot's identity ({@code FUEL}, {@code CORAL}, {@code CHASSIS_3}, {@code
+   * COMP_2027}, etc.) from {@code robot-identity.txt} or {@code /tmp/flux-robot-state}. Returns
+   * {@link #UNKNOWN_ROBOT_IDENTITY} rather than guessing when neither source identifies the robot.
    */
   default String detectRobotIdentity() throws IOException {
     String idFile = readRemoteText("robot-identity.txt");
     if (idFile != null && !idFile.isBlank()) {
-      return idFile.trim().split("\\R")[0].trim();
+      String firstLine = idFile.trim().split("\\R")[0].trim();
+      if (!isUnknownRobotIdentity(firstLine)) {
+        return firstLine;
+      }
     }
     RobotStateHeartbeat hb = readRobotStateHeartbeat();
-    if (hb.present() && hb.robotId() != null && !hb.robotId().isBlank() && !"UNKNOWN".equals(hb.robotId())) {
-      return hb.robotId();
+    if (hb.present() && !isUnknownRobotIdentity(hb.robotId())) {
+      return hb.robotId().trim();
     }
-    return "roborio-2026".equalsIgnoreCase(controllerPlatform()) ? "FUEL" : "COMP_2027";
+    return UNKNOWN_ROBOT_IDENTITY;
+  }
+
+  /** Returns {@code true} only when explicit initial-bootstrap opt-in is enabled. */
+  default boolean isBootstrapAllowed() {
+    return false;
+  }
+
+  /** Lists sorted regular {@code *.csv} filenames directly under {@code remoteRelativeDir}. */
+  default List<String> listRemoteCsvFiles(String remoteRelativeDir) throws IOException {
+    return List.of();
   }
 
   /**

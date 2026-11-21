@@ -35,8 +35,11 @@ public final class DriveWatcher {
   public static final long INITIAL_UNREACHABLE_BACKOFF_MS = 2_000L;
   public static final long MAX_UNREACHABLE_BACKOFF_MS = 60_000L;
   public static final String STATE_FILE_NAME = "drive-watcher-state.json";
+  public static final String BOOTSTRAP_ROBOT_KEY = "BOOTSTRAP";
   public static final String PARTIAL_CONFIGS_ERROR_MESSAGE =
       "code/configs/ requires full config folder including parameters.csv";
+  public static final String UNIDENTIFIED_ROBOT_ERROR_MESSAGE =
+      "Robot identity is unknown — write the robot name (e.g. CHASSIS_3, FUEL, CORAL) to /home/lvuser/robot-identity.txt before FluxTray can deploy or sync configs.";
   private static final String ROBOT_PKG_KEY_PREFIX = "robotPkg.";
   private static final String ROBOT_CFG_KEY_PREFIX = "robotCfg.";
   private static final String ROBOT_ACTIVE_KEY_PREFIX = "robotActivePkg.";
@@ -99,6 +102,10 @@ public final class DriveWatcher {
   private String connectedRobotId = null;
   private long nextReachableProbeAllowedMs = 0L;
   private long currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+  private long nextDeployRetryAllowedMs = 0L;
+  private long currentDeployFailureBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+  private String failedOperationKey = null;
+  private String lastErrorToastKey = null;
 
   public DriveWatcher(
       Path codeDir,
@@ -196,11 +203,13 @@ public final class DriveWatcher {
   public synchronized void onRobotConnected() {
     connectedRobotId = null;
     resetUnreachableBackoff();
+    clearOperationFailureState();
   }
 
   /** Clears cached robot identity when disconnected so the next connected robot is re-identified. */
   public synchronized void onRobotDisconnected() {
     connectedRobotId = null;
+    clearOperationFailureState();
   }
 
   /** Clears unreachable-robot probe backoff and cached robot identity. */
@@ -208,6 +217,41 @@ public final class DriveWatcher {
     connectedRobotId = null;
     nextReachableProbeAllowedMs = 0L;
     currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+  }
+
+  private void clearOperationFailureState() {
+    nextDeployRetryAllowedMs = 0L;
+    currentDeployFailureBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+    failedOperationKey = null;
+    lastErrorToastKey = null;
+  }
+
+  private void notifyErrorOnce(String toastKey, String title, String message) {
+    if (!toastKey.equals(lastErrorToastKey)) {
+      lastErrorToastKey = toastKey;
+      notifications.notify("ERROR", title, message);
+    }
+  }
+
+  private boolean isBackedOffForOperation(String opKey, long nowMs) {
+    return opKey != null
+        && opKey.equals(failedOperationKey)
+        && nowMs < nextDeployRetryAllowedMs;
+  }
+
+  private void recordOperationFailure(long nowMs, String opKey, String title, Throwable ex) {
+    String detail =
+        (ex.getMessage() != null && !ex.getMessage().isBlank())
+            ? ex.getMessage().trim()
+            : ex.getClass().getSimpleName();
+    if (!opKey.equals(failedOperationKey)) {
+      failedOperationKey = opKey;
+      currentDeployFailureBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+    }
+    nextDeployRetryAllowedMs = nowMs + currentDeployFailureBackoffMs;
+    currentDeployFailureBackoffMs =
+        Math.min(MAX_UNREACHABLE_BACKOFF_MS, currentDeployFailureBackoffMs * 2L);
+    notifyErrorOnce(title + "|" + detail, title, detail);
   }
 
   synchronized int packageValidationExtractCount() {
@@ -236,6 +280,19 @@ public final class DriveWatcher {
     }
     try {
       String resolved = normalizeRobotKey(robot.detectRobotIdentity());
+      if (resolved == null) {
+        if (robot.isBootstrapAllowed()) {
+          return BOOTSTRAP_ROBOT_KEY;
+        }
+        notifyErrorOnce(
+            "unidentified-robot",
+            "FluxTray Robot Identity Unknown",
+            UNIDENTIFIED_ROBOT_ERROR_MESSAGE);
+        return null;
+      }
+      if ("unidentified-robot".equals(lastErrorToastKey)) {
+        lastErrorToastKey = null;
+      }
       connectedRobotId = resolved;
       return resolved;
     } catch (IOException ioEx) {
@@ -247,16 +304,15 @@ public final class DriveWatcher {
     }
   }
 
-  private String defaultRobotKey() {
-    return "roborio-2026".equalsIgnoreCase(robot.controllerPlatform()) ? "FUEL" : "COMP_2027";
-  }
-
-  private String normalizeRobotKey(String raw) {
-    if (raw == null || raw.isBlank()) {
-      return defaultRobotKey();
+  private static String normalizeRobotKey(String raw) {
+    if (RobotTransport.isUnknownRobotIdentity(raw)) {
+      return null;
     }
     String cleaned = raw.trim().toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_-]", "_");
-    return cleaned.isEmpty() ? defaultRobotKey() : cleaned;
+    if (cleaned.isEmpty() || "UNKNOWN".equals(cleaned)) {
+      return null;
+    }
+    return cleaned;
   }
 
   private boolean isPackageAlreadyAppliedToConnectedRobot(String pkgHash) {
@@ -375,27 +431,39 @@ public final class DriveWatcher {
           }
           String robotId = resolveConnectedRobotId(nowMs);
           if (robotId == null) {
-            return new PollOutcome(ActionType.NONE, "Robot unreachable for package deploy", null);
+            return new PollOutcome(
+                ActionType.NONE, "Robot unreachable or identity unknown for package deploy", null);
           }
           if (pkgHash.equals(appliedPackageHashByRobot.get(robotId))) {
             pendingPackageHash = null;
             stablePackagePolls = 0;
-            if (!Boolean.TRUE.equals(hadActivePackageByRobot.get(robotId))) {
+            if (!BOOTSTRAP_ROBOT_KEY.equals(robotId)
+                && !Boolean.TRUE.equals(hadActivePackageByRobot.get(robotId))) {
               hadActivePackageByRobot.put(robotId, Boolean.TRUE);
               persistStateQuietly();
             }
           } else {
+            String opKey = "pkg:" + robotId + ":" + pkgHash;
+            if (isBackedOffForOperation(opKey, nowMs)) {
+              return new PollOutcome(
+                  ActionType.NONE, "Backing off failed package deploy for " + robotId, null);
+            }
             transferBusyCallback.accept(true);
             try {
               CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "package deploy");
               PackageDeployer.DeployStamp stamp = deployer.deployPackage(latestPkg, robot, true);
               appliedPackageHashByRobot.put(robotId, pkgHash);
-              hadActivePackageByRobot.put(robotId, Boolean.TRUE);
-              lastAppliedPackageHash = pkgHash;
-              lastRejectedPackageHash = null;
+              if (!BOOTSTRAP_ROBOT_KEY.equals(robotId)) {
+                hadActivePackageByRobot.put(robotId, Boolean.TRUE);
+                lastAppliedPackageHash = pkgHash;
+                lastRejectedPackageHash = null;
+                persistStateQuietly();
+              } else {
+                lastRejectedPackageHash = null;
+              }
               pendingPackageHash = null;
               stablePackagePolls = 0;
-              persistStateQuietly();
+              clearOperationFailureState();
               String msg =
                   "Deployed "
                       + stamp.packageName()
@@ -408,6 +476,18 @@ public final class DriveWatcher {
                       + ") and restarted robot.";
               notifications.notify("INFO", "FluxTray Deploy Complete", msg);
               return new PollOutcome(ActionType.DEPLOYED_PACKAGE, msg, preLogs);
+            } catch (IllegalStateException stateEx) {
+              if (isSafetyLockoutError(stateEx)) {
+                recordOperationFailure(nowMs, opKey, "FluxTray Safety Lockout", stateEx);
+                throw stateEx;
+              }
+              recordOperationFailure(nowMs, opKey, "FluxTray Deploy Failed", stateEx);
+              return new PollOutcome(
+                  ActionType.NONE, "Deploy failed (backing off): " + stateEx.getMessage(), null);
+            } catch (IOException | RuntimeException deployEx) {
+              recordOperationFailure(nowMs, opKey, "FluxTray Deploy Failed", deployEx);
+              return new PollOutcome(
+                  ActionType.NONE, "Deploy failed (backing off): " + deployEx.getMessage(), null);
             } finally {
               transferBusyCallback.accept(false);
             }
@@ -443,6 +523,11 @@ public final class DriveWatcher {
             return new PollOutcome(ActionType.NONE, "Robot unreachable for Restore STABLE", null);
           }
           if (Boolean.TRUE.equals(hadActivePackageByRobot.get(robotId))) {
+            String opKey = "restore:" + robotId;
+            if (isBackedOffForOperation(opKey, nowMs)) {
+              return new PollOutcome(
+                  ActionType.NONE, "Backing off failed Restore STABLE for " + robotId, null);
+            }
             transferBusyCallback.accept(true);
             try {
               CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "Restore STABLE");
@@ -454,6 +539,7 @@ public final class DriveWatcher {
                     appliedPackageHashByRobot.isEmpty() ? null : lastAppliedPackageHash;
                 emptyPackagePolls = 0;
                 emptyCodeSinceMs = -1L;
+                clearOperationFailureState();
                 persistStateQuietly();
                 String msg =
                     "code/ emptied — restored prev_stable.jar on "
@@ -468,7 +554,24 @@ public final class DriveWatcher {
                   appliedPackageHashByRobot.isEmpty() ? null : lastAppliedPackageHash;
               emptyPackagePolls = 0;
               emptyCodeSinceMs = -1L;
+              clearOperationFailureState();
               persistStateQuietly();
+            } catch (IllegalStateException stateEx) {
+              if (isSafetyLockoutError(stateEx)) {
+                recordOperationFailure(nowMs, opKey, "FluxTray Safety Lockout", stateEx);
+                throw stateEx;
+              }
+              recordOperationFailure(nowMs, opKey, "FluxTray Restore STABLE Failed", stateEx);
+              return new PollOutcome(
+                  ActionType.NONE,
+                  "Restore STABLE failed (backing off): " + stateEx.getMessage(),
+                  null);
+            } catch (IOException | RuntimeException restoreEx) {
+              recordOperationFailure(nowMs, opKey, "FluxTray Restore STABLE Failed", restoreEx);
+              return new PollOutcome(
+                  ActionType.NONE,
+                  "Restore STABLE failed (backing off): " + restoreEx.getMessage(),
+                  null);
             } finally {
               transferBusyCallback.accept(false);
             }
@@ -533,23 +636,34 @@ public final class DriveWatcher {
           }
           String robotId = resolveConnectedRobotId(nowMs);
           if (robotId == null) {
-            return new PollOutcome(ActionType.NONE, "Robot unreachable for config push", null);
+            return new PollOutcome(
+                ActionType.NONE, "Robot unreachable or identity unknown for config push", null);
           }
           if (cfgHash.equals(appliedConfigsHashByRobot.get(robotId))) {
             pendingConfigsHash = null;
             stableConfigsPolls = 0;
           } else {
+            String opKey = "cfg:" + robotId + ":" + cfgHash;
+            if (isBackedOffForOperation(opKey, nowMs)) {
+              return new PollOutcome(
+                  ActionType.NONE, "Backing off failed config push for " + robotId, null);
+            }
             transferBusyCallback.accept(true);
             try {
               CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "config push");
               String deployedSha =
                   deployer.pushFluxFigConfigs(configsDir, null, FluxFig.Mode.PRODUCTION, robot);
               appliedConfigsHashByRobot.put(robotId, cfgHash);
-              lastAppliedConfigsHash = cfgHash;
-              lastRejectedConfigsHash = null;
+              if (!BOOTSTRAP_ROBOT_KEY.equals(robotId)) {
+                lastAppliedConfigsHash = cfgHash;
+                lastRejectedConfigsHash = null;
+                persistStateQuietly();
+              } else {
+                lastRejectedConfigsHash = null;
+              }
               pendingConfigsHash = null;
               stableConfigsPolls = 0;
-              persistStateQuietly();
+              clearOperationFailureState();
               String msg =
                   "Pushed code/configs/*.csv to "
                       + robotId
@@ -558,6 +672,22 @@ public final class DriveWatcher {
                       + ") and restarted robot.";
               notifications.notify("INFO", "FluxTray Configs Pushed", msg);
               return new PollOutcome(ActionType.PUSHED_CONFIGS, msg, preLogs);
+            } catch (IllegalStateException stateEx) {
+              if (isSafetyLockoutError(stateEx)) {
+                recordOperationFailure(nowMs, opKey, "FluxTray Safety Lockout", stateEx);
+                throw stateEx;
+              }
+              recordOperationFailure(nowMs, opKey, "FluxTray Config Push Failed", stateEx);
+              return new PollOutcome(
+                  ActionType.NONE,
+                  "Config push failed (backing off): " + stateEx.getMessage(),
+                  null);
+            } catch (IOException | RuntimeException pushEx) {
+              recordOperationFailure(nowMs, opKey, "FluxTray Config Push Failed", pushEx);
+              return new PollOutcome(
+                  ActionType.NONE,
+                  "Config push failed (backing off): " + pushEx.getMessage(),
+                  null);
             } finally {
               transferBusyCallback.accept(false);
             }
@@ -623,46 +753,31 @@ public final class DriveWatcher {
       lastRejectedPackageHash = blankToNull(m.get("lastRejectedPackageHash"));
       lastRejectedConfigsHash = blankToNull(m.get("lastRejectedConfigsHash"));
 
-      boolean sawPerRobotEntries = false;
       for (Map.Entry<String, String> entry : m.entrySet()) {
         String key = entry.getKey();
         if (key.startsWith(ROBOT_PKG_KEY_PREFIX)) {
           String robotKey = normalizeRobotKey(key.substring(ROBOT_PKG_KEY_PREFIX.length()));
           String val = blankToNull(entry.getValue());
-          if (val != null) {
+          if (robotKey != null && !BOOTSTRAP_ROBOT_KEY.equals(robotKey) && val != null) {
             appliedPackageHashByRobot.put(robotKey, val);
-            sawPerRobotEntries = true;
           }
         } else if (key.startsWith(ROBOT_CFG_KEY_PREFIX)) {
           String robotKey = normalizeRobotKey(key.substring(ROBOT_CFG_KEY_PREFIX.length()));
           String val = blankToNull(entry.getValue());
-          if (val != null) {
+          if (robotKey != null && !BOOTSTRAP_ROBOT_KEY.equals(robotKey) && val != null) {
             appliedConfigsHashByRobot.put(robotKey, val);
-            sawPerRobotEntries = true;
           }
         } else if (key.startsWith(ROBOT_ACTIVE_KEY_PREFIX)) {
           String robotKey = normalizeRobotKey(key.substring(ROBOT_ACTIVE_KEY_PREFIX.length()));
-          if ("true".equalsIgnoreCase(entry.getValue())) {
+          if (robotKey != null
+              && !BOOTSTRAP_ROBOT_KEY.equals(robotKey)
+              && "true".equalsIgnoreCase(entry.getValue())) {
             hadActivePackageByRobot.put(robotKey, Boolean.TRUE);
-            sawPerRobotEntries = true;
           }
         }
       }
-      if (!sawPerRobotEntries) {
-        String fallbackRobot = defaultRobotKey();
-        if (lastAppliedPackageHash != null) {
-          appliedPackageHashByRobot.put(fallbackRobot, lastAppliedPackageHash);
-          hadActivePackageByRobot.put(fallbackRobot, Boolean.TRUE);
-        } else if ("true".equalsIgnoreCase(m.get("hadActivePackage"))) {
-          hadActivePackageByRobot.put(fallbackRobot, Boolean.TRUE);
-        }
-        if (lastAppliedConfigsHash != null) {
-          appliedConfigsHashByRobot.put(fallbackRobot, lastAppliedConfigsHash);
-        }
-      } else {
-        for (String robotKey : appliedPackageHashByRobot.keySet()) {
-          hadActivePackageByRobot.putIfAbsent(robotKey, Boolean.TRUE);
-        }
+      for (String robotKey : appliedPackageHashByRobot.keySet()) {
+        hadActivePackageByRobot.putIfAbsent(robotKey, Boolean.TRUE);
       }
     } catch (IOException ignored) {
     }
@@ -688,6 +803,9 @@ public final class DriveWatcher {
       allRobots.addAll(appliedConfigsHashByRobot.keySet());
       allRobots.addAll(hadActivePackageByRobot.keySet());
       for (String robotKey : allRobots) {
+        if (BOOTSTRAP_ROBOT_KEY.equals(robotKey) || RobotTransport.isUnknownRobotIdentity(robotKey)) {
+          continue;
+        }
         String pkg = appliedPackageHashByRobot.get(robotKey);
         if (pkg != null) {
           sb.append(",\n  \"")

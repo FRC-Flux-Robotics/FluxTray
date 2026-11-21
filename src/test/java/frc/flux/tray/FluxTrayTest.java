@@ -128,7 +128,10 @@ public final class FluxTrayTest {
       testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout();
       testReadDiagnosticsUsesBusyBoxSafeDfKilobytes();
       testDriveWatcherOfflineSyncAndPerRobotMultiChassisUpdates();
-      System.out.println("FluxTrayTest: ALL 36 SUITES PASSED");
+      testFailedDeployBacksOffAndRotatesRollbackRingOnce();
+      testUnidentifiedRobotIsNotDeployedUnderGuessedName();
+      testM130SwitchConfigPresetsLiveTuningTunedSnapshotPosixPathAndRestoreStable();
+      System.out.println("FluxTrayTest: ALL 39 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -1320,6 +1323,14 @@ public final class FluxTrayTest {
     assertTrue(
         java.util.Arrays.equals(binaryPayload, Files.readAllBytes(remoteJar)),
         "Uploaded binary bytes match input byte-for-byte");
+
+    // Refresh mock heartbeat like a live 250 ms roboRIO loop before download so loaded CI runs never age past 5 s.
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + System.currentTimeMillis()
+            + "\nROBOT_ID=FUEL\nPID=1234\n",
+        StandardCharsets.UTF_8);
 
     // Binary single-file download from a path containing spaces and a single quote + mtime.
     Path remoteLog = remoteRoot.resolve("U logs/Hub to Depot's 2026.wpilog");
@@ -2964,6 +2975,16 @@ public final class FluxTrayTest {
     }
 
     @Override
+    public boolean isBootstrapAllowed() {
+      return delegate.isBootstrapAllowed();
+    }
+
+    @Override
+    public List<String> listRemoteCsvFiles(String remoteRelativeDir) throws IOException {
+      return delegate.listRemoteCsvFiles(remoteRelativeDir);
+    }
+
+    @Override
     public String resolveActiveJarRemotePath() throws IOException {
       return delegate.resolveActiveJarRemotePath();
     }
@@ -4399,6 +4420,668 @@ public final class FluxTrayTest {
         rebootedWatcher.pollOnce(t + 130_000L).action(),
         "Untouched CHASSIS_3 stays idle after 30 s");
     assertEquals(0, chassis3.restartCount(), "CHASSIS_3 was never restarted");
+    audio.close();
+  }
+
+  private static void testFailedDeployBacksOffAndRotatesRollbackRingOnce() throws Exception {
+    Path temp = createTempDir("fluxtray-tray-f1-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio-a"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.setRobotStateFile(false, false, "FUEL");
+    String activeJar = rio.resolveActiveJarRemotePath();
+
+    // Seed rollback ring prev_1..5 with v5..v1 and active JAR with v6.
+    Files.writeString(rio.rootDir().resolve(activeJar), "JAR_V6", StandardCharsets.UTF_8);
+    Files.writeString(rio.rootDir().resolve("deploy/version.txt"), "DEPLOY_V6", StandardCharsets.UTF_8);
+    for (int slot = 1; slot <= 5; slot++) {
+      String tag = "V" + (6 - slot);
+      Files.writeString(
+          rio.rootDir().resolve("jars/prev_" + slot + ".jar"),
+          "JAR_" + tag,
+          StandardCharsets.UTF_8);
+      Path slotDeploy = rio.rootDir().resolve("jars/prev_" + slot + "_deploy");
+      Files.createDirectories(slotDeploy);
+      Files.writeString(slotDeploy.resolve("version.txt"), "DEPLOY_" + tag, StandardCharsets.UTF_8);
+    }
+
+    AtomicBoolean failRestart = new AtomicBoolean(true);
+    AtomicInteger restartAttempts = new AtomicInteger(0);
+    AtomicInteger jarUploads = new AtomicInteger(0);
+    RobotTransport restartFailRobot =
+        new DelegatingRobotTransport(rio) {
+          @Override
+          public void uploadFileAtomic(Path localFile, String remoteRelativePath)
+              throws IOException {
+            if (activeJar.equals(remoteRelativePath)) {
+              jarUploads.incrementAndGet();
+            }
+            super.uploadFileAtomic(localFile, remoteRelativePath);
+          }
+
+          @Override
+          public void restartRobotCode() throws IOException {
+            restartAttempts.incrementAndGet();
+            if (failRestart.get()) {
+              throw new IOException("Simulated frcKillRobot.sh failure");
+            }
+            super.restartRobotCode();
+          }
+        };
+
+    Path cfgDir = createSampleFluxFigConfigs(temp.resolve("cfg-v7"), "Drivetrain", 60.0);
+    Path jarV7 = temp.resolve("v7.jar");
+    Files.writeString(jarV7, "JAR_V7", StandardCharsets.UTF_8);
+    PackageDeployer.createFluxPkgZip(
+        codeDir.resolve("STABLE_v7_roborio-2026_fluxpkg.zip"),
+        new PackageManifest(
+            "STABLE_v7", "roborio-2026", "STABLE", "7777777", false, "cfg7777", "boris"),
+        jarV7,
+        cfgDir);
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    List<String> errorToasts = new CopyOnWriteArrayList<>();
+    DriveWatcher watcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            restartFailRobot,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> {
+              if ("ERROR".equalsIgnoreCase(lvl)) {
+                errorToasts.add(title + ":" + msg);
+              }
+            },
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+
+    long baseMs = 1_763_700_000_000L;
+    assertEquals(ActionType.NONE, watcher.pollOnce(baseMs).action(), "Poll 0 stabilizes package");
+    for (int i = 1; i <= 6; i++) {
+      PollOutcome out = watcher.pollOnce(baseMs + i * 1_000L);
+      assertEquals(ActionType.NONE, out.action(), "Failing deploy poll " + i + " backs off");
+    }
+    assertTrue(
+        restartAttempts.get() <= 2,
+        "Exponential backoff must limit 6 1s polls to <= 2 attempts (got "
+            + restartAttempts.get()
+            + ")");
+    assertEquals(1, jarUploads.get(), "Retry must resume at restart without re-uploading JAR");
+    assertEquals(1, errorToasts.size(), "Identical repeated deploy failures must toast strictly once");
+    assertEquals(
+        "JAR_V6",
+        Files.readString(rio.rootDir().resolve("jars/prev_1.jar"), StandardCharsets.UTF_8),
+        "prev_1 holds previous active JAR_V6");
+    assertEquals(
+        "JAR_V5",
+        Files.readString(rio.rootDir().resolve("jars/prev_2.jar"), StandardCharsets.UTF_8),
+        "prev_2 must remain JAR_V5 (ring rotated once)");
+    assertEquals(
+        "JAR_V4",
+        Files.readString(rio.rootDir().resolve("jars/prev_3.jar"), StandardCharsets.UTF_8),
+        "prev_3 must remain JAR_V4 (ring rotated once)");
+    assertEquals(
+        "JAR_V3",
+        Files.readString(rio.rootDir().resolve("jars/prev_4.jar"), StandardCharsets.UTF_8),
+        "prev_4 must remain JAR_V3 (ring rotated once)");
+    assertEquals(
+        "JAR_V2",
+        Files.readString(rio.rootDir().resolve("jars/prev_5.jar"), StandardCharsets.UTF_8),
+        "prev_5 must remain JAR_V2 (ring rotated once)");
+
+    // Once restart recovers after backoff window, deploy completes with ring still rotated once.
+    failRestart.set(false);
+    PollOutcome recovered = watcher.pollOnce(baseMs + 10_000L);
+    assertEquals(ActionType.DEPLOYED_PACKAGE, recovered.action(), "Retry succeeds after recovery");
+    assertEquals(1, jarUploads.get(), "Recovery retry still does not re-upload JAR");
+    assertEquals(
+        "JAR_V7",
+        Files.readString(rio.rootDir().resolve(activeJar), StandardCharsets.UTF_8),
+        "Active JAR is V7");
+    assertEquals(
+        "JAR_V5",
+        Files.readString(rio.rootDir().resolve("jars/prev_2.jar"), StandardCharsets.UTF_8),
+        "prev_2 still JAR_V5 after recovery");
+
+    // Second scenario: active JAR upload itself fails repeatedly; ring still rotates at most once.
+    MockRobotServer rioB = new MockRobotServer(temp.resolve("rio-b"), "roborio-2026");
+    rioB.setRobotIdentityFile("CORAL");
+    rioB.setRobotStateFile(false, false, "CORAL");
+    Files.writeString(rioB.rootDir().resolve(activeJar), "JAR_V6", StandardCharsets.UTF_8);
+    for (int slot = 1; slot <= 5; slot++) {
+      String tag = "V" + (6 - slot);
+      Files.writeString(
+          rioB.rootDir().resolve("jars/prev_" + slot + ".jar"),
+          "JAR_" + tag,
+          StandardCharsets.UTF_8);
+      Path slotDeploy = rioB.rootDir().resolve("jars/prev_" + slot + "_deploy");
+      Files.createDirectories(slotDeploy);
+      Files.writeString(slotDeploy.resolve("version.txt"), "DEPLOY_" + tag, StandardCharsets.UTF_8);
+    }
+    AtomicInteger uploadAttemptsB = new AtomicInteger(0);
+    RobotTransport uploadFailRobot =
+        new DelegatingRobotTransport(rioB) {
+          @Override
+          public void uploadFileAtomic(Path localFile, String remoteRelativePath)
+              throws IOException {
+            if (activeJar.equals(remoteRelativePath)) {
+              uploadAttemptsB.incrementAndGet();
+              throw new IOException("Simulated SSH drop mid-JAR upload");
+            }
+            super.uploadFileAtomic(localFile, remoteRelativePath);
+          }
+        };
+    List<String> errorToastsB = new CopyOnWriteArrayList<>();
+    DriveWatcher watcherB =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            uploadFailRobot,
+            new PackageDeployer(lockout, "ct-laptop"),
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> {
+              if ("ERROR".equalsIgnoreCase(lvl)) {
+                errorToastsB.add(title + ":" + msg);
+              }
+            },
+            temp.resolve("state-b"),
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+    watcherB.pollOnce(baseMs);
+    for (int i = 1; i <= 6; i++) {
+      assertEquals(ActionType.NONE, watcherB.pollOnce(baseMs + i * 1_000L).action(), "Upload fail backs off");
+    }
+    assertTrue(uploadAttemptsB.get() <= 2, "Upload failure must also back off to <= 2 attempts");
+    assertEquals(1, errorToastsB.size(), "Repeated upload failure must toast strictly once");
+    assertEquals(
+        "JAR_V6",
+        Files.readString(rioB.rootDir().resolve(activeJar), StandardCharsets.UTF_8),
+        "Active JAR remains V6");
+    assertEquals(
+        "JAR_V5",
+        Files.readString(rioB.rootDir().resolve("jars/prev_2.jar"), StandardCharsets.UTF_8),
+        "prev_2 stays JAR_V5 on upload retry");
+    assertEquals(
+        "JAR_V2",
+        Files.readString(rioB.rootDir().resolve("jars/prev_5.jar"), StandardCharsets.UTF_8),
+        "prev_5 stays JAR_V2 on upload retry");
+    audio.close();
+  }
+
+  private static void testUnidentifiedRobotIsNotDeployedUnderGuessedName() throws Exception {
+    Path temp = createTempDir("fluxtray-tray-f4-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rioA = new MockRobotServer(temp.resolve("rio-a"), "roborio-2026");
+    rioA.setRobotStateFile(false, false, "UNKNOWN");
+    MockRobotServer rioB = new MockRobotServer(temp.resolve("rio-b"), "roborio-2026");
+    rioB.setRobotStateFile(false, false, "UNKNOWN");
+
+    assertEquals(
+        RobotTransport.UNKNOWN_ROBOT_IDENTITY,
+        rioA.detectRobotIdentity(),
+        "Unidentified roboRIO must report 'unknown' instead of guessing FUEL");
+    assertEquals(
+        RobotTransport.UNKNOWN_ROBOT_IDENTITY,
+        rioB.detectRobotIdentity(),
+        "Second unidentified roboRIO must also report 'unknown'");
+
+    Path cfgDir = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
+    Path jar = temp.resolve("robot.jar");
+    Files.writeString(jar, "UNIDENTIFIED_GUARD_JAR", StandardCharsets.UTF_8);
+    PackageDeployer.createFluxPkgZip(
+        codeDir.resolve("STABLE_guard_roborio-2026_fluxpkg.zip"),
+        new PackageManifest(
+            "STABLE_guard", "roborio-2026", "STABLE", "abc1234", false, "cfg1234", "boris"),
+        jar,
+        cfgDir);
+    createSampleFluxFigConfigs(codeDir.resolve("configs"), "Drivetrain", 55.0);
+
+    AtomicReference<MockRobotServer> current = new AtomicReference<>(rioA);
+    RobotTransport switchable =
+        new DelegatingRobotTransport(rioA) {
+          @Override
+          public String controllerPlatform() {
+            return current.get().controllerPlatform();
+          }
+
+          @Override
+          public String currentBootEpochId() {
+            return current.get().currentBootEpochId();
+          }
+
+          @Override
+          public boolean isReachable() {
+            return current.get().isReachable();
+          }
+
+          @Override
+          public RobotStateHeartbeat readRobotStateHeartbeat() throws IOException {
+            return current.get().readRobotStateHeartbeat();
+          }
+
+          @Override
+          public void assertRobotDisabledForTransfer(String operationName) throws IOException {
+            current.get().assertRobotDisabledForTransfer(operationName);
+          }
+
+          @Override
+          public String detectRobotIdentity() throws IOException {
+            return current.get().detectRobotIdentity();
+          }
+
+          @Override
+          public boolean isBootstrapAllowed() {
+            return current.get().isBootstrapAllowed();
+          }
+
+          @Override
+          public String resolveActiveJarRemotePath() throws IOException {
+            return current.get().resolveActiveJarRemotePath();
+          }
+
+          @Override
+          public String readRemoteText(String remoteRelativePath) throws IOException {
+            return current.get().readRemoteText(remoteRelativePath);
+          }
+
+          @Override
+          public void writeRemoteText(String remoteRelativePath, String content) throws IOException {
+            current.get().writeRemoteText(remoteRelativePath, content);
+          }
+
+          @Override
+          public void uploadFileAtomic(Path localFile, String remoteRelativePath) throws IOException {
+            current.get().uploadFileAtomic(localFile, remoteRelativePath);
+          }
+
+          @Override
+          public void replaceRemoteDirectoryAtomic(Path localDir, String remoteRelativeDir)
+              throws IOException {
+            current.get().replaceRemoteDirectoryAtomic(localDir, remoteRelativeDir);
+          }
+
+          @Override
+          public boolean copyRemoteFile(String fromRelativePath, String toRelativePath)
+              throws IOException {
+            return current.get().copyRemoteFile(fromRelativePath, toRelativePath);
+          }
+
+          @Override
+          public boolean copyRemoteDirectory(String fromRelativeDir, String toRelativeDir)
+              throws IOException {
+            return current.get().copyRemoteDirectory(fromRelativeDir, toRelativeDir);
+          }
+
+          @Override
+          public boolean remoteFileExists(String remoteRelativePath) throws IOException {
+            return current.get().remoteFileExists(remoteRelativePath);
+          }
+
+          @Override
+          public boolean deleteRemoteFile(String remoteRelativePath) throws IOException {
+            return current.get().deleteRemoteFile(remoteRelativePath);
+          }
+
+          @Override
+          public void restartRobotCode() throws IOException {
+            current.get().restartRobotCode();
+          }
+
+          @Override
+          public List<RemoteLogEntry> listRemoteLogEntries() throws IOException {
+            return current.get().listRemoteLogEntries();
+          }
+
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RemoteLogEntry> entries, Path localDestinationDir) throws IOException {
+            return current.get().downloadSelectedLogs(entries, localDestinationDir);
+          }
+
+          @Override
+          public String captureSystemSnapshotRaw() throws IOException {
+            return current.get().captureSystemSnapshotRaw();
+          }
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    List<String> errorToasts = new CopyOnWriteArrayList<>();
+    DriveWatcher watcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            switchable,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> {
+              if ("ERROR".equalsIgnoreCase(lvl)) {
+                errorToasts.add(title + ":" + msg);
+              }
+            },
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+
+    long t = 1_763_710_000_000L;
+    for (int i = 0; i < 4; i++) {
+      assertEquals(ActionType.NONE, watcher.pollOnce(t + i * 1_000L).action(), "Unidentified rioA must not deploy");
+    }
+    current.set(rioB);
+    for (int i = 4; i < 8; i++) {
+      assertEquals(ActionType.NONE, watcher.pollOnce(t + i * 1_000L).action(), "Unidentified rioB must not deploy");
+    }
+    assertEquals(0, rioA.restartCount(), "Unidentified rioA must have 0 restarts");
+    assertEquals(0, rioB.restartCount(), "Unidentified rioB must have 0 restarts");
+    assertEquals(1, errorToasts.size(), "Unidentified robot must emit strictly 1 ERROR toast");
+    assertTrue(
+        errorToasts.get(0).contains("robot-identity.txt"),
+        "ERROR toast must instruct writing robot-identity.txt: " + errorToasts.get(0));
+    assertTrue(
+        !Files.exists(watcher.stateFile()),
+        "State file must not be persisted for unidentified robots");
+
+    assertThrowsIllegalState(
+        () -> deployer.pushFluxFigConfigs(cfgDir, null, FluxFig.Mode.PRODUCTION, rioA),
+        "pushFluxFigConfigs without explicit profile must fail closed on unidentified robot");
+    assertThrowsIllegalState(
+        () -> deployer.switchToLiveTuning(rioA),
+        "switchToLiveTuning must fail closed on unidentified robot");
+
+    // Explicit bootstrap opt-in permits deploying to an unidentified robot without recording FUEL.
+    current.set(rioA);
+    rioA.setBootstrapAllowed(true);
+    PollOutcome bootstrapped = watcher.pollOnce(t + 10_000L);
+    assertEquals(
+        ActionType.DEPLOYED_PACKAGE,
+        bootstrapped.action(),
+        "Explicit bootstrap flag allows package deploy on unidentified robot");
+    assertEquals(1, rioA.restartCount(), "Bootstrapped rioA restarted once");
+    assertTrue(
+        !Files.exists(watcher.stateFile())
+            || !Files.readString(watcher.stateFile(), StandardCharsets.UTF_8).contains("FUEL"),
+        "State file must never record guessed FUEL key");
+
+    // Writing robot-identity.txt on rioB unlocks normal keyed deploy under CHASSIS_3.
+    rioB.setRobotIdentityFile("CHASSIS_3");
+    current.set(rioB);
+    watcher.onRobotConnected();
+    assertEquals(ActionType.NONE, watcher.pollOnce(t + 15_000L).action(), "Stabilize for CHASSIS_3");
+    assertEquals(ActionType.DEPLOYED_PACKAGE, watcher.pollOnce(t + 16_000L).action(), "CHASSIS_3 deploys once identified");
+    String persisted = Files.readString(watcher.stateFile(), StandardCharsets.UTF_8);
+    assertTrue(persisted.contains("\"robotPkg.CHASSIS_3\""), "State must key under CHASSIS_3: " + persisted);
+    assertTrue(!persisted.contains("\"robotPkg.FUEL\""), "State must never contain guessed FUEL: " + persisted);
+    audio.close();
+  }
+
+  private static void testM130SwitchConfigPresetsLiveTuningTunedSnapshotPosixPathAndRestoreStable()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-m130-");
+    Path codeDir = temp.resolve("drive/code");
+    Path presetsDir = codeDir.resolve("configs/presets");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(presetsDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer chassis3 = new MockRobotServer(temp.resolve("rio-chassis3"), "roborio-2026");
+    chassis3.setRobotIdentityFile("CHASSIS_3");
+    chassis3.setRobotStateFile(false, false, "CHASSIS_3");
+
+    Path baseCfg = temp.resolve("base-configs");
+    Files.createDirectories(baseCfg);
+    Files.writeString(
+        baseCfg.resolve("parameters.csv"),
+        "key,DEFAULT,FUEL,CHASSIS_3\n"
+            + "controllerProfile,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026\n"
+            + "loopPeriodMs,20,20,20\n"
+            + "swerveCanBus,Drivetrain,Drivetrain,rio\n"
+            + "mechCanBus,Mech,Mech,rio\n"
+            + "auxCanBus,rio,rio,rio\n"
+            + "maxLinearSpeedMps,4.5,,\n"
+            + "maxAngularSpeedRadPerSec,4.71,,\n"
+            + "driveStatorLimitAmps,60.0,,\n"
+            + "driveSupplyLimitAmps,40.0,,\n"
+            + "driveSlipCurrentAmps,60.0,,\n"
+            + "joystickSensitivity,0.80,,\n"
+            + "rotationSensitivity,1.00,,\n"
+            + "pigeonId,20,20,24\n"
+            + "trackWidthMeters,0.56515,0.56515,0.5969\n"
+            + "wheelBaseMeters,0.56515,0.56515,0.5969\n"
+            + "wheelRadiusMeters,0.0508,0.0508,0.0508\n"
+            + "driveGearRatio,6.394736842105262,6.394736842105262,6.394736842105262\n"
+            + "turnGearRatio,12.1,12.1,12.1\n",
+        StandardCharsets.UTF_8);
+    String swerveModulesBaseline =
+        "robot,corner,driveMotorId,turnMotorId,cancoderId,encoderOffsetRot,invertDrive,invertTurn\n"
+            + "CHASSIS_3,FL,7,8,23,0.121337890625,false,false\n"
+            + "CHASSIS_3,FR,1,2,20,-0.294921875,true,false\n"
+            + "CHASSIS_3,BL,5,6,22,0.0234375,false,false\n"
+            + "CHASSIS_3,BR,3,4,21,0.4716796875,true,false\n";
+    Files.writeString(baseCfg.resolve("swerve_modules.csv"), swerveModulesBaseline, StandardCharsets.UTF_8);
+    Files.writeString(
+        baseCfg.resolve("mechanisms.csv"),
+        "robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio\n"
+            + "CHASSIS_3,SwerveDriveFL,1,rio,60.0,40.0,60.0,NONE,0.90,0.0,0.0,0.14,0.79,0.10,0.0,-10000.0,10000.0,-1,false,false,6.3947\n",
+        StandardCharsets.UTF_8);
+    Files.writeString(
+        baseCfg.resolve("cameras.csv"),
+        "robot,cameraName,portIndex,xMeters,yMeters,zMeters,rollDeg,pitchDeg,yawDeg,stdDevScalar\n",
+        StandardCharsets.UTF_8);
+    Files.writeString(
+        baseCfg.resolve("range_table.csv"),
+        "distanceMeters,shooterRps,hoodRotations,timeOfFlightSec\n2.0,35.0,0.15,0.32\n",
+        StandardCharsets.UTF_8);
+    Files.writeString(
+        baseCfg.resolve("batteries.csv"),
+        "batteryName,qrCode,purchaseYear,nominalRintMilliOhms,maxAllowedRintMilliOhms\n"
+            + "2026-B01,FLUX-BAT-2026-B01,2026,15.2,22.0\n",
+        StandardCharsets.UTF_8);
+
+    Path fakeJar = temp.resolve("Flux-RoboRIO-2027.jar");
+    Files.writeString(fakeJar, "STABLE_CHASSIS3_JAR", StandardCharsets.UTF_8);
+    Path stablePkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("STABLE_m130_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_m130", "roborio-2026", "STABLE", "abc9999", false, "cfg9999", "boris"),
+            fakeJar,
+            baseCfg);
+
+    List<String> remoteReadPaths = new CopyOnWriteArrayList<>();
+    RobotTransport spyRobot =
+        new DelegatingRobotTransport(chassis3) {
+          @Override
+          public String readRemoteText(String remoteRelativePath) throws IOException {
+            remoteReadPaths.add(remoteRelativePath);
+            return super.readRemoteText(remoteRelativePath);
+          }
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    deployer.deployPackage(stablePkg, spyRobot, true);
+    String prevStableParamsBaseline =
+        Files.readString(
+            chassis3.rootDir().resolve("jars/prev_stable_deploy/configs/parameters.csv"),
+            StandardCharsets.UTF_8);
+
+    Path crawlPreset = presetsDir.resolve("01_crawl_1p5mps.csv");
+    Files.writeString(
+        crawlPreset,
+        "key,DEFAULT\nmaxLinearSpeedMps,1.5\nmaxAngularSpeedRadPerSec,2.5\njoystickSensitivity,0.65\n",
+        StandardCharsets.UTF_8);
+    Path normalPreset = presetsDir.resolve("02_normal_3p5mps.csv");
+    Files.writeString(
+        normalPreset,
+        "key,DEFAULT\nmaxLinearSpeedMps,3.5\nmaxAngularSpeedRadPerSec,4.0\njoystickSensitivity,0.80\n",
+        StandardCharsets.UTF_8);
+    Path illegalBusPreset = temp.resolve("bad_bus.csv");
+    Files.writeString(illegalBusPreset, "key,DEFAULT\nswerveCanBus,Drivetrain\n", StandardCharsets.UTF_8);
+
+    List<PackageDeployer.ConfigPresetInfo> discovered =
+        PackageDeployer.discoverBehavioralPresets(codeDir);
+    assertEquals(2, discovered.size(), "Two presets discovered under code/configs/presets/");
+    assertEquals("01_crawl_1p5mps", discovered.get(0).name(), "First preset sorted by name");
+    assertEquals("02_normal_3p5mps", discovered.get(1).name(), "Second preset sorted by name");
+
+    boolean rejectedIllegalPreset = false;
+    try {
+      deployer.switchToBehavioralPreset(illegalBusPreset, FluxFig.Mode.PRODUCTION, spyRobot);
+    } catch (IllegalArgumentException expected) {
+      rejectedIllegalPreset = expected.getMessage().contains("hardware topology");
+    }
+    assertTrue(rejectedIllegalPreset, "Preset modifying swerveCanBus must be rejected");
+
+    // Seed an unsynced log so switching preset through TrayActionCoordinator pulls logs FIRST.
+    chassis3.seedSimulatedMatchLogs("2026-11-21_14-00-00", "CHASSIS_3", "base1111");
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    List<String> toasts = new CopyOnWriteArrayList<>();
+    try (FluxTrayMain.TrayActionCoordinator coord =
+        new FluxTrayMain.TrayActionCoordinator(
+            spyRobot,
+            deployer,
+            runMgr,
+            audio,
+            lockout,
+            dsDir,
+            logsDir,
+            stateDir.resolve("fluxtray.log"),
+            (lvl, title, msg) -> toasts.add(lvl + ":" + title + ":" + msg),
+            busy -> {})) {
+      coord.submitSwitchToPreset(crawlPreset, FluxFig.Mode.PRODUCTION).get(5, TimeUnit.SECONDS);
+
+      assertTrue(
+          Files.list(logsDir).anyMatch(p -> p.toString().endsWith(".zip")),
+          "Switching config must pull pending logs first");
+      FluxFig liveCfg = new FluxFig(chassis3.rootDir().resolve("deploy/configs"));
+      liveCfg.setActiveProfile("CHASSIS_3");
+      assertEquals(1.5, liveCfg.getDouble("maxLinearSpeedMps"), "Crawl preset speed applied");
+      assertEquals(2.5, liveCfg.getDouble("maxAngularSpeedRadPerSec"), "Crawl preset angular speed");
+      assertEquals(0.65, liveCfg.getDouble("joystickSensitivity"), "Crawl preset stick scale");
+      assertEquals("rio", liveCfg.getString("swerveCanBus"), "CHASSIS_3 swerveCanBus preserved");
+      assertEquals(24, liveCfg.getInt("pigeonId"), "CHASSIS_3 pigeonId preserved");
+      assertEquals(
+          swerveModulesBaseline,
+          Files.readString(
+              chassis3.rootDir().resolve("deploy/configs/swerve_modules.csv"),
+              StandardCharsets.UTF_8),
+          "swerve_modules.csv offsets must remain untouched by behavioral preset");
+      assertEquals(
+          prevStableParamsBaseline,
+          Files.readString(
+              chassis3.rootDir().resolve("jars/prev_stable_deploy/configs/parameters.csv"),
+              StandardCharsets.UTF_8),
+          "jars/prev_stable_deploy/ must remain untouched by EXPERIMENTAL preset");
+      FluxFig.ActiveProfileDirective presetDir =
+          FluxFig.parseActiveProfileDirective(
+              Files.readString(
+                  chassis3.rootDir().resolve("deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE),
+                  StandardCharsets.UTF_8));
+      assertEquals("EXPERIMENTAL", presetDir.channel(), "Preset sets channel=EXPERIMENTAL");
+      assertEquals("01_crawl_1p5mps", presetDir.preset(), "Preset name stamped into active-profile.txt");
+
+      // Switch to Live Tuning (EXPERIMENTAL), simulate a robot /tmp/fluxfig-tuned-snapshot.txt, and pull.
+      coord.submitSwitchToLiveTuning().get(5, TimeUnit.SECONDS);
+      FluxFig.ActiveProfileDirective tuneDir =
+          FluxFig.parseActiveProfileDirective(
+              Files.readString(
+                  chassis3.rootDir().resolve("deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE),
+                  StandardCharsets.UTF_8));
+      assertEquals(FluxFig.Mode.TUNING, tuneDir.mode(), "Live Tuning sets mode=TUNING");
+      assertEquals("EXPERIMENTAL", tuneDir.channel(), "Live Tuning sets channel=EXPERIMENTAL");
+      assertEquals("live-tuning", tuneDir.preset(), "Live Tuning sets preset=live-tuning");
+
+      String fakeTunedSnapshot =
+          "# FluxFig Effective Snapshot\n# Mode: TUNING\n# ActiveProfile: CHASSIS_3\n"
+              + "# RuntimeOverrides:\n#   CHASSIS_3.maxLinearSpeedMps: 1.5 -> 2.1\n";
+      chassis3.writeRemoteText(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH, fakeTunedSnapshot);
+      chassis3.seedSimulatedMatchLogs("2026-11-21_14-05-00", "CHASSIS_3", liveCfg.getConfigSha256());
+
+      remoteReadPaths.clear();
+      CompletedRunBundle pulled =
+          runMgr.pullDriveSafeRunZip(
+              "tuning_run_1",
+              null,
+              spyRobot,
+              dsDir,
+              logsDir,
+              Instant.parse("2026-11-21T14:06:00Z").toEpochMilli(),
+              false,
+              true,
+              false);
+      assertTrue(pulled != null && pulled.zipArchive() != null, "Live tuning run ZIP pulled");
+      assertTrue(
+          remoteReadPaths.contains("/tmp/fluxfig-tuned-snapshot.txt"),
+          "TRAY-D01: must request exact POSIX /tmp/fluxfig-tuned-snapshot.txt (saw "
+              + remoteReadPaths
+              + ")");
+      assertTrue(
+          remoteReadPaths.stream().noneMatch(p -> p != null && p.contains("\\")),
+          "Remote paths must never contain Windows backslashes");
+      String bundledSnapshot = readZipEntryText(pulled.zipArchive(), "tuning_run_1/tuned-snapshot.txt");
+      assertTrue(
+          bundledSnapshot.contains("CHASSIS_3.maxLinearSpeedMps: 1.5 -> 2.1"),
+          "Pulled ZIP must include unmerged tuned-snapshot.txt");
+      String bundledMeta = readZipEntryText(pulled.zipArchive(), "tuning_run_1/run-meta.json");
+      assertTrue(
+          bundledMeta.contains("\"configChannel\": \"EXPERIMENTAL\""),
+          "run-meta.json must record configChannel=EXPERIMENTAL: " + bundledMeta);
+      assertTrue(
+          bundledMeta.contains("\"configPreset\": \"live-tuning\""),
+          "run-meta.json must record configPreset=live-tuning: " + bundledMeta);
+
+      // 1-Click Restore STABLE wipes /tmp/fluxfig-tuned-snapshot.txt and restores locked STABLE base.
+      deployer.restoreStable(spyRobot);
+      assertTrue(
+          !chassis3.remoteFileExists(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH),
+          "Restore STABLE must wipe /tmp/fluxfig-tuned-snapshot.txt");
+      FluxFig restoredCfg = FluxFig.load(chassis3.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+      assertEquals(FluxFig.Mode.PRODUCTION, restoredCfg.getMode(), "Restore STABLE returns to PRODUCTION");
+      assertEquals(4.5, restoredCfg.getDouble("maxLinearSpeedMps"), "Restore STABLE returns 4.5 m/s base");
+    }
     audio.close();
   }
 

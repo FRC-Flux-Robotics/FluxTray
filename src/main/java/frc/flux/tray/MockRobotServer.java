@@ -33,6 +33,7 @@ public final class MockRobotServer implements RobotTransport {
   private volatile String lastRestartedJar = null;
   private final List<String> operationLog = new ArrayList<>();
   private volatile boolean autoRefreshHeartbeat = true;
+  private volatile boolean bootstrapAllowed = false;
 
   public MockRobotServer(Path rootDir, String controllerPlatform) throws IOException {
     this.rootDir = rootDir;
@@ -55,6 +56,31 @@ public final class MockRobotServer implements RobotTransport {
 
   public void setReachable(boolean reachable) {
     this.reachable = reachable;
+  }
+
+  public void setBootstrapAllowed(boolean bootstrapAllowed) {
+    this.bootstrapAllowed = bootstrapAllowed;
+  }
+
+  @Override
+  public boolean isBootstrapAllowed() {
+    return bootstrapAllowed;
+  }
+
+  @Override
+  public List<String> listRemoteCsvFiles(String remoteRelativeDir) throws IOException {
+    ensureReachable();
+    Path dir = resolvePath(remoteRelativeDir);
+    if (!Files.isDirectory(dir)) {
+      return List.of();
+    }
+    try (Stream<Path> s = Files.list(dir)) {
+      return s.filter(Files::isRegularFile)
+          .map(p -> p.getFileName().toString())
+          .filter(n -> n.toLowerCase(java.util.Locale.ROOT).endsWith(".csv"))
+          .sorted()
+          .toList();
+    }
   }
 
   public void setNextSnapshot(FluxSystemSnapshot snapshot) {

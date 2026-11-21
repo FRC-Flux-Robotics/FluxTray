@@ -202,6 +202,32 @@ public final class SshRobotTransport implements RobotTransport {
     return allowMissingHeartbeat;
   }
 
+  @Override
+  public boolean isBootstrapAllowed() {
+    return allowMissingHeartbeat;
+  }
+
+  @Override
+  public List<String> listRemoteCsvFiles(String remoteRelativeDir) throws IOException {
+    String full = resolveRemote(remoteRelativeDir);
+    String out =
+        runSshCommand(
+            "if [ -d "
+                + shQuote(full)
+                + " ]; then for f in "
+                + shQuote(full)
+                + "/*.csv; do [ -f \"$f\" ] && basename \"$f\"; done; fi");
+    List<String> files = new ArrayList<>();
+    for (String line : out.split("\\R")) {
+      String trimmed = line.trim();
+      if (!trimmed.isEmpty() && trimmed.toLowerCase(Locale.ROOT).endsWith(".csv")) {
+        files.add(trimmed);
+      }
+    }
+    files.sort(String::compareTo);
+    return files;
+  }
+
   /** Returns OS-appropriate null known-hosts sink ({@code NUL} on Windows, {@code /dev/null} on POSIX). */
   public static String nullKnownHostsPath() {
     String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);

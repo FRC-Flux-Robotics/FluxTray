@@ -7,8 +7,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -175,12 +178,70 @@ public final class PackageDeployer {
     return new RobotCodeStatus(gen, platform, activeJar, hb, stamp, hasPrevStable, diag);
   }
 
+  /** Behavioral delta preset CSV discovered under {@code code/configs/presets/*.csv}. */
+  public record ConfigPresetInfo(String name, String displayName, Path filePath) {}
+
+  /** Outcome of switching the connected robot's active config channel or behavioral preset. */
+  public record ConfigSwitchResult(
+      String robotId,
+      String channel,
+      String preset,
+      FluxFig.Mode mode,
+      String configSha256) {}
+
+  private static final class InProgressDeploy {
+    final String packageSha256;
+    final boolean hadPreviousJar;
+    boolean ringRotated;
+    boolean jarUploaded;
+    boolean deploySwapped;
+    boolean stableSnapshotSaved;
+    DeployStamp stamp;
+
+    InProgressDeploy(String packageSha256, boolean hadPreviousJar) {
+      this.packageSha256 = packageSha256;
+      this.hadPreviousJar = hadPreviousJar;
+    }
+  }
+
   private final RobotSafetyLockout lockout;
   private final String laptopId;
+  private final Map<String, InProgressDeploy> inProgressByTarget = new LinkedHashMap<>();
 
   public PackageDeployer(RobotSafetyLockout lockout, String laptopId) {
     this.lockout = lockout;
     this.laptopId = laptopId;
+  }
+
+  /**
+   * Scans {@code <codeDir>/configs/presets/*.csv} for behavioral delta presets shown in the {@code
+   * Switch Config} menu.
+   */
+  public static List<ConfigPresetInfo> discoverBehavioralPresets(Path codeDir) {
+    if (codeDir == null) {
+      return List.of();
+    }
+    Path presetsDir = codeDir.resolve("configs").resolve("presets");
+    if (!Files.isDirectory(presetsDir)) {
+      return List.of();
+    }
+    List<ConfigPresetInfo> presets = new ArrayList<>();
+    try (Stream<Path> s = Files.list(presetsDir)) {
+      for (Path p :
+          s.filter(Files::isRegularFile)
+              .sorted(Comparator.comparing(f -> f.getFileName().toString()))
+              .toList()) {
+        String fileName = p.getFileName().toString();
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        if (lower.startsWith(".") || !lower.endsWith(".csv")) {
+          continue;
+        }
+        String stem = fileName.substring(0, fileName.length() - 4);
+        presets.add(new ConfigPresetInfo(stem, stem + " (EXPERIMENTAL)", p));
+      }
+    } catch (IOException ignored) {
+    }
+    return presets;
   }
 
   /**
@@ -373,87 +434,145 @@ public final class PackageDeployer {
   /**
    * Atomically deploys a {@code .fluxpkg.zip} bundle onto the exact JAR executed by {@code
    * robotCommand}, stages and atomically swaps {@code deploy/}, rotates both JAR and {@code
-   * deploy/} into the 5-slot rollback ring, rolls back the JAR if {@code deploy/} fails, protects
-   * {@code prev_stable} from dirty {@code EXPERIMENTAL} packages, and restarts robot code.
+   * deploy/} into the 5-slot rollback ring at most once per package hash (resuming retries at the
+   * failed step), rolls back the JAR if {@code deploy/} fails, protects {@code prev_stable} from
+   * dirty {@code EXPERIMENTAL} packages, and restarts robot code.
    */
-  public DeployStamp deployPackage(
+  public synchronized DeployStamp deployPackage(
       Path fluxPkgZip, RobotTransport robot, boolean forceOverwriteOtherLaptop)
       throws IOException {
     lockout.beginTransferOrThrow("deployPackage:" + fluxPkgZip.getFileName());
     Path tempExtract = Files.createTempDirectory("fluxpkg-extract-");
     try {
       robot.assertRobotDisabledForTransfer("deployPackage:" + fluxPkgZip.getFileName());
+      String pkgSha256 = DriveWatcher.sha256File(fluxPkgZip);
       extractZip(fluxPkgZip, tempExtract);
       PackageManifest manifest =
           validateExtractedPackage(
               tempExtract, fluxPkgZip.getFileName().toString(), robot.controllerPlatform());
 
-      String existingStampJson = robot.readRemoteText("deploy/deploy-stamp.json");
-      DeployStamp existing = DeployStamp.fromJson(existingStampJson);
-      if (existing != null
-          && !existing.deployedByLaptop().isEmpty()
-          && !existing.deployedByLaptop().equalsIgnoreCase(laptopId)
-          && !forceOverwriteOtherLaptop) {
-        throw new IllegalStateException(
-            "OVERWRITE GUARD: Robot currently holds package '"
-                + existing.packageName()
-                + "' (git="
-                + existing.gitSha()
-                + ") deployed by '"
-                + existing.deployedByLaptop()
-                + "'. Pass forceOverwrite=true to override.");
+      String activeJarTarget = robot.resolveActiveJarRemotePath();
+      String resumeKey = buildDeployResumeKey(robot, activeJarTarget);
+      InProgressDeploy progress = inProgressByTarget.get(resumeKey);
+      boolean resumingSamePackage = progress != null && pkgSha256.equals(progress.packageSha256);
+
+      if (!resumingSamePackage || (!progress.jarUploaded && !progress.deploySwapped)) {
+        String existingStampJson = robot.readRemoteText("deploy/deploy-stamp.json");
+        DeployStamp existing = DeployStamp.fromJson(existingStampJson);
+        if (existing != null
+            && !existing.deployedByLaptop().isEmpty()
+            && !existing.deployedByLaptop().equalsIgnoreCase(laptopId)
+            && !forceOverwriteOtherLaptop) {
+          throw new IllegalStateException(
+              "OVERWRITE GUARD: Robot currently holds package '"
+                  + existing.packageName()
+                  + "' (git="
+                  + existing.gitSha()
+                  + ") deployed by '"
+                  + existing.deployedByLaptop()
+                  + "'. Pass forceOverwrite=true to override.");
+        }
       }
 
-      String activeJarTarget = robot.resolveActiveJarRemotePath();
-      boolean hadPreviousJar = robot.remoteFileExists(activeJarTarget);
-      rotateRollbackRing(robot, activeJarTarget);
+      if (!resumingSamePackage) {
+        progress = new InProgressDeploy(pkgSha256, robot.remoteFileExists(activeJarTarget));
+        inProgressByTarget.put(resumeKey, progress);
+      }
+
+      if (!progress.ringRotated) {
+        rotateRollbackRing(robot, activeJarTarget);
+        progress.ringRotated = true;
+      }
 
       Path jarPath = tempExtract.resolve("frcUserProgram.jar");
-      robot.uploadFileAtomic(jarPath, activeJarTarget);
+      if (!progress.jarUploaded) {
+        robot.uploadFileAtomic(jarPath, activeJarTarget);
+        progress.jarUploaded = true;
+      }
 
       DeployStamp newStamp =
-          new DeployStamp(
-              manifest.packageName(),
-              manifest.channel(),
-              manifest.gitSha(),
-              manifest.configSha(),
-              laptopId,
-              System.currentTimeMillis());
+          progress.stamp != null
+              ? progress.stamp
+              : new DeployStamp(
+                  manifest.packageName(),
+                  manifest.channel(),
+                  manifest.gitSha(),
+                  manifest.configSha(),
+                  laptopId,
+                  System.currentTimeMillis());
+      progress.stamp = newStamp;
 
-      Path deployDir = tempExtract.resolve("deploy");
-      Files.createDirectories(deployDir);
-      Files.writeString(
-          deployDir.resolve("deploy-stamp.json"), newStamp.toJson(), StandardCharsets.UTF_8);
-      try {
-        robot.replaceRemoteDirectoryAtomic(deployDir, "deploy");
-      } catch (IOException | RuntimeException deployEx) {
-        // Never leave the robot split-brained with the new JAR and previous deploy/ directory.
+      if (!progress.deploySwapped) {
+        Path deployDir = tempExtract.resolve("deploy");
+        Files.createDirectories(deployDir);
+        Files.writeString(
+            deployDir.resolve("deploy-stamp.json"), newStamp.toJson(), StandardCharsets.UTF_8);
         try {
-          if (hadPreviousJar && robot.remoteFileExists("jars/prev_1.jar")) {
-            robot.copyRemoteFile("jars/prev_1.jar", activeJarTarget);
-          } else if (!hadPreviousJar) {
-            robot.deleteRemoteFile(activeJarTarget);
+          robot.replaceRemoteDirectoryAtomic(deployDir, "deploy");
+          progress.deploySwapped = true;
+        } catch (IOException | RuntimeException deployEx) {
+          // Never leave the robot split-brained with the new JAR and previous deploy/ directory.
+          try {
+            if (progress.hadPreviousJar && robot.remoteFileExists("jars/prev_1.jar")) {
+              if (robot.copyRemoteFile("jars/prev_1.jar", activeJarTarget)) {
+                progress.jarUploaded = false;
+              }
+            } else if (!progress.hadPreviousJar) {
+              if (robot.deleteRemoteFile(activeJarTarget)) {
+                progress.jarUploaded = false;
+              }
+            }
+          } catch (Exception rollbackEx) {
+            deployEx.addSuppressed(rollbackEx);
           }
-        } catch (Exception rollbackEx) {
-          deployEx.addSuppressed(rollbackEx);
+          throw deployEx;
         }
-        throw deployEx;
       }
 
       boolean cleanStable = "STABLE".equalsIgnoreCase(manifest.channel()) && !manifest.gitDirty();
-      if (cleanStable) {
+      if (cleanStable && !progress.stableSnapshotSaved) {
         robot.uploadFileAtomic(jarPath, "jars/prev_stable.jar");
         if (!robot.copyRemoteDirectory("deploy", "jars/prev_stable_deploy")) {
           throw new IOException("Failed to snapshot deploy/ into jars/prev_stable_deploy.");
         }
+        progress.stableSnapshotSaved = true;
       }
 
       robot.restartRobotCode();
+      inProgressByTarget.remove(resumeKey);
       return newStamp;
     } finally {
       deleteRecursively(tempExtract);
       lockout.endTransfer();
     }
+  }
+
+  private static String buildDeployResumeKey(RobotTransport robot, String activeJarTarget) {
+    String identity = RobotTransport.UNKNOWN_ROBOT_IDENTITY;
+    try {
+      String detected = robot.detectRobotIdentity();
+      if (detected != null && !detected.isBlank()) {
+        identity = detected.trim();
+      }
+    } catch (IOException ignored) {
+    }
+    return identity + "|" + robot.controllerPlatform() + "|" + activeJarTarget;
+  }
+
+  private static String resolveIdentifiedProfileOrThrow(
+      String explicitProfile, RobotTransport robot) throws IOException {
+    if (explicitProfile != null && !explicitProfile.isBlank()) {
+      return explicitProfile.trim();
+    }
+    String detected = robot.detectRobotIdentity();
+    if (RobotTransport.isUnknownRobotIdentity(detected)) {
+      if (robot.isBootstrapAllowed()) {
+        return "DEFAULT";
+      }
+      throw new IllegalStateException(
+          "Robot identity is unknown — write the robot name (e.g. CHASSIS_3, FUEL, CORAL) to /home/lvuser/robot-identity.txt first.");
+    }
+    return detected.trim();
   }
 
   /**
@@ -475,10 +594,7 @@ public final class PackageDeployer {
     lockout.beginTransferOrThrow("pushFluxFigConfigs:" + activeProfileOverlay + ":" + mode);
     try {
       robot.assertRobotDisabledForTransfer("pushFluxFigConfigs");
-      String effectiveProfile =
-          (activeProfileOverlay != null && !activeProfileOverlay.isBlank())
-              ? activeProfileOverlay.trim()
-              : robot.detectRobotIdentity();
+      String effectiveProfile = resolveIdentifiedProfileOrThrow(activeProfileOverlay, robot);
       FluxFig fig = new FluxFig(configDir);
       fig.setActiveProfile(effectiveProfile);
       List<String> violations = fig.validateStrict();
@@ -490,13 +606,180 @@ public final class PackageDeployer {
           robot.uploadFileAtomic(csv, "deploy/configs/" + csv.getFileName().toString());
         }
       }
+      String channel = (mode == FluxFig.Mode.TUNING) ? "EXPERIMENTAL" : "STABLE";
+      String preset = (mode == FluxFig.Mode.TUNING) ? "live-tuning" : "STABLE";
       robot.writeRemoteText(
           "deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE,
-          FluxFig.formatActiveProfileDirective(effectiveProfile, mode, fig.getConfigSha256()));
+          FluxFig.formatActiveProfileDirective(
+              effectiveProfile, mode, fig.getConfigSha256(), channel, preset));
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
       robot.restartRobotCode();
       return fig.getConfigSha256();
     } finally {
       lockout.endTransfer();
+    }
+  }
+
+  /**
+   * Restores the robot's locked {@code STABLE} config base from {@code jars/prev_stable_deploy/configs}
+   * (without touching {@code jars/prev_stable_deploy/} or the JAR), locks {@code Mode.PRODUCTION},
+   * clears any temporary tuned snapshot, and restarts robot code.
+   */
+  public ConfigSwitchResult switchToStableConfig(RobotTransport robot) throws IOException {
+    lockout.beginTransferOrThrow("switchToStableConfig");
+    try {
+      robot.assertRobotDisabledForTransfer("switchToStableConfig");
+      String robotId = resolveIdentifiedProfileOrThrow(null, robot);
+      if (robot.remoteFileExists("jars/prev_stable_deploy/configs/parameters.csv")) {
+        if (!robot.copyRemoteDirectory("jars/prev_stable_deploy/configs", "deploy/configs")) {
+          throw new IOException(
+              "Failed to restore jars/prev_stable_deploy/configs onto deploy/configs.");
+        }
+      }
+      Map<String, String> remoteCsvs = loadRemoteCsvDirectory(robot, "deploy/configs");
+      String sha = validateAndHashRemoteCsvs(remoteCsvs, robotId);
+      robot.writeRemoteText(
+          "deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE,
+          FluxFig.formatActiveProfileDirective(
+              robotId, FluxFig.Mode.PRODUCTION, sha, "STABLE", "STABLE"));
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
+      robot.restartRobotCode();
+      return new ConfigSwitchResult(robotId, "STABLE", "STABLE", FluxFig.Mode.PRODUCTION, sha);
+    } finally {
+      lockout.endTransfer();
+    }
+  }
+
+  /**
+   * Merges a behavioral delta preset CSV onto the connected robot's locked hardware base ({@code
+   * jars/prev_stable_deploy/configs} if present, else {@code deploy/configs}), validates the full
+   * robot config strictly locally, uploads ONLY merged {@code parameters.csv} + {@code
+   * active-profile.txt} ({@code channel=EXPERIMENTAL}), preserves {@code swerve_modules.csv} and
+   * {@code jars/prev_stable_deploy/}, clears stale tuned snapshots, and restarts robot code.
+   */
+  public ConfigSwitchResult switchToBehavioralPreset(
+      Path presetCsv, FluxFig.Mode mode, RobotTransport robot) throws IOException {
+    if (presetCsv == null || !Files.isRegularFile(presetCsv)) {
+      throw new IOException("Behavioral preset CSV not found: " + presetCsv);
+    }
+    FluxFig.Mode effectiveMode = (mode != null) ? mode : FluxFig.Mode.PRODUCTION;
+    String fileName = presetCsv.getFileName().toString();
+    String presetName =
+        fileName.toLowerCase(Locale.ROOT).endsWith(".csv")
+            ? fileName.substring(0, fileName.length() - 4)
+            : fileName;
+    String presetText = Files.readString(presetCsv, StandardCharsets.UTF_8);
+
+    lockout.beginTransferOrThrow("switchToBehavioralPreset:" + presetName);
+    Path tempMergedParams = null;
+    try {
+      robot.assertRobotDisabledForTransfer("switchToBehavioralPreset:" + presetName);
+      String robotId = resolveIdentifiedProfileOrThrow(null, robot);
+      String baseDir =
+          robot.remoteFileExists("jars/prev_stable_deploy/configs/parameters.csv")
+              ? "jars/prev_stable_deploy/configs"
+              : "deploy/configs";
+      Map<String, String> baseCsvs = loadRemoteCsvDirectory(robot, baseDir);
+      String baseParams = baseCsvs.get("parameters.csv");
+      if (baseParams == null || baseParams.isBlank()) {
+        throw new IOException("Robot has no base parameters.csv under " + baseDir);
+      }
+
+      String mergedParams =
+          FluxFig.mergeBehavioralPresetParametersCsv(baseParams, presetText, robotId);
+      Map<String, String> candidateCsvs = new LinkedHashMap<>(baseCsvs);
+      candidateCsvs.put("parameters.csv", mergedParams);
+      String mergedSha = validateAndHashRemoteCsvs(candidateCsvs, robotId);
+
+      tempMergedParams = Files.createTempFile("fluxtray-preset-params-", ".csv");
+      Files.writeString(tempMergedParams, mergedParams, StandardCharsets.UTF_8);
+      robot.uploadFileAtomic(tempMergedParams, "deploy/configs/parameters.csv");
+      robot.writeRemoteText(
+          "deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE,
+          FluxFig.formatActiveProfileDirective(
+              robotId, effectiveMode, mergedSha, "EXPERIMENTAL", presetName));
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
+      robot.restartRobotCode();
+      return new ConfigSwitchResult(
+          robotId, "EXPERIMENTAL", presetName, effectiveMode, mergedSha);
+    } finally {
+      if (tempMergedParams != null) {
+        Files.deleteIfExists(tempMergedParams);
+      }
+      lockout.endTransfer();
+    }
+  }
+
+  /**
+   * Switches the connected robot into {@code Mode.TUNING} ({@code channel=EXPERIMENTAL}, {@code
+   * preset=live-tuning}) without modifying any CSVs or {@code jars/prev_stable_deploy/}, wipes any
+   * stale {@code /tmp/fluxfig-tuned-snapshot.txt}, and restarts robot code so NT4 tuning activates.
+   */
+  public ConfigSwitchResult switchToLiveTuning(RobotTransport robot) throws IOException {
+    lockout.beginTransferOrThrow("switchToLiveTuning");
+    try {
+      robot.assertRobotDisabledForTransfer("switchToLiveTuning");
+      String robotId = resolveIdentifiedProfileOrThrow(null, robot);
+      Map<String, String> remoteCsvs = loadRemoteCsvDirectory(robot, "deploy/configs");
+      String sha =
+          remoteCsvs.containsKey("parameters.csv")
+              ? validateAndHashRemoteCsvs(remoteCsvs, robotId)
+              : "";
+      robot.writeRemoteText(
+          "deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE,
+          FluxFig.formatActiveProfileDirective(
+              robotId, FluxFig.Mode.TUNING, sha, "EXPERIMENTAL", "live-tuning"));
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
+      robot.restartRobotCode();
+      return new ConfigSwitchResult(
+          robotId, "EXPERIMENTAL", "live-tuning", FluxFig.Mode.TUNING, sha);
+    } finally {
+      lockout.endTransfer();
+    }
+  }
+
+  private static Map<String, String> loadRemoteCsvDirectory(
+      RobotTransport robot, String remoteConfigsDir) throws IOException {
+    Map<String, String> csvs = new LinkedHashMap<>();
+    List<String> names = new ArrayList<>(robot.listRemoteCsvFiles(remoteConfigsDir));
+    if (!names.contains("parameters.csv")) {
+      names.add("parameters.csv");
+    }
+    for (String fallbackName :
+        List.of("mechanisms.csv", "swerve_modules.csv", "cameras.csv", "batteries.csv", "range_table.csv")) {
+      if (!names.contains(fallbackName)) {
+        names.add(fallbackName);
+      }
+    }
+    names.sort(String::compareTo);
+    for (String name : names) {
+      String content = robot.readRemoteText(remoteConfigsDir + "/" + name);
+      if (content != null && !content.isBlank()) {
+        csvs.put(name, content);
+      }
+    }
+    return csvs;
+  }
+
+  private static String validateAndHashRemoteCsvs(
+      Map<String, String> csvFiles, String activeProfile) throws IOException {
+    if (!csvFiles.containsKey("parameters.csv")) {
+      throw new IOException("Robot config directory is missing required parameters.csv");
+    }
+    Path tempDir = Files.createTempDirectory("fluxtray-cfg-validate-");
+    try {
+      for (Map.Entry<String, String> e : csvFiles.entrySet()) {
+        Files.writeString(tempDir.resolve(e.getKey()), e.getValue(), StandardCharsets.UTF_8);
+      }
+      FluxFig fig = new FluxFig(tempDir);
+      fig.setActiveProfile(activeProfile);
+      List<String> violations = fig.validateStrict();
+      if (!violations.isEmpty()) {
+        throw new IllegalStateException("FluxFig safety gate blocked config switch: " + violations);
+      }
+      return fig.getConfigSha256();
+    } finally {
+      deleteRecursively(tempDir);
     }
   }
 
@@ -529,9 +812,11 @@ public final class PackageDeployer {
           }
         }
       }
-      String effectiveProfile =
-          (profile == null || profile.isBlank()) ? robot.detectRobotIdentity() : profile.trim();
-      String directive = FluxFig.formatActiveProfileDirective(effectiveProfile, mode, sha);
+      String effectiveProfile = resolveIdentifiedProfileOrThrow(profile, robot);
+      String channel = (mode == FluxFig.Mode.TUNING) ? "EXPERIMENTAL" : "STABLE";
+      String preset = (mode == FluxFig.Mode.TUNING) ? "live-tuning" : "STABLE";
+      String directive =
+          FluxFig.formatActiveProfileDirective(effectiveProfile, mode, sha, channel, preset);
       robot.writeRemoteText("deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE, directive);
       return FluxFig.parseActiveProfileDirective(directive);
     } finally {
@@ -542,7 +827,7 @@ public final class PackageDeployer {
   /** Harvests {@code /tmp/fluxfig-tuned-snapshot.txt}, promotes {@code vN+1}, pushes CSVs, and restarts. */
   public FluxFig.ReleaseEntry promoteRemoteTuningSnapshot(
       Path hubConfigsDir, String author, String notes, RobotTransport robot) throws IOException {
-    String remoteTmpPath = FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_PATH.toString();
+    String remoteTmpPath = FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH;
     String snapshotText;
     lockout.beginTransferOrThrow("promoteRemoteTuningSnapshot");
     try {
@@ -571,7 +856,7 @@ public final class PackageDeployer {
       robot.writeRemoteText(
           "deploy/configs/" + FluxFig.ACTIVE_PROFILE_FILE,
           FluxFig.formatActiveProfileDirective(
-              activeProfile, FluxFig.Mode.PRODUCTION, release.configSha256()));
+              activeProfile, FluxFig.Mode.PRODUCTION, release.configSha256(), "STABLE", "STABLE"));
       robot.deleteRemoteFile(remoteTmpPath);
       robot.restartRobotCode();
     } finally {
@@ -582,10 +867,10 @@ public final class PackageDeployer {
 
   /**
    * 1-Click "Restore STABLE": atomically restores {@code jars/prev_stable.jar} onto the active
-   * {@code robotCommand} JAR target, restores {@code jars/prev_stable_deploy/} if present, and
-   * restarts robot code.
+   * {@code robotCommand} JAR target, restores {@code jars/prev_stable_deploy/}, clears any
+   * temporary {@code /tmp/fluxfig-tuned-snapshot.txt}, and restarts robot code.
    */
-  public void restoreStable(RobotTransport robot) throws IOException {
+  public synchronized void restoreStable(RobotTransport robot) throws IOException {
     lockout.beginTransferOrThrow("restoreStable");
     try {
       robot.assertRobotDisabledForTransfer("restoreStable");
@@ -599,6 +884,8 @@ public final class PackageDeployer {
       if (!robot.copyRemoteDirectory("jars/prev_stable_deploy", "deploy")) {
         throw new IOException("Failed to restore jars/prev_stable_deploy onto deploy/");
       }
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
+      inProgressByTarget.clear();
       robot.restartRobotCode();
     } finally {
       lockout.endTransfer();
@@ -606,7 +893,7 @@ public final class PackageDeployer {
   }
 
   /** Rolls back active JAR and {@code deploy/} to slot {@code 1..5} and restarts robot code. */
-  public void rollbackToSlot(int slot, RobotTransport robot) throws IOException {
+  public synchronized void rollbackToSlot(int slot, RobotTransport robot) throws IOException {
     if (slot < 1 || slot > ROLLBACK_RING_SLOTS) {
       throw new IllegalArgumentException(
           "Rollback slot must be between 1 and " + ROLLBACK_RING_SLOTS);
@@ -626,6 +913,8 @@ public final class PackageDeployer {
       if (!robot.copyRemoteDirectory(deploySlot, "deploy")) {
         throw new IOException("Failed to restore " + deploySlot + " onto deploy/");
       }
+      robot.deleteRemoteFile(FluxFig.DEFAULT_TMP_TUNED_SNAPSHOT_REMOTE_PATH);
+      inProgressByTarget.clear();
       robot.restartRobotCode();
     } finally {
       lockout.endTransfer();
