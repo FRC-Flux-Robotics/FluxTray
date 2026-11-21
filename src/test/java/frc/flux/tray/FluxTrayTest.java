@@ -108,7 +108,8 @@ public final class FluxTrayTest {
       testMalformedManifestFailsClosedAndRollbackChecksDeployCopy();
       testTruncatedMsgPackFrameNeverMarksDisabled();
       testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell();
-      System.out.println("FluxTrayTest: ALL 22 SUITES PASSED");
+      testGitHubReleaseUpdaterIntegritySafetyLockoutAndRealPosixSwap();
+      System.out.println("FluxTrayTest: ALL 23 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -1373,6 +1374,324 @@ public final class FluxTrayTest {
     SshRobotTransport.ProcessResult okRes =
         realShellRunner.run(List.of("ssh", "lvuser@127.0.0.1", guard), null, java.time.Duration.ofSeconds(5));
     assertEquals(0, okRes.exitCode(), "Fresh 41-bit EPOCH_MS must pass real /bin/sh guard");
+
+    // Verify restartRobotCode redirects stdio and replaceRemoteDirectoryAtomic inlines the heartbeat guard.
+    List<String> capturedCmds = new ArrayList<>();
+    SshRobotTransport.ProcessRunner captureRunner =
+        (argv, stdin, timeout) -> {
+          String cmd = argv.get(argv.size() - 1);
+          capturedCmds.add(cmd);
+          if (cmd.contains("HEARTBEAT_PRESENT")) {
+            long sec = System.currentTimeMillis() / 1000L;
+            String out =
+                "REMOTE_EPOCH_SEC="
+                    + sec
+                    + "\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+                    + (sec * 1000L)
+                    + "\nROBOT_ID=FUEL\nPID=123\n";
+            return new SshRobotTransport.ProcessResult(0, out, "");
+          }
+          return new SshRobotTransport.ProcessResult(0, "", "");
+        };
+    SshRobotTransport sshVerify =
+        new SshRobotTransport(List.of("127.0.0.1"), false, lockout, false, hbFile.toString(), captureRunner);
+    sshVerify.restartRobotCode();
+    assertTrue(
+        capturedCmds.stream()
+            .anyMatch(c -> c.contains("frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1")),
+        "restartRobotCode must redirect stdio so SSH never hangs on child FDs");
+
+    Path localDeployDir = temp.resolve("deploy-src");
+    Files.createDirectories(localDeployDir);
+    Files.writeString(localDeployDir.resolve("a.txt"), "hello", StandardCharsets.UTF_8);
+    capturedCmds.clear();
+    sshVerify.replaceRemoteDirectoryAtomic(localDeployDir, "deploy");
+    assertTrue(
+        capturedCmds.stream()
+            .anyMatch(c -> c.contains("${_ep%???}") && c.contains("tar -xf - -C")),
+        "replaceRemoteDirectoryAtomic must inline BusyBox heartbeat guard before tar staging");
+  }
+
+  private static void testGitHubReleaseUpdaterIntegritySafetyLockoutAndRealPosixSwap()
+      throws Exception {
+    assertTrue(
+        GitHubReleaseUpdater.isNewerVersion("2027.1.0", "v2027.2.0-ct-handoff"),
+        "Higher numeric version with tag suffix must be detected as newer");
+    assertTrue(
+        !GitHubReleaseUpdater.isNewerVersion("2027.2.0-ct-handoff", "v2027.2.0-ct-handoff"),
+        "Identical suffixed version must not trigger update loop");
+    assertTrue(
+        GitHubReleaseUpdater.isNewerVersion("2027.2.0-ct-handoff", "v2027.2.0"),
+        "Clean release without suffix must be newer than same-core suffixed build");
+    assertTrue(
+        !GitHubReleaseUpdater.isNewerVersion("2027.2.1", "v2027.2.0"),
+        "Older release must never downgrade current version");
+
+    Path temp = createTempDir("fluxtray-updater-");
+    Path oldJar = temp.resolve("FluxTray.jar");
+    Files.writeString(oldJar, "OLD_JAR_BYTES", StandardCharsets.UTF_8);
+
+    // Build a valid minimal JAR containing META-INF/MANIFEST.MF and FluxTrayMain.class.
+    Path validNewJar = temp.resolve("release-FluxTray.jar");
+    try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(validNewJar))) {
+      zos.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
+      zos.write("Manifest-Version: 1.0\nImplementation-Version: 2027.2.0\n".getBytes(StandardCharsets.UTF_8));
+      zos.closeEntry();
+      zos.putNextEntry(new ZipEntry("frc/flux/tray/FluxTrayMain.class"));
+      zos.write(new byte[] {(byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE});
+      zos.closeEntry();
+    }
+    byte[] validJarBytes = Files.readAllBytes(validNewJar);
+    String validSha256 = GitHubReleaseUpdater.sha256Hex(validJarBytes);
+
+    // Start a real loopback HTTP server mimicking GitHub Releases API + asset downloads.
+    AtomicReference<String> releaseJsonRef = new AtomicReference<>("");
+    AtomicReference<String> shaBodyRef = new AtomicReference<>(validSha256 + "  FluxTray.jar\n");
+    AtomicReference<byte[]> jarBodyRef = new AtomicReference<>(validJarBytes);
+    try (ServerSocket server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress())) {
+      int port = server.getLocalPort();
+      String baseUrl = "http://127.0.0.1:" + port;
+      AtomicBoolean serverRunning = new AtomicBoolean(true);
+      Thread httpThread =
+          new Thread(
+              () -> {
+                while (serverRunning.get()) {
+                  try (Socket client = server.accept()) {
+                    BufferedReader br =
+                        new BufferedReader(
+                            new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
+                    String reqLine = br.readLine();
+                    if (reqLine == null) {
+                      continue;
+                    }
+                    String line;
+                    while ((line = br.readLine()) != null && !line.isEmpty()) {
+                      // drain headers
+                    }
+                    byte[] body;
+                    int status = 200;
+                    if (reqLine.contains("/releases/latest")) {
+                      body = releaseJsonRef.get().getBytes(StandardCharsets.UTF_8);
+                    } else if (reqLine.contains("/assets/FluxTray.jar.sha256")) {
+                      body = shaBodyRef.get().getBytes(StandardCharsets.UTF_8);
+                    } else if (reqLine.contains("/assets/FluxTray.jar")) {
+                      body = jarBodyRef.get();
+                    } else {
+                      status = 404;
+                      body = "not found".getBytes(StandardCharsets.UTF_8);
+                    }
+                    OutputStream out = client.getOutputStream();
+                    String hdr =
+                        "HTTP/1.1 "
+                            + status
+                            + " OK\r\nContent-Length: "
+                            + body.length
+                            + "\r\nConnection: close\r\n\r\n";
+                    out.write(hdr.getBytes(StandardCharsets.US_ASCII));
+                    out.write(body);
+                    out.flush();
+                  } catch (IOException ignored) {
+                  }
+                }
+              },
+              "fluxtray-test-gh-http");
+      httpThread.setDaemon(true);
+      httpThread.start();
+
+      try {
+        // 1) Refuse missing FluxTray.jar.sha256 asset (fail closed).
+        releaseJsonRef.set(
+            "{\"tag_name\":\"v2027.2.0\",\"draft\":false,\"prerelease\":false,\"assets\":["
+                + "{\"name\":\"FluxTray.jar\",\"browser_download_url\":\""
+                + baseUrl
+                + "/assets/FluxTray.jar\"}]}");
+        GitHubReleaseUpdater missingShaUpdater =
+            new GitHubReleaseUpdater(
+                "FRC-Flux-Robotics/FluxTray",
+                baseUrl,
+                "2027.1.0",
+                null,
+                null,
+                (javaExe, staged) -> true,
+                (pid, tgt, stg, bak, javaExe, args) -> {});
+        boolean missingShaFailed = false;
+        try {
+          missingShaUpdater.checkAndStageUpdate(oldJar, List.of("--tray"), false, () -> true);
+        } catch (IOException expected) {
+          missingShaFailed = expected.getMessage().contains("missing");
+        }
+        assertTrue(missingShaFailed, "Updater must refuse release missing FluxTray.jar.sha256");
+
+        // 2) Refuse SHA-256 mismatch and clean up staged .new file.
+        releaseJsonRef.set(
+            "{\"tag_name\":\"v2027.2.0\",\"draft\":false,\"prerelease\":false,\"assets\":["
+                + "{\"name\":\"FluxTray.jar\",\"browser_download_url\":\""
+                + baseUrl
+                + "/assets/FluxTray.jar\"},"
+                + "{\"name\":\"FluxTray.jar.sha256\",\"browser_download_url\":\""
+                + baseUrl
+                + "/assets/FluxTray.jar.sha256\"}]}");
+        shaBodyRef.set("0".repeat(64) + "  FluxTray.jar\n");
+        GitHubReleaseUpdater badShaUpdater =
+            new GitHubReleaseUpdater(
+                "FRC-Flux-Robotics/FluxTray",
+                baseUrl,
+                "2027.1.0",
+                null,
+                null,
+                (javaExe, staged) -> true,
+                (pid, tgt, stg, bak, javaExe, args) -> {});
+        boolean shaMismatchFailed = false;
+        try {
+          badShaUpdater.checkAndStageUpdate(oldJar, List.of("--tray"), false, () -> true);
+        } catch (IOException expected) {
+          shaMismatchFailed = expected.getMessage().contains("SHA-256 mismatch");
+        }
+        assertTrue(shaMismatchFailed, "Updater must fail closed on SHA-256 mismatch");
+        assertTrue(
+            !Files.exists(temp.resolve("FluxTray.jar.new")),
+            "Staged .new JAR must be deleted on verification failure");
+        assertEquals(
+            "v2027.2.0",
+            badShaUpdater.lastFailedTag(),
+            "Failed tag must be latched to avoid repeated downloads");
+
+        // 3) Refuse update when --self-test fails on the staged JAR.
+        shaBodyRef.set(validSha256 + "  FluxTray.jar\n");
+        GitHubReleaseUpdater badSelfTestUpdater =
+            new GitHubReleaseUpdater(
+                "FRC-Flux-Robotics/FluxTray",
+                baseUrl,
+                "2027.1.0",
+                null,
+                null,
+                (javaExe, staged) -> false,
+                (pid, tgt, stg, bak, javaExe, args) -> {});
+        boolean selfTestFailed = false;
+        try {
+          badSelfTestUpdater.checkAndStageUpdate(oldJar, List.of("--tray"), false, () -> true);
+        } catch (IOException expected) {
+          selfTestFailed = expected.getMessage().contains("--self-test");
+        }
+        assertTrue(selfTestFailed, "Updater must abort if staged JAR fails --self-test");
+
+        // 4) TrayActionCoordinator blocks update checks while robot is Enabled or on FMS.
+        RobotSafetyLockout lockout = new RobotSafetyLockout();
+        lockout.updateState(true, false, System.currentTimeMillis());
+        MockRobotServer mockRio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+        MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+        BatteryAndRunManager runMgr =
+            new BatteryAndRunManager(temp.resolve("hub"), lockout, audio);
+        AtomicBoolean restarted = new AtomicBoolean(false);
+        try (FluxTrayMain.TrayActionCoordinator coord =
+            new FluxTrayMain.TrayActionCoordinator(
+                mockRio,
+                new PackageDeployer(lockout, "test"),
+                runMgr,
+                audio,
+                lockout,
+                temp.resolve("ds"),
+                temp.resolve("logs"),
+                temp.resolve("tray.log"),
+                (lvl, title, msg) -> {},
+                busy -> {})) {
+          GitHubReleaseUpdater liveUpdater =
+              new GitHubReleaseUpdater(
+                  "FRC-Flux-Robotics/FluxTray",
+                  baseUrl,
+                  "2027.1.0",
+                  null,
+                  null,
+                  (javaExe, staged) -> true,
+                  (pid, tgt, stg, bak, javaExe, args) -> {});
+          Future<?> blockedFuture =
+              coord.submitUpdateCheckIfIdle(
+                  liveUpdater, oldJar, List.of("--tray"), false, () -> restarted.set(true));
+          assertTrue(blockedFuture == null, "Update check must be blocked while robot is Enabled");
+          assertTrue(!restarted.get(), "Restart callback must never fire while Enabled");
+
+          // 5) Happy path: Disabled + off-FMS downloads, verifies SHA-256, backs up, and runs real POSIX swap script.
+          lockout.updateState(false, false, System.currentTimeMillis());
+          Path relaunchMarker = temp.resolve("relaunched.txt");
+          Path fakeJava = temp.resolve("fake-java.sh");
+          Files.writeString(
+              fakeJava,
+              "#!/bin/sh\nprintf '%s\\n' \"$@\" > "
+                  + SshRobotTransport.shQuote(relaunchMarker.toString())
+                  + "\n",
+              StandardCharsets.UTF_8);
+          fakeJava.toFile().setExecutable(true);
+
+          GitHubReleaseUpdater swapUpdater =
+              new GitHubReleaseUpdater(
+                  "FRC-Flux-Robotics/FluxTray",
+                  baseUrl,
+                  "2027.1.0",
+                  null,
+                  null,
+                  (javaExe, staged) -> true,
+                  (pid, tgt, stg, bak, javaExe, args) -> {
+                    // Use non-existent PID 99999999 so the real /bin/sh swap script executes immediately.
+                    String posixScript =
+                        GitHubReleaseUpdater.buildPosixSwapScript(
+                            99_999_999L, tgt, stg, bak, fakeJava, args);
+                    Path sh = temp.resolve("swap-test.sh");
+                    Files.writeString(sh, posixScript, StandardCharsets.UTF_8);
+                    Process p = new ProcessBuilder("/bin/sh", sh.toString()).start();
+                    try {
+                      assertTrue(p.waitFor(10, TimeUnit.SECONDS), "POSIX swap script must exit cleanly");
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                      throw new IOException(e);
+                    }
+                  });
+          Future<?> okFuture =
+              coord.submitUpdateCheckIfIdle(
+                  swapUpdater,
+                  oldJar,
+                  List.of("--tray", "--code-dir", "G:\\My Drive\\FLUX-10413-Hub\\code"),
+                  false,
+                  () -> restarted.set(true));
+          assertTrue(okFuture != null, "Idle Disabled robot must allow update check");
+          okFuture.get(15, TimeUnit.SECONDS);
+          assertTrue(restarted.get(), "Verified update must invoke restart callback");
+          assertTrue(
+              java.util.Arrays.equals(validJarBytes, Files.readAllBytes(oldJar)),
+              "Real POSIX swap script must replace FluxTray.jar with verified release bytes");
+          assertEquals(
+              "OLD_JAR_BYTES",
+              Files.readString(temp.resolve("FluxTray.jar.bak"), StandardCharsets.UTF_8),
+              "Previous FluxTray.jar must be preserved in FluxTray.jar.bak");
+
+          // Wait briefly for detached background fake-java.sh to flush relaunched args.
+          for (int i = 0; i < 40 && !Files.isRegularFile(relaunchMarker); i++) {
+            Thread.sleep(50L);
+          }
+          assertTrue(Files.isRegularFile(relaunchMarker), "Swap script must relaunch FluxTray");
+          String relaunchArgsText = Files.readString(relaunchMarker, StandardCharsets.UTF_8);
+          assertTrue(
+              relaunchArgsText.contains("--tray")
+                  && relaunchArgsText.contains("G:\\My Drive\\FLUX-10413-Hub\\code"),
+              "Relaunched FluxTray must preserve original CLI arguments");
+        }
+
+        // 6) Verify Windows .cmd swap script uses PS/non-interactive-safe ping wait, move /Y, and backup rollback.
+        String winCmd =
+            GitHubReleaseUpdater.buildWindowsSwapScript(
+                4321L,
+                Path.of("C:\\Flux10413\\FluxTray.jar"),
+                Path.of("C:\\Flux10413\\FluxTray.jar.new"),
+                Path.of("C:\\Flux10413\\FluxTray.jar.bak"),
+                Path.of("C:\\Program Files\\Eclipse Adoptium\\jdk-17\\bin\\javaw.exe"),
+                List.of("--tray", "--code-dir", "G:\\My Drive\\FLUX-10413-Hub\\code"));
+        assertTrue(winCmd.contains("ping -n 2 127.0.0.1"), "Windows script must use ping wait (not timeout)");
+        assertTrue(winCmd.contains("move /Y \"%STAGED%\" \"%TARGET%\""), "Windows script must move staged JAR");
+        assertTrue(winCmd.contains("copy /Y \"%BACKUP%\" \"%TARGET%\""), "Windows script must roll back from .bak on failure");
+        assertTrue(winCmd.contains("javaw.exe"), "Windows script must relaunch javaw.exe");
+      } finally {
+        serverRunning.set(false);
+      }
+    }
   }
 
   private static void testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus()

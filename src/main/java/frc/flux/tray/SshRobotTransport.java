@@ -449,9 +449,11 @@ public final class SshRobotTransport implements RobotTransport {
     // Stream the entire directory as one POSIX/USTAR tar over SSH stdin so filenames with spaces
     // never touch Windows OpenSSH scp argument splitting.
     byte[] tarBytes = buildUstarTarArchive(localDir);
+    String guard = buildInlineHeartbeatGuard();
     if (tarBytes.length > 0) {
       runSshTransferCommand(
-          "rm -rf "
+          guard
+              + " && rm -rf "
               + shQuote(staged)
               + " && mkdir -p "
               + shQuote(staged)
@@ -459,7 +461,7 @@ public final class SshRobotTransport implements RobotTransport {
               + shQuote(staged),
           tarBytes);
     } else {
-      runSshCommand("rm -rf " + shQuote(staged) + " && mkdir -p " + shQuote(staged));
+      runSshCommand(guard + " && rm -rf " + shQuote(staged) + " && mkdir -p " + shQuote(staged));
     }
 
     assertRobotDisabledForTransfer("swapRemoteDirectory:" + remoteRelativeDir);
@@ -579,10 +581,10 @@ public final class SshRobotTransport implements RobotTransport {
     if (isSystemCore) {
       runSshCommand(
           guard
-              + " && (if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl restart frc-robot 2>/dev/null || systemctl restart frc-robot 2>/dev/null || true; "
-              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then /usr/local/frc/bin/frcKillRobot.sh -t -r; fi)");
+              + " && (if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl restart frc-robot </dev/null >/dev/null 2>&1 || systemctl restart frc-robot </dev/null >/dev/null 2>&1 || true; "
+              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then /usr/local/frc/bin/frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1; fi)");
     } else {
-      runSshCommand(guard + " && /usr/local/frc/bin/frcKillRobot.sh -t -r");
+      runSshCommand(guard + " && /usr/local/frc/bin/frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1");
     }
   }
 

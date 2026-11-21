@@ -243,7 +243,32 @@ public final class FluxTrayMain {
         }
       }
       case "--self-test" -> runSelfTest();
-      case "--tray", "--code-dir", "--logs-dir" -> launchSystemTray(args);
+      case "--version" -> System.out.println("FluxTray " + GitHubReleaseUpdater.detectCurrentVersion());
+      case "--check-update" -> {
+        String repo = getFlagValue(args, "--update-repo", GitHubReleaseUpdater.resolveDefaultRepo());
+        GitHubReleaseUpdater updater =
+            new GitHubReleaseUpdater(repo, GitHubReleaseUpdater.detectCurrentVersion());
+        var outcome = updater.checkForUpdate();
+        System.out.println(outcome.message());
+      }
+      case "--self-update" -> {
+        String repo = getFlagValue(args, "--update-repo", GitHubReleaseUpdater.resolveDefaultRepo());
+        GitHubReleaseUpdater updater =
+            new GitHubReleaseUpdater(repo, GitHubReleaseUpdater.detectCurrentVersion());
+        Path runningJar =
+            GitHubReleaseUpdater.resolveRunningJarPath()
+                .orElseThrow(
+                    () ->
+                        new IllegalStateException(
+                            "Cannot --self-update when not running from a packaged FluxTray.jar"));
+        var outcome = updater.checkAndStageUpdate(runningJar, List.of("--version"), false, () -> true);
+        System.out.println(outcome.message());
+        if (outcome.stagedForRestart()) {
+          System.exit(0);
+        }
+      }
+      case "--tray", "--code-dir", "--logs-dir", "--no-auto-update", "--update-repo" ->
+          launchSystemTray(args);
       default -> {
         System.err.println("Unknown option: " + cmd);
         printUsage();
@@ -492,6 +517,7 @@ public final class FluxTrayMain {
     private final Consumer<Boolean> busyListener;
     private final AtomicBoolean busySyncing = new AtomicBoolean(false);
     private final AtomicBoolean drivePollQueued = new AtomicBoolean(false);
+    private final AtomicBoolean updateCheckQueued = new AtomicBoolean(false);
     private final ExecutorService actionExecutor;
 
     TrayActionCoordinator(
@@ -669,6 +695,59 @@ public final class FluxTrayMain {
               notify.notify("ERROR", "Restore STABLE Failed", ex.getMessage());
             } finally {
               setBusySyncing(false);
+            }
+          });
+    }
+
+    /**
+     * Checks GitHub Releases when completely idle (Disabled, off-FMS, not recording audio, not
+     * transferring) and triggers a verified swap-and-relaunch if a newer release is published.
+     */
+    Future<?> submitUpdateCheckIfIdle(
+        GitHubReleaseUpdater updater,
+        Path runningJar,
+        List<String> relaunchArgs,
+        boolean preferJavaw,
+        Runnable onRestartScheduled) {
+      if (updater == null
+          || runningJar == null
+          || lockout.isEnabled()
+          || lockout.isFmsAttached()
+          || audio.isRecording()
+          || isBusySyncing()) {
+        return null;
+      }
+      if (!updateCheckQueued.compareAndSet(false, true)) {
+        return null;
+      }
+      return actionExecutor.submit(
+          () -> {
+            try {
+              if (lockout.isEnabled() || lockout.isFmsAttached() || audio.isRecording()) {
+                return;
+              }
+              var outcome =
+                  updater.checkAndStageUpdate(
+                      runningJar,
+                      relaunchArgs,
+                      preferJavaw,
+                      () -> !lockout.isEnabled() && !lockout.isFmsAttached() && !audio.isRecording());
+              if (outcome.stagedForRestart()) {
+                notify.notify(
+                    "INFO",
+                    "FluxTray Updating to " + outcome.latestVersion(),
+                    "Verified GitHub Release "
+                        + outcome.latestVersion()
+                        + "; restarting tray agent.");
+                if (onRestartScheduled != null) {
+                  onRestartScheduled.run();
+                }
+              }
+            } catch (Exception ex) {
+              // Offline pits and transient GitHub outages stay quiet in the tray UI (log only).
+              appendTrayLog(logFile, "INFO", "Auto-update check skipped: " + ex.getMessage());
+            } finally {
+              updateCheckQueued.set(false);
             }
           });
     }
@@ -856,6 +935,35 @@ public final class FluxTrayMain {
         1L,
         TimeUnit.SECONDS);
 
+    boolean autoUpdateEnabled =
+        !hasFlag(args, "--no-auto-update")
+            && !"false".equalsIgnoreCase(System.getProperty("flux.autoupdate", "true"));
+    Path runningJarPath = GitHubReleaseUpdater.resolveRunningJarPath().orElse(null);
+    if (autoUpdateEnabled && runningJarPath != null) {
+      String updateRepo =
+          getFlagValue(args, "--update-repo", GitHubReleaseUpdater.resolveDefaultRepo());
+      GitHubReleaseUpdater releaseUpdater =
+          new GitHubReleaseUpdater(updateRepo, GitHubReleaseUpdater.detectCurrentVersion());
+      List<String> relaunchArgs = List.of(args);
+      scheduler.scheduleWithFixedDelay(
+          () ->
+              coordinator.submitUpdateCheckIfIdle(
+                  releaseUpdater,
+                  runningJarPath,
+                  relaunchArgs,
+                  true,
+                  () -> {
+                    ntClient.close();
+                    scheduler.shutdownNow();
+                    audio.close();
+                    runOnEdt(() -> tray.remove(icon));
+                    System.exit(0);
+                  }),
+          GitHubReleaseUpdater.DEFAULT_INITIAL_DELAY_SECONDS,
+          TimeUnit.MINUTES.toSeconds(GitHubReleaseUpdater.DEFAULT_CHECK_INTERVAL_MINUTES),
+          TimeUnit.SECONDS);
+    }
+
     MenuItem pullLogsItem = new MenuItem("Pull Logs Now");
     MenuItem restoreItem = new MenuItem("Restore STABLE");
     MenuItem exitItem = new MenuItem("Exit FluxTray");
@@ -949,7 +1057,7 @@ public final class FluxTrayMain {
           16 kHz PCM mentor-audio.wav recording, and atomic roboRIO deploy + frcKillRobot.sh restart.
 
         Usage:
-          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--log-file <fluxtray.log>]
+          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--no-auto-update] [--update-repo <owner/repo>] [--log-file <fluxtray.log>]
           java -jar dist/FluxTray.jar --pull-logs [<dir>] [--dir <output-dir>] [--file <filename.zip>] [--out <dir-or-zip-path>] [--run-id <id>] [--robot <name>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --inspect-snapshot <system-snapshot.txt>
           java -jar dist/FluxTray.jar --deploy <package.fluxpkg.zip> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--force]
@@ -959,6 +1067,9 @@ public final class FluxTrayMain {
           java -jar dist/FluxTray.jar --restore-stable [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --rollback <1..5> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --sync-pending [<FLUX-10413-Hub-dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
+          java -jar dist/FluxTray.jar --check-update [--update-repo <owner/repo>]
+          java -jar dist/FluxTray.jar --self-update [--update-repo <owner/repo>]
+          java -jar dist/FluxTray.jar --version
           java -jar dist/FluxTray.jar --print-ssh-capture-cmd
           java -jar dist/FluxTray.jar --self-test
         """);

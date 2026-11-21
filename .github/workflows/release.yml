@@ -1,0 +1,59 @@
+name: Release FluxTray.jar
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2027.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout FluxTray
+        uses: actions/checkout@v4
+
+      - name: Set up Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build, test, and stamp FluxTray.jar
+        env:
+          FLUXTRAY_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh
+          java -jar dist/FluxTray.jar --self-test
+          sha256sum dist/FluxTray.jar | awk '{print $1 "  FluxTray.jar"}' > dist/FluxTray.jar.sha256
+          cat dist/FluxTray.jar.sha256
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/FluxTray.jar dist/FluxTray.jar.sha256 --clobber
+          else
+            gh release create "$TAG" dist/FluxTray.jar dist/FluxTray.jar.sha256 \
+              --title "FluxTray $TAG" \
+              --generate-notes
+          fi
