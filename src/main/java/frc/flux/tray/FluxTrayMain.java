@@ -20,6 +20,11 @@ import java.awt.TrayIcon;
 import java.awt.image.BufferedImage;
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,6 +33,7 @@ import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -268,7 +274,12 @@ public final class FluxTrayMain {
           System.exit(0);
         }
       }
-      case "--tray", "--code-dir", "--logs-dir", "--no-auto-update", "--update-repo" ->
+      case "--tray",
+          "--code-dir",
+          "--logs-dir",
+          "--auto-update",
+          "--no-auto-update",
+          "--update-repo" ->
           launchSystemTray(args);
       default -> {
         System.err.println("Unknown option: " + cmd);
@@ -509,7 +520,91 @@ public final class FluxTrayMain {
     }
   }
 
-  private static void runSelfTest() throws IOException {
+  /** Auto-update is opt-in ({@code --auto-update} or {@code -Dflux.autoupdate=true}); OFF by default. */
+  static boolean isAutoUpdateEnabled(String[] args) {
+    if (args != null && hasFlag(args, "--no-auto-update")) {
+      return false;
+    }
+    if (args != null && hasFlag(args, "--auto-update")) {
+      return true;
+    }
+    return "true".equalsIgnoreCase(System.getProperty("flux.autoupdate", "false"));
+  }
+
+  /** Exclusive OS-level file lock preventing duplicate competing FluxTray tray daemons. */
+  static final class SingleInstanceLock implements Closeable {
+    public static final String LOCK_FILE_NAME = "fluxtray.lock";
+
+    private final Path lockFile;
+    private final FileChannel channel;
+    private final FileLock lock;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    private SingleInstanceLock(Path lockFile, FileChannel channel, FileLock lock) {
+      this.lockFile = lockFile;
+      this.channel = channel;
+      this.lock = lock;
+    }
+
+    static Optional<SingleInstanceLock> tryAcquire(Path lockFile) throws IOException {
+      if (lockFile.getParent() != null) {
+        Files.createDirectories(lockFile.getParent());
+      }
+      FileChannel channel =
+          FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+      FileLock lock;
+      try {
+        lock = channel.tryLock();
+      } catch (OverlappingFileLockException alreadyHeldInJvm) {
+        channel.close();
+        return Optional.empty();
+      } catch (IOException | RuntimeException ex) {
+        try {
+          channel.close();
+        } catch (IOException suppressed) {
+          ex.addSuppressed(suppressed);
+        }
+        throw ex;
+      }
+      if (lock == null) {
+        channel.close();
+        return Optional.empty();
+      }
+      try {
+        channel.truncate(0L);
+        byte[] pidBytes =
+            (ProcessHandle.current().pid() + System.lineSeparator())
+                .getBytes(StandardCharsets.UTF_8);
+        channel.write(ByteBuffer.wrap(pidBytes));
+        channel.force(false);
+      } catch (IOException ignored) {
+      }
+      return Optional.of(new SingleInstanceLock(lockFile, channel, lock));
+    }
+
+    Path lockFile() {
+      return lockFile;
+    }
+
+    @Override
+    public void close() {
+      if (!closed.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        if (lock.isValid()) {
+          lock.release();
+        }
+      } catch (IOException ignored) {
+      }
+      try {
+        channel.close();
+      } catch (IOException ignored) {
+      }
+    }
+  }
+
+  static void runSelfTest() throws IOException {
     Path tmp = Files.createTempDirectory("fluxtray-selftest-");
     try {
       MockRobotServer mock = new MockRobotServer(tmp.resolve("robot"), "roborio-2026");
@@ -517,6 +612,88 @@ public final class FluxTrayMain {
       mock.setNextSnapshotRaw(
           "[PLATFORM]\ncontrollerType=ROBORIO\nhostname=roboRIO-10413-FRC\n[CPU_AND_IRQ]\ntotalCpuPct=24.5\n[STORAGE]\nfreeStorageMb=480.0\n");
       FluxSystemSnapshot baseline = mock.captureSystemSnapshot();
+      if (!baseline.evaluate().isEmpty()) {
+        throw new IllegalStateException("Self-test healthy baseline reported unexpected alerts");
+      }
+
+      FluxSystemSnapshot anomalous =
+          FluxSystemSnapshot.parse(
+              "[PLATFORM]\ncontrollerType=ROBORIO\nhostname=roboRIO-10413-FRC\n"
+                  + "[CPU_AND_IRQ]\ntotalCpuPct=96.0\n[THERMAL]\ncpuTempC=92.0\n[STORAGE]\nfreeStorageMb=12.0\n");
+      if (anomalous.evaluate().isEmpty()) {
+        throw new IllegalStateException("Self-test anomalous snapshot failed to flag watch alerts");
+      }
+
+      Path validCfg = tmp.resolve("cfg-valid");
+      Files.createDirectories(validCfg);
+      Files.writeString(
+          validCfg.resolve("parameters.csv"),
+          "Key,DEFAULT,FUEL\ncontrollerProfile,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026\n"
+              + "swerveCanBus,Drivetrain,Drivetrain\nmechCanBus,Mech,Mech\nloopPeriodMs,20.0,20.0\n",
+          StandardCharsets.UTF_8);
+      Files.writeString(
+          validCfg.resolve("mechanisms.csv"),
+          "robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio\n"
+              + "FUEL,Elevator,10,Mech,60.0,40.0,60.0,Elevator_Static,2.4,0.0,0.1,0.18,0.12,0.01,0.35,0.0,48.0,11,false,false,1.0\n",
+          StandardCharsets.UTF_8);
+      List<String> validViolations = new FluxFig(validCfg).validateStrict();
+      if (!validViolations.isEmpty()) {
+        throw new IllegalStateException("Self-test valid FluxFig failed: " + validViolations);
+      }
+
+      Path fakeJar = tmp.resolve("Flux-RoboRIO-2027.jar");
+      Files.writeString(fakeJar, "SELFTEST_JAR", StandardCharsets.UTF_8);
+      Path pkgZip =
+          PackageDeployer.createFluxPkgZip(
+              tmp.resolve("STABLE_selftest_roborio-2026_fluxpkg.zip"),
+              new PackageDeployer.PackageManifest(
+                  "STABLE_selftest", "roborio-2026", "STABLE", "abc1234", false, "cfg1234", "self-test"),
+              fakeJar,
+              validCfg);
+      PackageDeployer.PackageManifest parsedManifest =
+          PackageDeployer.validatePackageArchiveLocally(pkgZip, "roborio-2026");
+      if (!"STABLE_selftest".equals(parsedManifest.packageName())) {
+        throw new IllegalStateException("Self-test package manifest mismatch");
+      }
+      if (!"Flux-RoboRIO-2027.jar"
+          .equals(
+              PackageDeployer.parseJarPathFromRobotCommand(
+                  "java -jar /home/lvuser/Flux-RoboRIO-2027.jar"))) {
+        throw new IllegalStateException("Self-test robotCommand parser mismatch");
+      }
+
+      RobotSafetyLockout lockout = new RobotSafetyLockout();
+      lockout.updateState(true, false, System.currentTimeMillis());
+      boolean blockedEnabled = false;
+      try {
+        lockout.assertSafeForTransfer("self-test");
+      } catch (IllegalStateException expected) {
+        blockedEnabled = true;
+      }
+      if (!blockedEnabled) {
+        throw new IllegalStateException("Self-test RobotSafetyLockout failed to block Enabled");
+      }
+      RobotTransport.RobotStateHeartbeat hb =
+          RobotTransport.RobotStateHeartbeat.parse(
+              "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+                  + System.currentTimeMillis()
+                  + "\nROBOT_ID=FUEL\nPID=1234\n");
+      if (!hb.valid() || hb.enabled()) {
+        throw new IllegalStateException("Self-test heartbeat parser failed");
+      }
+
+      if (!GitHubReleaseUpdater.isNewerVersion("2027.2.0-ct-handoff", "v2027.2.0-ct-handoff-2")
+          || GitHubReleaseUpdater.isNewerVersion("2027.2.0", "v2027.2.0+build.1")) {
+        throw new IllegalStateException("Self-test SemVer updater check failed");
+      }
+      var parsedRelease =
+          GitHubReleaseUpdater.parseLatestReleaseJson(
+              "{\"tag_name\":\"v2027.2.0\",\"body\":\"See \\\"assets\\\" []\",\"draft\":false,\"prerelease\":false,"
+                  + "\"assets\":[{\"name\":\"FluxTray.jar\",\"browser_download_url\":\"https://example.invalid/FluxTray.jar\"}]}");
+      if (parsedRelease.isEmpty() || parsedRelease.get().jarDownloadUrl() == null) {
+        throw new IllegalStateException("Self-test release JSON parser failed");
+      }
+
       printSnapshotAudit("SelfTest-RoboRIO-FUEL", baseline);
     } finally {
       try (Stream<Path> walk = Files.walk(tmp)) {
@@ -553,6 +730,22 @@ public final class FluxTrayMain {
       action.run();
     } else {
       EventQueue.invokeLater(action);
+    }
+  }
+
+  static void removeTrayIconSynchronously(SystemTray tray, TrayIcon icon) {
+    if (tray == null || icon == null) {
+      return;
+    }
+    if (GraphicsEnvironment.isHeadless() || EventQueue.isDispatchThread()) {
+      tray.remove(icon);
+      return;
+    }
+    try {
+      EventQueue.invokeAndWait(() -> tray.remove(icon));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (InvocationTargetException ignored) {
     }
   }
 
@@ -859,12 +1052,35 @@ public final class FluxTrayMain {
                 "--logs-dir",
                 System.getProperty("flux.logs.dir", hubDir.resolve("logs").toString())));
     Path dsLogDir = Path.of(getFlagValue(args, "--ds-logs", DEFAULT_DS_LOGS_DIR));
-    Path stateDir = Path.of(System.getProperty("user.home"), ".fluxtray");
+    String stateProp = System.getProperty("flux.state.dir");
+    Path stateDir =
+        (stateProp != null && !stateProp.isBlank())
+            ? Path.of(stateProp.trim())
+            : Path.of(System.getProperty("user.home"), ".fluxtray");
     Path logFile =
         Path.of(
             getFlagValue(
                 args, "--log-file", stateDir.resolve("fluxtray.log").toString()));
     Path ledgerFile = stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME);
+    Path lockFile = stateDir.resolve(SingleInstanceLock.LOCK_FILE_NAME);
+
+    SingleInstanceLock instanceLock;
+    try {
+      Optional<SingleInstanceLock> acquired = SingleInstanceLock.tryAcquire(lockFile);
+      if (acquired.isEmpty()) {
+        String msg =
+            "Another FluxTray instance is already running (lock held: " + lockFile + "); exiting.";
+        appendTrayLog(logFile, "WARN", msg);
+        System.err.println("FluxTray: " + msg);
+        return;
+      }
+      instanceLock = acquired.get();
+    } catch (IOException lockEx) {
+      String msg = "Failed to acquire single-instance lock " + lockFile + ": " + lockEx.getMessage();
+      appendTrayLog(logFile, "ERROR", msg);
+      System.err.println("FluxTray: " + msg);
+      return;
+    }
 
     RobotSafetyLockout lockout = new RobotSafetyLockout();
     // Tray mode defaults to roboRIO multi-host discovery (lvuser@) unless --systemcore is given.
@@ -971,10 +1187,16 @@ public final class FluxTrayMain {
         () -> {
           boolean conn = ntClient.isConnected();
           ntConnected.set(conn);
-          if (!conn) {
-            // Return icon to Gray on disconnect while robot-side /tmp/flux-robot-state stays fail-closed.
+          if (conn) {
+            driveWatcher.resetUnreachableBackoff();
+          } else {
+            // Return icon to Gray on disconnect while robot-side /tmp/flux-robot-state stays fail-closed,
+            // and trigger the 15 s debrief auto-stop/spool window if the robot breaker dropped mid-recording.
             displayedEnabled.set(false);
             displayedFms.set(false);
+            if (audio.isRecording()) {
+              audio.onRobotStateChanged(false, System.currentTimeMillis());
+            }
           }
           refreshIcon.run();
         });
@@ -987,6 +1209,7 @@ public final class FluxTrayMain {
                   ntClient.close();
                   audio.close();
                   coordinator.close();
+                  instanceLock.close();
                 },
                 "fluxtray-shutdown-cleanup"));
 
@@ -1010,9 +1233,7 @@ public final class FluxTrayMain {
         1L,
         TimeUnit.SECONDS);
 
-    boolean autoUpdateEnabled =
-        !hasFlag(args, "--no-auto-update")
-            && !"false".equalsIgnoreCase(System.getProperty("flux.autoupdate", "true"));
+    boolean autoUpdateEnabled = isAutoUpdateEnabled(args);
     Path runningJarPath = GitHubReleaseUpdater.resolveRunningJarPath().orElse(null);
     if (autoUpdateEnabled && runningJarPath != null) {
       String updateRepo =
@@ -1031,7 +1252,8 @@ public final class FluxTrayMain {
                     ntClient.close();
                     scheduler.shutdownNow();
                     audio.close();
-                    runOnEdt(() -> tray.remove(icon));
+                    removeTrayIconSynchronously(tray, icon);
+                    instanceLock.close();
                     System.exit(0);
                   }),
           GitHubReleaseUpdater.DEFAULT_INITIAL_DELAY_SECONDS,
@@ -1055,7 +1277,8 @@ public final class FluxTrayMain {
           scheduler.shutdownNow();
           coordinator.close();
           audio.close();
-          tray.remove(icon);
+          removeTrayIconSynchronously(tray, icon);
+          instanceLock.close();
           System.exit(0);
         });
 
@@ -1135,7 +1358,7 @@ public final class FluxTrayMain {
           16 kHz PCM mentor-audio.wav recording, and atomic roboRIO deploy + frcKillRobot.sh restart.
 
         Usage:
-          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--no-auto-update] [--update-repo <owner/repo>] [--log-file <fluxtray.log>]
+          java -jar dist/FluxTray.jar --tray [--code-dir <drive/code>] [--logs-dir <drive/logs>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--auto-update|--no-auto-update] [--update-repo <owner/repo>] [--log-file <fluxtray.log>]
           java -jar dist/FluxTray.jar --pull-logs [<dir>] [--dir <output-dir>] [--file <filename.zip>] [--out <dir-or-zip-path>] [--run-id <id>] [--robot <name>] [--ds-logs <dir>] [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat]
           java -jar dist/FluxTray.jar --inspect-snapshot <system-snapshot.txt>
           java -jar dist/FluxTray.jar --deploy <package.fluxpkg.zip> [--host <ip>] [--roborio|--systemcore] [--allow-missing-heartbeat] [--force]

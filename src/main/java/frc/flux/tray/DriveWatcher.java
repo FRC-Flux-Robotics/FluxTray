@@ -28,6 +28,8 @@ public final class DriveWatcher {
 
   public static final int REQUIRED_STABLE_POLLS = 2;
   public static final long DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS = 25_000L;
+  public static final long INITIAL_UNREACHABLE_BACKOFF_MS = 2_000L;
+  public static final long MAX_UNREACHABLE_BACKOFF_MS = 60_000L;
   public static final String STATE_FILE_NAME = "drive-watcher-state.json";
   public static final String PARTIAL_CONFIGS_ERROR_MESSAGE =
       "code/configs/ requires full config folder including parameters.csv";
@@ -62,6 +64,9 @@ public final class DriveWatcher {
   private final long emptyCodeRollbackDelayMs;
   private final Consumer<Boolean> transferBusyCallback;
 
+  private record CachedFileFingerprint(
+      Path path, long sizeBytes, long lastModifiedMs, String sha256) {}
+
   private String pendingPackageHash = null;
   private int stablePackagePolls = 0;
   private String lastAppliedPackageHash = null;
@@ -69,11 +74,21 @@ public final class DriveWatcher {
   private boolean hadActivePackage = false;
   private int emptyPackagePolls = 0;
   private long emptyCodeSinceMs = -1L;
+  private CachedFileFingerprint cachedPkgFingerprint = null;
+  private String lastValidatedPackageHash = null;
+  private String lastValidatedPackagePlatform = null;
+  private int packageValidationExtractCount = 0;
 
   private String pendingConfigsHash = null;
   private int stableConfigsPolls = 0;
   private String lastAppliedConfigsHash = null;
   private String lastRejectedConfigsHash = null;
+  private String cachedConfigsMetadataSignature = null;
+  private String cachedConfigsHash = null;
+  private String lastValidatedConfigsHash = null;
+
+  private long nextReachableProbeAllowedMs = 0L;
+  private long currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
 
   public DriveWatcher(
       Path codeDir,
@@ -163,6 +178,70 @@ public final class DriveWatcher {
     return stateFile;
   }
 
+  /** Clears unreachable-robot probe backoff (called immediately when NT4 reconnects). */
+  public synchronized void resetUnreachableBackoff() {
+    nextReachableProbeAllowedMs = 0L;
+    currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
+  }
+
+  synchronized int packageValidationExtractCount() {
+    return packageValidationExtractCount;
+  }
+
+  private boolean checkRobotReachableWithBackoff(long nowMs) {
+    if (nowMs < nextReachableProbeAllowedMs) {
+      return false;
+    }
+    if (robot.isReachable()) {
+      resetUnreachableBackoff();
+      return true;
+    }
+    nextReachableProbeAllowedMs = nowMs + currentUnreachableBackoffMs;
+    currentUnreachableBackoffMs =
+        Math.min(MAX_UNREACHABLE_BACKOFF_MS, currentUnreachableBackoffMs * 2L);
+    return false;
+  }
+
+  private String resolvePackageHashCached(Path latestPkg) throws IOException {
+    long size = Files.size(latestPkg);
+    long mtime = lastModifiedSafe(latestPkg);
+    if (cachedPkgFingerprint != null
+        && cachedPkgFingerprint.path().equals(latestPkg)
+        && cachedPkgFingerprint.sizeBytes() == size
+        && cachedPkgFingerprint.lastModifiedMs() == mtime) {
+      String cachedHash = cachedPkgFingerprint.sha256();
+      boolean settled =
+          cachedHash.equals(lastAppliedPackageHash)
+              || cachedHash.equals(lastRejectedPackageHash)
+              || (cachedHash.equals(pendingPackageHash)
+                  && stablePackagePolls >= REQUIRED_STABLE_POLLS);
+      if (settled) {
+        return cachedHash;
+      }
+    }
+    String computed = sha256File(latestPkg);
+    cachedPkgFingerprint = new CachedFileFingerprint(latestPkg, size, mtime, computed);
+    return computed;
+  }
+
+  private String resolveConfigsHashCached(Path configsDir) throws IOException {
+    String metaSig = csvDirectoryMetadataSignature(configsDir);
+    if (metaSig.equals(cachedConfigsMetadataSignature) && cachedConfigsHash != null) {
+      boolean settled =
+          cachedConfigsHash.equals(lastAppliedConfigsHash)
+              || cachedConfigsHash.equals(lastRejectedConfigsHash)
+              || (cachedConfigsHash.equals(pendingConfigsHash)
+                  && stableConfigsPolls >= REQUIRED_STABLE_POLLS);
+      if (settled) {
+        return cachedConfigsHash;
+      }
+    }
+    String computed = sha256CsvDirectory(configsDir);
+    cachedConfigsMetadataSignature = metaSig;
+    cachedConfigsHash = computed;
+    return computed;
+  }
+
   /**
    * Executes one deterministic watch cycle (serialized onto the tray action worker in production or
    * called directly in unit tests).
@@ -176,7 +255,7 @@ public final class DriveWatcher {
     if (latestPkg != null) {
       emptyPackagePolls = 0;
       emptyCodeSinceMs = -1L;
-      String pkgHash = sha256File(latestPkg);
+      String pkgHash = resolvePackageHashCached(latestPkg);
       if (pkgHash.equals(lastAppliedPackageHash)) {
         if (!hadActivePackage) {
           hadActivePackage = true;
@@ -190,27 +269,34 @@ public final class DriveWatcher {
           stablePackagePolls = 1;
         }
         if (stablePackagePolls >= REQUIRED_STABLE_POLLS) {
-          try {
-            PackageDeployer.validatePackageArchiveLocally(latestPkg, robot.controllerPlatform());
-          } catch (IOException | IllegalArgumentException | IllegalStateException badPkg) {
-            lastRejectedPackageHash = pkgHash;
-            pendingPackageHash = null;
-            stablePackagePolls = 0;
-            persistStateQuietly();
-            String msg =
-                "Rejected invalid package "
-                    + latestPkg.getFileName()
-                    + ": "
-                    + badPkg.getMessage();
-            notifications.notify("ERROR", "FluxTray Package Rejected", msg);
-            return new PollOutcome(ActionType.REJECTED_INVALID_PACKAGE, msg, null);
+          String platform = robot.controllerPlatform();
+          if (!pkgHash.equals(lastValidatedPackageHash)
+              || !platform.equals(lastValidatedPackagePlatform)) {
+            try {
+              packageValidationExtractCount++;
+              PackageDeployer.validatePackageArchiveLocally(latestPkg, platform);
+              lastValidatedPackageHash = pkgHash;
+              lastValidatedPackagePlatform = platform;
+            } catch (IOException | IllegalArgumentException | IllegalStateException badPkg) {
+              lastRejectedPackageHash = pkgHash;
+              pendingPackageHash = null;
+              stablePackagePolls = 0;
+              persistStateQuietly();
+              String msg =
+                  "Rejected invalid package "
+                      + latestPkg.getFileName()
+                      + ": "
+                      + badPkg.getMessage();
+              notifications.notify("ERROR", "FluxTray Package Rejected", msg);
+              return new PollOutcome(ActionType.REJECTED_INVALID_PACKAGE, msg, null);
+            }
           }
 
           if (lockout.isEnabled() || lockout.isFmsAttached()) {
             return new PollOutcome(
                 ActionType.DEFERRED_LOCKOUT, "Deferred package deploy while Enabled/FMS", null);
           }
-          if (!robot.isReachable()) {
+          if (!checkRobotReachableWithBackoff(nowMs)) {
             return new PollOutcome(ActionType.NONE, "Robot unreachable for package deploy", null);
           }
           transferBusyCallback.accept(true);
@@ -253,7 +339,7 @@ public final class DriveWatcher {
           return new PollOutcome(
               ActionType.DEFERRED_LOCKOUT, "Deferred Restore STABLE while Enabled/FMS", null);
         }
-        if (!robot.isReachable()) {
+        if (!checkRobotReachableWithBackoff(nowMs)) {
           return new PollOutcome(ActionType.NONE, "Robot unreachable for Restore STABLE", null);
         }
         transferBusyCallback.accept(true);
@@ -283,7 +369,7 @@ public final class DriveWatcher {
 
     Path configsDir = codeDir.resolve("configs");
     if (Files.isDirectory(configsDir) && hasAnyCsvFile(configsDir)) {
-      String cfgHash = sha256CsvDirectory(configsDir);
+      String cfgHash = resolveConfigsHashCached(configsDir);
       if (!cfgHash.equals(lastAppliedConfigsHash) && !cfgHash.equals(lastRejectedConfigsHash)) {
         if (cfgHash.equals(pendingConfigsHash)) {
           stableConfigsPolls++;
@@ -292,43 +378,46 @@ public final class DriveWatcher {
           stableConfigsPolls = 1;
         }
         if (stableConfigsPolls >= REQUIRED_STABLE_POLLS) {
-          if (!Files.isRegularFile(configsDir.resolve("parameters.csv"))) {
-            lastRejectedConfigsHash = cfgHash;
-            pendingConfigsHash = null;
-            stableConfigsPolls = 0;
-            persistStateQuietly();
-            notifications.notify(
-                "ERROR", "FluxFig Config Folder Incomplete", PARTIAL_CONFIGS_ERROR_MESSAGE);
-            return new PollOutcome(
-                ActionType.REJECTED_INVALID_CONFIG, PARTIAL_CONFIGS_ERROR_MESSAGE, null);
-          }
-          List<String> violations;
-          try {
-            FluxFig localCheck = new FluxFig(configsDir);
-            violations = localCheck.validateStrict();
-          } catch (RuntimeException parseEx) {
-            lastRejectedConfigsHash = cfgHash;
-            pendingConfigsHash = null;
-            stableConfigsPolls = 0;
-            persistStateQuietly();
-            String msg = "Blocked malformed code/configs/*.csv push: " + parseEx.getMessage();
-            notifications.notify("ERROR", "FluxFig Validation Blocked", msg);
-            return new PollOutcome(ActionType.REJECTED_INVALID_CONFIG, msg, null);
-          }
-          if (!violations.isEmpty()) {
-            lastRejectedConfigsHash = cfgHash;
-            pendingConfigsHash = null;
-            stableConfigsPolls = 0;
-            persistStateQuietly();
-            String msg = "Blocked unsafe code/configs/*.csv push: " + violations.get(0);
-            notifications.notify("ERROR", "FluxFig Validation Blocked", msg);
-            return new PollOutcome(ActionType.REJECTED_INVALID_CONFIG, msg, null);
+          if (!cfgHash.equals(lastValidatedConfigsHash)) {
+            if (!Files.isRegularFile(configsDir.resolve("parameters.csv"))) {
+              lastRejectedConfigsHash = cfgHash;
+              pendingConfigsHash = null;
+              stableConfigsPolls = 0;
+              persistStateQuietly();
+              notifications.notify(
+                  "ERROR", "FluxFig Config Folder Incomplete", PARTIAL_CONFIGS_ERROR_MESSAGE);
+              return new PollOutcome(
+                  ActionType.REJECTED_INVALID_CONFIG, PARTIAL_CONFIGS_ERROR_MESSAGE, null);
+            }
+            List<String> violations;
+            try {
+              FluxFig localCheck = new FluxFig(configsDir);
+              violations = localCheck.validateStrict();
+            } catch (RuntimeException parseEx) {
+              lastRejectedConfigsHash = cfgHash;
+              pendingConfigsHash = null;
+              stableConfigsPolls = 0;
+              persistStateQuietly();
+              String msg = "Blocked malformed code/configs/*.csv push: " + parseEx.getMessage();
+              notifications.notify("ERROR", "FluxFig Validation Blocked", msg);
+              return new PollOutcome(ActionType.REJECTED_INVALID_CONFIG, msg, null);
+            }
+            if (!violations.isEmpty()) {
+              lastRejectedConfigsHash = cfgHash;
+              pendingConfigsHash = null;
+              stableConfigsPolls = 0;
+              persistStateQuietly();
+              String msg = "Blocked unsafe code/configs/*.csv push: " + violations.get(0);
+              notifications.notify("ERROR", "FluxFig Validation Blocked", msg);
+              return new PollOutcome(ActionType.REJECTED_INVALID_CONFIG, msg, null);
+            }
+            lastValidatedConfigsHash = cfgHash;
           }
           if (lockout.isEnabled() || lockout.isFmsAttached()) {
             return new PollOutcome(
                 ActionType.DEFERRED_LOCKOUT, "Deferred config push while Enabled/FMS", null);
           }
-          if (!robot.isReachable()) {
+          if (!checkRobotReachableWithBackoff(nowMs)) {
             return new PollOutcome(ActionType.NONE, "Robot unreachable for config push", null);
           }
           transferBusyCallback.accept(true);
@@ -468,6 +557,25 @@ public final class DriveWatcher {
     } catch (NoSuchAlgorithmException e) {
       throw new IllegalStateException(e);
     }
+  }
+
+  private static String csvDirectoryMetadataSignature(Path dir) throws IOException {
+    StringBuilder sb = new StringBuilder(256);
+    try (Stream<Path> s = Files.list(dir)) {
+      for (Path p :
+          s.filter(Files::isRegularFile)
+              .filter(f -> f.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".csv"))
+              .sorted(Comparator.comparing(f -> f.getFileName().toString()))
+              .toList()) {
+        sb.append(p.getFileName().toString())
+            .append('|')
+            .append(Files.size(p))
+            .append('|')
+            .append(lastModifiedSafe(p))
+            .append('\n');
+      }
+    }
+    return sb.toString();
   }
 
   static String sha256CsvDirectory(Path dir) throws IOException {

@@ -222,26 +222,24 @@ public final class BatteryAndRunManager {
     lockout.beginTransferOrThrow("pullDriveSafeRunZip:" + runId);
     Path tempStageRoot = Files.createTempDirectory("fluxtray-run-stage-");
     try {
+      long audioEnableMs = audioRecorder.enableStartEpochMs();
+      long audioDisableMs = audioRecorder.disableStartEpochMs();
+      if (audioRecorder.isRecording()) {
+        // Spool active narration before SSH so a robot breaker power-off never drops mentor audio.
+        audioRecorder.flushToSpool(pendingAudioSpoolDir);
+      }
       robot.assertRobotDisabledForTransfer("pullDriveSafeRunZip:" + runId);
       List<RemoteLogEntry> toDownload =
           incrementalOnly ? findUnsyncedRemoteLogs(robot) : robot.listRemoteLogEntries();
       List<Path> existingSpoolDirs = listPendingAudioSpoolDirs();
-      if (skipIfNoNewFiles
-          && toDownload.isEmpty()
-          && !audioRecorder.isRecording()
-          && existingSpoolDirs.isEmpty()) {
+      if (skipIfNoNewFiles && toDownload.isEmpty() && existingSpoolDirs.isEmpty()) {
         return null;
       }
 
       Path runStageDir = tempStageRoot.resolve(runId);
       Files.createDirectories(runStageDir);
 
-      long audioEnableMs = audioRecorder.enableStartEpochMs();
-      long audioDisableMs = audioRecorder.disableStartEpochMs();
-      if (audioRecorder.isRecording()) {
-        audioRecorder.flushToSpool(pendingAudioSpoolDir);
-      }
-      List<Path> stagedSpoolDirs = listPendingAudioSpoolDirs();
+      List<Path> stagedSpoolDirs = existingSpoolDirs;
       if (!stagedSpoolDirs.isEmpty()) {
         Path latestSpool = stagedSpoolDirs.get(stagedSpoolDirs.size() - 1);
         copySpoolAudioIntoRunDir(latestSpool, runStageDir);
@@ -820,15 +818,39 @@ public final class BatteryAndRunManager {
                   })
               .sorted()
               .toList()) {
-        long mtimeMs = Files.getLastModifiedTime(f).toMillis();
-        long nameTsMs = parseDsLogNameEpochMs(f.getFileName().toString(), effectiveZone);
-        boolean mtimeMatches =
-            isYearAtLeast2025(mtimeMs) && mtimeMs >= winStart && mtimeMs <= winEnd;
-        boolean nameMatches =
-            nameTsMs > 0L && isYearAtLeast2025(nameTsMs) && nameTsMs >= winStart && nameTsMs <= winEnd;
-        if (mtimeMatches || nameMatches) {
-          Files.copy(f, runDir.resolve(f.getFileName()), StandardCopyOption.REPLACE_EXISTING);
-          copied++;
+        try {
+          long mtimeMs = Files.getLastModifiedTime(f).toMillis();
+          long nameTsMs = parseDsLogNameEpochMs(f.getFileName().toString(), effectiveZone);
+          boolean mtimeMatches =
+              isYearAtLeast2025(mtimeMs) && mtimeMs >= winStart && mtimeMs <= winEnd;
+          boolean nameMatches =
+              nameTsMs > 0L
+                  && isYearAtLeast2025(nameTsMs)
+                  && nameTsMs >= winStart
+                  && nameTsMs <= winEnd;
+          if (mtimeMatches || nameMatches) {
+            Path dest = runDir.resolve(f.getFileName());
+            try {
+              Files.copy(f, dest, StandardCopyOption.REPLACE_EXISTING);
+              copied++;
+            } catch (IOException copyEx) {
+              try {
+                Files.deleteIfExists(dest);
+              } catch (IOException ignored) {
+              }
+              System.err.println(
+                  "FluxTray WARN: Skipping locked/unreadable DS log "
+                      + f.getFileName()
+                      + ": "
+                      + copyEx.getMessage());
+            }
+          }
+        } catch (IOException metaEx) {
+          System.err.println(
+              "FluxTray WARN: Skipping unreadable DS log "
+                  + f.getFileName()
+                  + ": "
+                  + metaEx.getMessage());
         }
       }
     }

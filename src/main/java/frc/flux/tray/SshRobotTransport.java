@@ -1,14 +1,17 @@
 package frc.flux.tray;
 
 import frc.lib.fluxfig.FluxSystemSnapshot;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.time.Instant;
@@ -65,6 +68,18 @@ public final class SshRobotTransport implements RobotTransport {
   @FunctionalInterface
   public interface ProcessRunner {
     ProcessResult run(List<String> argv, byte[] stdin, Duration timeout) throws IOException;
+
+    /** Streams process stdout directly to {@code stdoutTargetFile} without heap buffering. */
+    default ProcessResult runToFile(
+        List<String> argv, byte[] stdin, Path stdoutTargetFile, Duration timeout)
+        throws IOException {
+      ProcessResult res = run(argv, stdin, timeout);
+      if (res.exitCode() == 0 && stdoutTargetFile != null) {
+        byte[] bytes = res.stdoutBytes() != null ? res.stdoutBytes() : new byte[0];
+        Files.write(stdoutTargetFile, bytes);
+      }
+      return res;
+    }
   }
 
   private record HeartbeatSample(boolean present, long remoteEpochSec, RobotStateHeartbeat heartbeat) {}
@@ -148,7 +163,23 @@ public final class SshRobotTransport implements RobotTransport {
         (heartbeatFilePath != null && !heartbeatFilePath.isBlank())
             ? heartbeatFilePath
             : DEFAULT_HEARTBEAT_FILE;
-    this.processRunner = processRunner != null ? processRunner : this::runLocalProcess;
+    this.processRunner =
+        processRunner != null
+            ? processRunner
+            : new ProcessRunner() {
+              @Override
+              public ProcessResult run(List<String> argv, byte[] stdin, Duration timeout)
+                  throws IOException {
+                return runLocalProcess(argv, stdin, timeout);
+              }
+
+              @Override
+              public ProcessResult runToFile(
+                  List<String> argv, byte[] stdin, Path stdoutTargetFile, Duration timeout)
+                  throws IOException {
+                return runLocalProcessToFile(argv, stdin, stdoutTargetFile, timeout);
+              }
+            };
     if (lockout != null) {
       lockout.addAbortListener(this::abortActiveProcesses);
     }
@@ -700,10 +731,24 @@ public final class SshRobotTransport implements RobotTransport {
         throw new IOException("Blocked unsafe remote log path: " + entry.relativeKey());
       }
       Files.createDirectories(target.getParent());
-      byte[] payload =
-          runSshTransferDownload(
-              buildInlineHeartbeatGuard() + " && cat " + shQuote(entry.remoteFullPath()));
-      Files.write(target, payload);
+      Path tempTarget =
+          target.resolveSibling(target.getFileName().toString() + ".fluxtray.part");
+      try {
+        runSshTransferDownloadToFile(
+            buildInlineHeartbeatGuard() + " && cat " + shQuote(entry.remoteFullPath()),
+            tempTarget);
+        try {
+          Files.move(
+              tempTarget,
+              target,
+              StandardCopyOption.REPLACE_EXISTING,
+              StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+          Files.move(tempTarget, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+      } finally {
+        Files.deleteIfExists(tempTarget);
+      }
       if (entry.mtimeEpochSec() > 0L) {
         Files.setLastModifiedTime(
             target, FileTime.from(Instant.ofEpochSecond(entry.mtimeEpochSec())));
@@ -938,9 +983,12 @@ public final class SshRobotTransport implements RobotTransport {
     return runSshCommandOnHost(discoverReachableHost(), remoteCmd, stdin, TRANSFER_TIMEOUT_SEC);
   }
 
-  private byte[] runSshTransferDownload(String remoteCmd) throws IOException {
+  private void runSshTransferDownloadToFile(String remoteCmd, Path targetFile) throws IOException {
     List<String> cmd = buildSshInvocation(discoverReachableHost(), remoteCmd);
-    return runCheckedProcessRaw(cmd, null, TRANSFER_TIMEOUT_SEC);
+    ProcessResult result =
+        processRunner.runToFile(
+            List.copyOf(cmd), null, targetFile, Duration.ofSeconds(TRANSFER_TIMEOUT_SEC));
+    checkProcessResult(result);
   }
 
   private String runSshCommandOnHost(
@@ -964,16 +1012,15 @@ public final class SshRobotTransport implements RobotTransport {
     return result.stdout() != null ? result.stdout() : "";
   }
 
-  private byte[] runCheckedProcessRaw(List<String> argv, byte[] stdin, long timeoutSeconds)
-      throws IOException {
-    ProcessResult result = runCheckedResult(argv, stdin, timeoutSeconds);
-    return result.stdoutBytes() != null ? result.stdoutBytes() : new byte[0];
-  }
-
-  private ProcessResult runCheckedResult(List<String> argv, byte[] stdin, long timeoutSeconds)
+  ProcessResult runCheckedResult(List<String> argv, byte[] stdin, long timeoutSeconds)
       throws IOException {
     ProcessResult result =
         processRunner.run(List.copyOf(argv), stdin, Duration.ofSeconds(timeoutSeconds));
+    checkProcessResult(result);
+    return result;
+  }
+
+  private static void checkProcessResult(ProcessResult result) throws IOException {
     if (result.exitCode() != 0) {
       String stderr = result.stderr() != null ? result.stderr() : "";
       if (result.exitCode() == LOCKOUT_EXIT_CODE || stderr.contains("LOCKOUT:")) {
@@ -981,22 +1028,43 @@ public final class SshRobotTransport implements RobotTransport {
       }
       throw new IOException("SSH exited with " + result.exitCode() + ": " + stderr);
     }
-    return result;
   }
 
-  private ProcessResult runLocalProcess(List<String> argv, byte[] stdin, Duration timeout)
+  ProcessResult runLocalProcess(List<String> argv, byte[] stdin, Duration timeout)
       throws IOException {
+    return executeLocalProcess(argv, stdin, null, timeout);
+  }
+
+  ProcessResult runLocalProcessToFile(
+      List<String> argv, byte[] stdin, Path stdoutTargetFile, Duration timeout) throws IOException {
+    return executeLocalProcess(argv, stdin, stdoutTargetFile, timeout);
+  }
+
+  private ProcessResult executeLocalProcess(
+      List<String> argv, byte[] stdin, Path stdoutTargetFile, Duration timeout) throws IOException {
     Process p = new ProcessBuilder(argv).start();
     activeProcesses.add(p);
+    Thread inWriter = null;
     try {
       final byte[][] stdoutHolder = new byte[1][];
       final byte[][] stderrHolder = new byte[1][];
+      final IOException[] stdoutError = new IOException[1];
       Thread outReader =
           new Thread(
               () -> {
-                try {
-                  stdoutHolder[0] = p.getInputStream().readAllBytes();
-                } catch (IOException ignored) {
+                if (stdoutTargetFile != null) {
+                  try (OutputStream out =
+                      new BufferedOutputStream(Files.newOutputStream(stdoutTargetFile), 64 * 1024)) {
+                    p.getInputStream().transferTo(out);
+                    out.flush();
+                  } catch (IOException ex) {
+                    stdoutError[0] = ex;
+                  }
+                } else {
+                  try {
+                    stdoutHolder[0] = p.getInputStream().readAllBytes();
+                  } catch (IOException ignored) {
+                  }
                 }
               },
               "fluxtray-ssh-stdout");
@@ -1014,10 +1082,30 @@ public final class SshRobotTransport implements RobotTransport {
       outReader.start();
       errReader.start();
 
-      try (OutputStream procIn = p.getOutputStream()) {
-        if (stdin != null && stdin.length > 0) {
-          procIn.write(stdin);
-          procIn.flush();
+      // Stream stdin asynchronously so early exit-42 lockouts or stalled ssh peers never deadlock
+      // write() or mask the remote exit status with Broken pipe.
+      if (stdin != null && stdin.length > 0) {
+        inWriter =
+            new Thread(
+                () -> {
+                  try (OutputStream procIn = p.getOutputStream()) {
+                    int offset = 0;
+                    while (offset < stdin.length && !Thread.currentThread().isInterrupted()) {
+                      int chunk = Math.min(64 * 1024, stdin.length - offset);
+                      procIn.write(stdin, offset, chunk);
+                      offset += chunk;
+                    }
+                    procIn.flush();
+                  } catch (IOException ignored) {
+                  }
+                },
+                "fluxtray-ssh-stdin");
+        inWriter.setDaemon(true);
+        inWriter.start();
+      } else {
+        try {
+          p.getOutputStream().close();
+        } catch (IOException ignored) {
         }
       }
 
@@ -1025,21 +1113,49 @@ public final class SshRobotTransport implements RobotTransport {
       boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
       if (!finished) {
         p.destroyForcibly();
+        if (stdoutTargetFile != null) {
+          Files.deleteIfExists(stdoutTargetFile);
+        }
         throw new IOException("SSH/SCP command timed out after " + timeout.toSeconds() + "s");
       }
-      outReader.join(2_000L);
+      outReader.join(stdoutTargetFile != null ? 30_000L : 2_000L);
       errReader.join(2_000L);
-      byte[] rawStdout = stdoutHolder[0] != null ? stdoutHolder[0] : new byte[0];
-      String stdout = new String(rawStdout, StandardCharsets.UTF_8);
+      int exitCode = p.exitValue();
       String stderr =
           stderrHolder[0] != null ? new String(stderrHolder[0], StandardCharsets.UTF_8) : "";
-      return new ProcessResult(p.exitValue(), stdout, stderr, rawStdout);
+      if (stdoutTargetFile != null) {
+        if (exitCode != 0) {
+          Files.deleteIfExists(stdoutTargetFile);
+        } else if (stdoutError[0] != null) {
+          Files.deleteIfExists(stdoutTargetFile);
+          throw stdoutError[0];
+        }
+        return new ProcessResult(exitCode, "", stderr, new byte[0]);
+      }
+      byte[] rawStdout = stdoutHolder[0] != null ? stdoutHolder[0] : new byte[0];
+      String stdout = new String(rawStdout, StandardCharsets.UTF_8);
+      return new ProcessResult(exitCode, stdout, stderr, rawStdout);
     } catch (InterruptedException e) {
       p.destroyForcibly();
+      if (stdoutTargetFile != null) {
+        try {
+          Files.deleteIfExists(stdoutTargetFile);
+        } catch (IOException ignored) {
+        }
+      }
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted waiting for SSH/SCP", e);
     } finally {
       activeProcesses.remove(p);
+      p.destroyForcibly();
+      if (inWriter != null) {
+        inWriter.interrupt();
+        try {
+          inWriter.join(1_000L);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
     }
   }
 

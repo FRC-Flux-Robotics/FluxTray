@@ -14,6 +14,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
@@ -41,6 +45,10 @@ public final class MultiMicAudioRecorder implements Closeable {
       new AudioFormat(SAMPLE_RATE_HZ, SAMPLE_SIZE_BITS, CHANNELS, true, false);
 
   public static final long POST_DISABLE_DEBRIEF_WINDOW_MS = 15_000L;
+  public static final long MAX_RECORDING_BYTES = 30L * 1024L * 1024L;
+  public static final long MAX_RECORDING_DURATION_MS = 15L * 60L * 1_000L;
+  static final int MAX_CONSECUTIVE_ZERO_READS = 20;
+  static final long ZERO_READ_BACKOFF_MS = 10L;
   public static final int STREAM_CHUNK_BYTES = 16 * 1024;
   public static final String AUDIO_FILE_NAME = "mentor-audio.wav";
   public static final String AUDIO_SYNC_FILE_NAME = "audio-sync.json";
@@ -53,6 +61,11 @@ public final class MultiMicAudioRecorder implements Closeable {
   /** Port for PCM audio input (backed by {@link TargetDataLine} in production or mock PCM in tests). */
   public interface PcmCapturePort extends Closeable {
     int read(byte[] buffer, int offset, int length) throws IOException;
+
+    /** Returns {@code false} when the underlying OS audio line is closed or inactive. */
+    default boolean isHealthy() {
+      return true;
+    }
   }
 
   /** Factory opening a live PCM capture stream (returns {@code null} if no microphone is present). */
@@ -62,6 +75,9 @@ public final class MultiMicAudioRecorder implements Closeable {
   }
 
   private final PcmCaptureFactory captureFactory;
+  private final long postDisableAutoStopDelayMs;
+  private final long maxRecordingBytes;
+  private final long maxRecordingDurationMs;
   private final List<VoiceCue> recordedCues = new ArrayList<>();
   private final AtomicBoolean captureActive = new AtomicBoolean(false);
   private volatile Path spoolRootDir = null;
@@ -71,17 +87,35 @@ public final class MultiMicAudioRecorder implements Closeable {
   private boolean micAvailable = false;
   private long enableStartEpochMs = 0L;
   private long disableStartEpochMs = 0L;
+  private long recordingGeneration = 0L;
   private Path tempPcmFile = null;
   private PcmCapturePort activePort = null;
   private Thread captureThread = null;
+  private ScheduledExecutorService autoStopScheduler = null;
+  private ScheduledFuture<?> postDisableStopTask = null;
 
   public MultiMicAudioRecorder() {
     this(MultiMicAudioRecorder::openSystemTargetDataLine);
   }
 
   public MultiMicAudioRecorder(PcmCaptureFactory captureFactory) {
+    this(
+        captureFactory,
+        POST_DISABLE_DEBRIEF_WINDOW_MS,
+        MAX_RECORDING_BYTES,
+        MAX_RECORDING_DURATION_MS);
+  }
+
+  MultiMicAudioRecorder(
+      PcmCaptureFactory captureFactory,
+      long postDisableAutoStopDelayMs,
+      long maxRecordingBytes,
+      long maxRecordingDurationMs) {
     this.captureFactory =
         captureFactory != null ? captureFactory : MultiMicAudioRecorder::openSystemTargetDataLine;
+    this.postDisableAutoStopDelayMs = Math.max(1L, postDisableAutoStopDelayMs);
+    this.maxRecordingBytes = Math.max(1024L, maxRecordingBytes);
+    this.maxRecordingDurationMs = Math.max(1L, maxRecordingDurationMs);
   }
 
   public void setSpoolRootDir(Path spoolRootDir) {
@@ -110,6 +144,10 @@ public final class MultiMicAudioRecorder implements Closeable {
     TargetDataLine line = (TargetDataLine) AudioSystem.getLine(info);
     line.open(format, STREAM_CHUNK_BYTES * 2);
     line.start();
+    return wrapTargetDataLine(line);
+  }
+
+  static PcmCapturePort wrapTargetDataLine(TargetDataLine line) {
     return new PcmCapturePort() {
       @Override
       public int read(byte[] buffer, int offset, int length) {
@@ -117,15 +155,24 @@ public final class MultiMicAudioRecorder implements Closeable {
       }
 
       @Override
+      public boolean isHealthy() {
+        return line.isOpen() && line.isActive();
+      }
+
+      @Override
       public void close() {
-        line.stop();
-        line.close();
+        try {
+          line.stop();
+        } finally {
+          line.close();
+        }
       }
     };
   }
 
   public synchronized void onRobotStateChanged(boolean enabled, long nowMs) {
     if (enabled) {
+      cancelPostDisableStopTask();
       if (recording && disableStartEpochMs > 0L) {
         // Re-enabled inside the 15 s post-disable debrief window: close and flush Run 1 to the
         // durable spool first so Run 2 starts with clean enable/disable timestamps and a full debrief.
@@ -151,15 +198,17 @@ public final class MultiMicAudioRecorder implements Closeable {
       if (!recording) {
         stopCaptureWorkerQuietly();
         cleanupTempPcmQuietly();
+        recordingGeneration++;
         recording = true;
         enableStartEpochMs = nowMs;
         disableStartEpochMs = 0L;
         recordedCues.clear();
         lastCaptureError = null;
-        startCaptureWorker();
+        startCaptureWorker(recordingGeneration);
       }
     } else if (recording && disableStartEpochMs == 0L) {
       disableStartEpochMs = nowMs;
+      schedulePostDisableAutoStop(recordingGeneration);
     }
   }
 
@@ -226,6 +275,7 @@ public final class MultiMicAudioRecorder implements Closeable {
    */
   public synchronized Path flushAudioFile(Path runDir) throws IOException {
     Files.createDirectories(runDir);
+    cancelPostDisableStopTask();
     stopCaptureWorkerQuietly();
 
     Path wavFile = runDir.resolve(AUDIO_FILE_NAME);
@@ -276,6 +326,12 @@ public final class MultiMicAudioRecorder implements Closeable {
 
   @Override
   public synchronized void close() {
+    cancelPostDisableStopTask();
+    if (autoStopScheduler != null) {
+      autoStopScheduler.shutdownNow();
+      autoStopScheduler = null;
+    }
+    recordingGeneration++;
     recording = false;
     enableStartEpochMs = 0L;
     disableStartEpochMs = 0L;
@@ -285,6 +341,10 @@ public final class MultiMicAudioRecorder implements Closeable {
 
   synchronized Path currentTempPcmFile() {
     return tempPcmFile;
+  }
+
+  synchronized boolean isCaptureThreadAlive() {
+    return captureThread != null && captureThread.isAlive();
   }
 
   public synchronized List<VoiceCue> recordedCues() {
@@ -311,7 +371,54 @@ public final class MultiMicAudioRecorder implements Closeable {
     return disableStartEpochMs;
   }
 
-  private void startCaptureWorker() {
+  private void schedulePostDisableAutoStop(long expectedGeneration) {
+    cancelPostDisableStopTask();
+    if (autoStopScheduler == null || autoStopScheduler.isShutdown()) {
+      autoStopScheduler =
+          Executors.newSingleThreadScheduledExecutor(
+              r -> {
+                Thread t = new Thread(r, "fluxtray-audio-autostop");
+                t.setDaemon(true);
+                return t;
+              });
+    }
+    postDisableStopTask =
+        autoStopScheduler.schedule(
+            () -> autoStopAndSpoolIfCurrent(expectedGeneration, "post-disable debrief window elapsed"),
+            postDisableAutoStopDelayMs,
+            TimeUnit.MILLISECONDS);
+  }
+
+  private void cancelPostDisableStopTask() {
+    ScheduledFuture<?> task = postDisableStopTask;
+    postDisableStopTask = null;
+    if (task != null) {
+      task.cancel(false);
+    }
+  }
+
+  private synchronized void autoStopAndSpoolIfCurrent(long expectedGeneration, String reason) {
+    if (!recording || recordingGeneration != expectedGeneration) {
+      return;
+    }
+    cancelPostDisableStopTask();
+    Path spool = spoolRootDir;
+    if (spool != null) {
+      try {
+        flushToSpool(spool);
+        return;
+      } catch (IOException ex) {
+        notifyCaptureError("Failed to auto-spool audio (" + reason + "): " + ex.getMessage());
+      }
+    }
+    stopCaptureWorkerQuietly();
+    cleanupTempPcmQuietly();
+    recording = false;
+    enableStartEpochMs = 0L;
+    disableStartEpochMs = 0L;
+  }
+
+  private void startCaptureWorker(long expectedGeneration) {
     try {
       PcmCapturePort port = captureFactory.open(CAPTURE_FORMAT);
       if (port == null) {
@@ -329,21 +436,84 @@ public final class MultiMicAudioRecorder implements Closeable {
           new Thread(
               () -> {
                 byte[] buf = new byte[STREAM_CHUNK_BYTES];
-                try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(pcmFile), STREAM_CHUNK_BYTES)) {
+                long totalBytesWritten = 0L;
+                long startNano = System.nanoTime();
+                int consecutiveZeroReads = 0;
+                boolean capReached = false;
+                boolean abortedOnDeviceFault = false;
+                try (OutputStream out =
+                    new BufferedOutputStream(Files.newOutputStream(pcmFile), STREAM_CHUNK_BYTES)) {
                   while (captureActive.get()) {
+                    if (!port.isHealthy()) {
+                      abortedOnDeviceFault = true;
+                      notifyCaptureError(
+                          "Microphone disconnected or inactive — stopping audio capture.");
+                      break;
+                    }
+                    long elapsedMs = (System.nanoTime() - startNano) / 1_000_000L;
+                    if (totalBytesWritten >= maxRecordingBytes
+                        || elapsedMs >= maxRecordingDurationMs) {
+                      capReached = true;
+                      break;
+                    }
                     int n = port.read(buf, 0, buf.length);
                     if (n < 0) {
                       break;
                     }
-                    if (n > 0) {
-                      out.write(buf, 0, n);
+                    if (n == 0) {
+                      consecutiveZeroReads++;
+                      if (!port.isHealthy()) {
+                        abortedOnDeviceFault = true;
+                        notifyCaptureError(
+                            "Microphone disconnected or inactive — stopping audio capture.");
+                        break;
+                      }
+                      if (consecutiveZeroReads >= MAX_CONSECUTIVE_ZERO_READS) {
+                        abortedOnDeviceFault = true;
+                        notifyCaptureError(
+                            "Microphone stalled (consecutive 0-byte reads; USB headset unplugged) — stopping audio capture.");
+                        break;
+                      }
+                      try {
+                        Thread.sleep(ZERO_READ_BACKOFF_MS);
+                      } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                      }
+                      continue;
+                    }
+                    consecutiveZeroReads = 0;
+                    int toWrite = (int) Math.min(n, maxRecordingBytes - totalBytesWritten);
+                    if (toWrite > 0) {
+                      out.write(buf, 0, toWrite);
+                      totalBytesWritten += toWrite;
+                    }
+                    if (totalBytesWritten >= maxRecordingBytes) {
+                      capReached = true;
+                      break;
                     }
                   }
                   out.flush();
                 } catch (IOException ex) {
                   if (captureActive.get()) {
+                    abortedOnDeviceFault = true;
                     notifyCaptureError("Microphone stream interrupted: " + ex.getMessage());
                   }
+                }
+                if (abortedOnDeviceFault && captureActive.get()) {
+                  try {
+                    port.close();
+                  } catch (IOException ignored) {
+                  }
+                }
+                if (capReached && captureActive.get()) {
+                  notifyCaptureError(
+                      "Microphone recording reached safety cap ("
+                          + (maxRecordingBytes / (1024L * 1024L))
+                          + " MB / "
+                          + (maxRecordingDurationMs / 60_000L)
+                          + " min) — auto-stopping and spooling.");
+                  autoStopAndSpoolIfCurrent(expectedGeneration, "max recording cap reached");
                 }
               },
               "fluxtray-audio-capture");
@@ -384,7 +554,7 @@ public final class MultiMicAudioRecorder implements Closeable {
     }
     Thread t = captureThread;
     captureThread = null;
-    if (t != null) {
+    if (t != null && t != Thread.currentThread()) {
       try {
         t.join(2_000L);
       } catch (InterruptedException e) {

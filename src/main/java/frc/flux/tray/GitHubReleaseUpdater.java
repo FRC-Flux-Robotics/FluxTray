@@ -1,7 +1,9 @@
 package frc.flux.tray;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.http.HttpClient;
@@ -18,7 +20,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -44,6 +49,31 @@ public final class GitHubReleaseUpdater {
   public static final long DEFAULT_INITIAL_DELAY_SECONDS = 45L;
 
   private static final Pattern SHA256_HEX_PATTERN = Pattern.compile("\\b([0-9a-fA-F]{64})\\b");
+  private static final int MAX_HTTP_REDIRECTS = 5;
+
+  private static final HttpClient SHARED_HTTP_CLIENT =
+      HttpClient.newBuilder()
+          .connectTimeout(Duration.ofSeconds(10))
+          .followRedirects(HttpClient.Redirect.NEVER)
+          .executor(
+              Executors.newCachedThreadPool(
+                  r -> {
+                    Thread t = new Thread(r, "fluxtray-http");
+                    t.setDaemon(true);
+                    return t;
+                  }))
+          .build();
+
+  /** Permanent release-artifact defect (corrupt checksum/JAR or failed self-test) that should latch. */
+  private static final class ReleaseIntegrityException extends IOException {
+    ReleaseIntegrityException(String message) {
+      super(message);
+    }
+
+    ReleaseIntegrityException(String message, Throwable cause) {
+      super(message, cause);
+    }
+  }
 
   /** Parsed metadata for a published GitHub Release carrying {@code FluxTray.jar} + SHA-256. */
   public record ReleaseInfo(
@@ -339,7 +369,7 @@ public final class GitHubReleaseUpdater {
       }
       String expectedSha256 = parseSha256Digest(shaRes.bodyText());
       if (expectedSha256 == null) {
-        throw new IOException("Malformed " + SHA256_ASSET_NAME + " checksum asset");
+        throw new ReleaseIntegrityException("Malformed " + SHA256_ASSET_NAME + " checksum asset");
       }
 
       HttpResult jarRes =
@@ -355,7 +385,7 @@ public final class GitHubReleaseUpdater {
 
       String actualSha256 = sha256Hex(jarRes.body());
       if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
-        throw new IOException(
+        throw new ReleaseIntegrityException(
             "SHA-256 mismatch for "
                 + latest.tagName()
                 + ": expected="
@@ -365,11 +395,16 @@ public final class GitHubReleaseUpdater {
       }
 
       Files.write(stagedJar, jarRes.body());
-      verifyJarArchiveStructure(stagedJar);
+      try {
+        verifyJarArchiveStructure(stagedJar);
+      } catch (IOException jarEx) {
+        throw new ReleaseIntegrityException(jarEx.getMessage(), jarEx);
+      }
 
       Path cliJavaExe = resolveJavaExecutable(false);
       if (!selfTest.verifyStagedJar(cliJavaExe, stagedJar)) {
-        throw new IOException("Staged " + latest.tagName() + " failed --self-test verification");
+        throw new ReleaseIntegrityException(
+            "Staged " + latest.tagName() + " failed --self-test verification");
       }
 
       if (safeToRestartCheck != null && !safeToRestartCheck.getAsBoolean()) {
@@ -404,8 +439,15 @@ public final class GitHubReleaseUpdater {
               + " (sha256="
               + actualSha256.substring(0, 12)
               + ") and scheduled restart.");
-    } catch (IOException | RuntimeException ex) {
+    } catch (ReleaseIntegrityException ex) {
       lastFailedTag = latest.tagName();
+      try {
+        Files.deleteIfExists(stagedJar);
+      } catch (IOException ignored) {
+      }
+      throw ex;
+    } catch (IOException | RuntimeException ex) {
+      // Do not latch transient network/IO failures so later checks can retry once online.
       try {
         Files.deleteIfExists(stagedJar);
       } catch (IOException ignored) {
@@ -428,8 +470,8 @@ public final class GitHubReleaseUpdater {
 
   /** Returns {@code true} strictly when {@code candidateVersion} is newer than {@code currentVersion}. */
   public static boolean isNewerVersion(String currentVersion, String candidateVersion) {
-    String cur = normalizeVersion(currentVersion);
-    String cand = normalizeVersion(candidateVersion);
+    String cur = stripBuildMetadata(normalizeVersion(currentVersion));
+    String cand = stripBuildMetadata(normalizeVersion(candidateVersion));
     if (cand.isEmpty() || cur.equalsIgnoreCase(cand)) {
       return false;
     }
@@ -443,14 +485,88 @@ public final class GitHubReleaseUpdater {
         return b > a;
       }
     }
-    // Same numeric core: a clean release (no -suffix) is newer than a suffixed build.
-    boolean curHasSuffix = cur.contains("-");
-    boolean candHasSuffix = cand.contains("-");
-    return curHasSuffix && !candHasSuffix;
+    String curSuffix = extractPreReleaseSuffix(cur);
+    String candSuffix = extractPreReleaseSuffix(cand);
+    if (curSuffix == null && candSuffix == null) {
+      return false;
+    }
+    if (curSuffix != null && candSuffix == null) {
+      return true;
+    }
+    if (curSuffix == null) {
+      return false;
+    }
+    return comparePreReleaseSuffix(candSuffix, curSuffix) > 0;
+  }
+
+  private static String stripBuildMetadata(String normalized) {
+    int plus = normalized.indexOf('+');
+    return plus >= 0 ? normalized.substring(0, plus).trim() : normalized;
+  }
+
+  private static String extractPreReleaseSuffix(String stripped) {
+    int dash = stripped.indexOf('-');
+    if (dash < 0 || dash + 1 >= stripped.length()) {
+      return null;
+    }
+    return stripped.substring(dash + 1);
+  }
+
+  private static int comparePreReleaseSuffix(String a, String b) {
+    String[] aTokens = a.split("[.-]");
+    String[] bTokens = b.split("[.-]");
+    int minLen = Math.min(aTokens.length, bTokens.length);
+    for (int i = 0; i < minLen; i++) {
+      String ta = aTokens[i];
+      String tb = bTokens[i];
+      if (isAsciiDigits(ta) && isAsciiDigits(tb)) {
+        int cmp = compareUnsignedNumericStrings(ta, tb);
+        if (cmp != 0) {
+          return cmp;
+        }
+      } else {
+        int cmp = ta.compareToIgnoreCase(tb);
+        if (cmp != 0) {
+          return cmp;
+        }
+      }
+    }
+    return Integer.compare(aTokens.length, bTokens.length);
+  }
+
+  private static boolean isAsciiDigits(String s) {
+    if (s == null || s.isEmpty()) {
+      return false;
+    }
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c < '0' || c > '9') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static int compareUnsignedNumericStrings(String a, String b) {
+    String na = stripLeadingZeros(a);
+    String nb = stripLeadingZeros(b);
+    if (na.length() != nb.length()) {
+      return Integer.compare(na.length(), nb.length());
+    }
+    return na.compareTo(nb);
+  }
+
+  private static String stripLeadingZeros(String digits) {
+    int idx = 0;
+    while (idx + 1 < digits.length() && digits.charAt(idx) == '0') {
+      idx++;
+    }
+    return digits.substring(idx);
   }
 
   private static int[] parseNumericCore(String normalized) {
-    String core = normalized.contains("-") ? normalized.substring(0, normalized.indexOf('-')) : normalized;
+    String stripped = stripBuildMetadata(normalized);
+    String core = stripped.contains("-") ? stripped.substring(0, stripped.indexOf('-')) : stripped;
     String[] parts = core.split("\\.");
     int[] nums = new int[parts.length];
     for (int i = 0; i < parts.length; i++) {
@@ -542,50 +658,170 @@ public final class GitHubReleaseUpdater {
     return Path.of(binName);
   }
 
-  private static HttpResult jdkHttpGet(
-      String url, String acceptHeader, String authToken, Duration timeout) throws IOException {
-    HttpClient client =
-        HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .build();
-    HttpRequest.Builder req =
-        HttpRequest.newBuilder(URI.create(url))
-            .timeout(timeout)
-            .header("User-Agent", "FluxTray/" + detectCurrentVersion())
-            .header("Accept", acceptHeader != null ? acceptHeader : "*/*")
-            .GET();
-    if (authToken != null && !authToken.isBlank()) {
-      req.header("Authorization", "Bearer " + authToken);
+  static boolean isSameOrigin(URI a, URI b) {
+    if (a == null || b == null) {
+      return false;
     }
-    try {
-      HttpResponse<byte[]> response =
-          client.send(req.build(), HttpResponse.BodyHandlers.ofByteArray());
-      return new HttpResult(response.statusCode(), response.body());
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new IOException("Interrupted fetching " + url, e);
-    }
+    String sA = a.getScheme() != null ? a.getScheme().toLowerCase(Locale.ROOT) : "";
+    String sB = b.getScheme() != null ? b.getScheme().toLowerCase(Locale.ROOT) : "";
+    String hA = a.getHost() != null ? a.getHost().toLowerCase(Locale.ROOT) : "";
+    String hB = b.getHost() != null ? b.getHost().toLowerCase(Locale.ROOT) : "";
+    return !sA.isEmpty()
+        && sA.equals(sB)
+        && !hA.isEmpty()
+        && hA.equals(hB)
+        && effectivePort(a) == effectivePort(b);
   }
 
-  private static boolean runJarSelfTest(Path javaExe, Path stagedJar) throws IOException {
+  private static int effectivePort(URI uri) {
+    if (uri.getPort() > 0) {
+      return uri.getPort();
+    }
+    String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase(Locale.ROOT) : "";
+    return "https".equals(scheme) ? 443 : ("http".equals(scheme) ? 80 : -1);
+  }
+
+  private static HttpResult jdkHttpGet(
+      String url, String acceptHeader, String authToken, Duration timeout) throws IOException {
+    URI initialUri = URI.create(url);
+    URI currentUri = initialUri;
+    for (int hop = 0; hop <= MAX_HTTP_REDIRECTS; hop++) {
+      HttpRequest.Builder req =
+          HttpRequest.newBuilder(currentUri)
+              .timeout(timeout)
+              .header("User-Agent", "FluxTray/" + detectCurrentVersion())
+              .header("Accept", acceptHeader != null ? acceptHeader : "*/*")
+              .GET();
+      if (authToken != null && !authToken.isBlank() && isSameOrigin(initialUri, currentUri)) {
+        req.header("Authorization", "Bearer " + authToken);
+      }
+      HttpResponse<byte[]> response;
+      try {
+        response = SHARED_HTTP_CLIENT.send(req.build(), HttpResponse.BodyHandlers.ofByteArray());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("Interrupted fetching " + currentUri, e);
+      }
+      int status = response.statusCode();
+      if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+        Optional<String> loc = response.headers().firstValue("Location");
+        if (loc.isEmpty() || loc.get().isBlank()) {
+          return new HttpResult(status, response.body());
+        }
+        URI nextUri = currentUri.resolve(loc.get().trim());
+        if ("https".equalsIgnoreCase(currentUri.getScheme())
+            && !"https".equalsIgnoreCase(nextUri.getScheme())) {
+          throw new IOException("Blocked insecure HTTPS -> HTTP redirect to " + nextUri);
+        }
+        currentUri = nextUri;
+        continue;
+      }
+      return new HttpResult(status, response.body());
+    }
+    throw new IOException("Too many redirects fetching " + url);
+  }
+
+  static boolean runJarSelfTest(Path javaExe, Path stagedJar) throws IOException {
+    return runJarSelfTest(javaExe, stagedJar, Duration.ofSeconds(20));
+  }
+
+  static boolean runJarSelfTest(Path javaExe, Path stagedJar, Duration timeout) throws IOException {
     Process p =
-        new ProcessBuilder(javaExe.toString(), "-jar", stagedJar.toAbsolutePath().toString(), "--self-test")
+        new ProcessBuilder(
+                javaExe.toString(), "-jar", stagedJar.toAbsolutePath().toString(), "--self-test")
             .redirectErrorStream(true)
             .start();
-    try (InputStream ignored = p.getInputStream()) {
-      ignored.readAllBytes();
-      boolean finished = p.waitFor(20, TimeUnit.SECONDS);
+    Thread drainer =
+        new Thread(
+            () -> {
+              try (InputStream in = p.getInputStream()) {
+                in.transferTo(OutputStream.nullOutputStream());
+              } catch (IOException ignored) {
+              }
+            },
+            "fluxtray-selftest-drain");
+    drainer.setDaemon(true);
+    drainer.start();
+    try {
+      long timeoutMs = Math.max(1L, timeout.toMillis());
+      boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
       if (!finished) {
         p.destroyForcibly();
         return false;
       }
+      drainer.join(2_000L);
       return p.exitValue() == 0;
     } catch (InterruptedException e) {
       p.destroyForcibly();
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted running staged JAR --self-test", e);
+    } finally {
+      p.destroyForcibly();
+      drainer.interrupt();
+      try {
+        drainer.join(1_000L);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
     }
+  }
+
+  static Map<String, String> collectFluxSystemProperties() {
+    Map<String, String> props = new TreeMap<>();
+    for (String name : System.getProperties().stringPropertyNames()) {
+      if (name.startsWith("flux.")) {
+        String val = System.getProperty(name);
+        if (val != null) {
+          props.put(name, val);
+        }
+      }
+    }
+    return props;
+  }
+
+  static String escapeWindowsBatchSetValue(String value) {
+    if (value == null) {
+      return "";
+    }
+    return value.replace("\r", "").replace("\n", "").replace("\"", "").replace("%", "%%");
+  }
+
+  static String quoteWindowsBatchArg(String arg) {
+    String safe = arg == null ? "" : arg.replace("\r", "").replace("\n", "");
+    StringBuilder sb = new StringBuilder(safe.length() + 8);
+    sb.append('"');
+    int backslashes = 0;
+    for (int i = 0; i < safe.length(); i++) {
+      char c = safe.charAt(i);
+      if (c == '\\') {
+        backslashes++;
+      } else if (c == '"') {
+        for (int b = 0; b < backslashes * 2 + 1; b++) {
+          sb.append('\\');
+        }
+        sb.append('"');
+        backslashes = 0;
+      } else {
+        for (int b = 0; b < backslashes; b++) {
+          sb.append('\\');
+        }
+        backslashes = 0;
+        if (c == '%') {
+          sb.append("%%");
+        } else {
+          sb.append(c);
+        }
+      }
+    }
+    for (int b = 0; b < backslashes * 2; b++) {
+      sb.append('\\');
+    }
+    sb.append('"');
+    return sb.toString();
+  }
+
+  static List<String> buildWindowsHelperLaunchCommand(Path script) {
+    return List.of("cmd.exe", "/d", "/c", script.toAbsolutePath().toString());
   }
 
   /** Builds the Windows {@code .cmd} swap-and-relaunch script (with automatic backup rollback). */
@@ -596,16 +832,45 @@ public final class GitHubReleaseUpdater {
       Path backupJar,
       Path relaunchJavaExe,
       List<String> relaunchArgs) {
+    return buildWindowsSwapScript(
+        oldPid,
+        targetJar,
+        stagedJar,
+        backupJar,
+        relaunchJavaExe,
+        relaunchArgs,
+        collectFluxSystemProperties());
+  }
+
+  static String buildWindowsSwapScript(
+      long oldPid,
+      Path targetJar,
+      Path stagedJar,
+      Path backupJar,
+      Path relaunchJavaExe,
+      List<String> relaunchArgs,
+      Map<String, String> fluxJvmProperties) {
+    StringBuilder jvmPropsBuilder = new StringBuilder();
+    if (fluxJvmProperties != null) {
+      for (Map.Entry<String, String> entry : new TreeMap<>(fluxJvmProperties).entrySet()) {
+        jvmPropsBuilder
+            .append(' ')
+            .append(quoteWindowsBatchArg("-D" + entry.getKey() + "=" + entry.getValue()));
+      }
+    }
     StringBuilder argsBuilder = new StringBuilder();
-    for (String arg : relaunchArgs) {
-      argsBuilder.append(" \"").append(arg.replace("\"", "\"\"")).append("\"");
+    if (relaunchArgs != null) {
+      for (String arg : relaunchArgs) {
+        argsBuilder.append(' ').append(quoteWindowsBatchArg(arg));
+      }
     }
     return "@echo off\r\n"
-        + "setlocal\r\n"
+        + "setlocal DisableDelayedExpansion\r\n"
         + "set \"OLD_PID=" + oldPid + "\"\r\n"
-        + "set \"TARGET=" + targetJar.toAbsolutePath() + "\"\r\n"
-        + "set \"STAGED=" + stagedJar.toAbsolutePath() + "\"\r\n"
-        + "set \"BACKUP=" + backupJar.toAbsolutePath() + "\"\r\n"
+        + "set \"TARGET=" + escapeWindowsBatchSetValue(targetJar.toAbsolutePath().toString()) + "\"\r\n"
+        + "set \"STAGED=" + escapeWindowsBatchSetValue(stagedJar.toAbsolutePath().toString()) + "\"\r\n"
+        + "set \"BACKUP=" + escapeWindowsBatchSetValue(backupJar.toAbsolutePath().toString()) + "\"\r\n"
+        + "set \"JAVA_EXE=" + escapeWindowsBatchSetValue(relaunchJavaExe.toAbsolutePath().toString()) + "\"\r\n"
         + "for /L %%i in (1,1,20) do (\r\n"
         + "  tasklist /FI \"PID eq %OLD_PID%\" 2>NUL | find /I \"%OLD_PID%\" >NUL\r\n"
         + "  if errorlevel 1 goto wait_done\r\n"
@@ -625,7 +890,12 @@ public final class GitHubReleaseUpdater {
         + "if \"%SWAPPED%\"==\"0\" (\r\n"
         + "  if exist \"%BACKUP%\" copy /Y \"%BACKUP%\" \"%TARGET%\" >NUL 2>&1\r\n"
         + ")\r\n"
-        + "start \"\" \"" + relaunchJavaExe.toAbsolutePath() + "\" -jar \"%TARGET%\"" + argsBuilder + "\r\n";
+        + "start \"\" \"%JAVA_EXE%\""
+        + jvmPropsBuilder
+        + " -jar \"%TARGET%\""
+        + argsBuilder
+        + "\r\n"
+        + "(goto) 2>nul & del /F /Q \"%~f0\"\r\n";
   }
 
   /** Builds the POSIX {@code /bin/sh} swap-and-relaunch script (with automatic backup rollback). */
@@ -636,9 +906,37 @@ public final class GitHubReleaseUpdater {
       Path backupJar,
       Path relaunchJavaExe,
       List<String> relaunchArgs) {
+    return buildPosixSwapScript(
+        oldPid,
+        targetJar,
+        stagedJar,
+        backupJar,
+        relaunchJavaExe,
+        relaunchArgs,
+        collectFluxSystemProperties());
+  }
+
+  static String buildPosixSwapScript(
+      long oldPid,
+      Path targetJar,
+      Path stagedJar,
+      Path backupJar,
+      Path relaunchJavaExe,
+      List<String> relaunchArgs,
+      Map<String, String> fluxJvmProperties) {
+    StringBuilder jvmPropsBuilder = new StringBuilder();
+    if (fluxJvmProperties != null) {
+      for (Map.Entry<String, String> entry : new TreeMap<>(fluxJvmProperties).entrySet()) {
+        jvmPropsBuilder
+            .append(' ')
+            .append(SshRobotTransport.shQuote("-D" + entry.getKey() + "=" + entry.getValue()));
+      }
+    }
     StringBuilder argsBuilder = new StringBuilder();
-    for (String arg : relaunchArgs) {
-      argsBuilder.append(' ').append(SshRobotTransport.shQuote(arg));
+    if (relaunchArgs != null) {
+      for (String arg : relaunchArgs) {
+        argsBuilder.append(' ').append(SshRobotTransport.shQuote(arg));
+      }
     }
     return "#!/bin/sh\n"
         + "OLD_PID=" + oldPid + "\n"
@@ -655,9 +953,11 @@ public final class GitHubReleaseUpdater {
         + "fi\n"
         + "nohup "
         + SshRobotTransport.shQuote(relaunchJavaExe.toAbsolutePath().toString())
+        + jvmPropsBuilder
         + " -jar \"$TARGET\""
         + argsBuilder
-        + " </dev/null >/dev/null 2>&1 &\n";
+        + " </dev/null >/dev/null 2>&1 &\n"
+        + "rm -f \"$0\"\n";
   }
 
   private static void spawnPlatformSwapHelper(
@@ -677,7 +977,11 @@ public final class GitHubReleaseUpdater {
           buildWindowsSwapScript(
               currentPid, targetJar, stagedJar, backupJar, relaunchJavaExe, relaunchArgs),
           StandardCharsets.UTF_8);
-      new ProcessBuilder("cmd.exe", "/c", "start", "", "/B", script.toAbsolutePath().toString())
+      File nul = new File("NUL");
+      new ProcessBuilder(buildWindowsHelperLaunchCommand(script))
+          .redirectInput(ProcessBuilder.Redirect.from(nul))
+          .redirectOutput(ProcessBuilder.Redirect.to(nul))
+          .redirectError(ProcessBuilder.Redirect.to(nul))
           .start();
     } else {
       Path script = Files.createTempFile("fluxtray-apply-update-", ".sh");
@@ -700,18 +1004,58 @@ public final class GitHubReleaseUpdater {
     return new MapFields(tag, draft, prerelease);
   }
 
-  /** Extracts each JSON object inside a named top-level array field (e.g., {@code "assets": [...]}). */
-  private static List<String> extractArrayObjects(String json, String fieldName) {
+  /** Extracts each JSON object inside a named top-level array field (ignoring string literals). */
+  static List<String> extractArrayObjects(String json, String fieldName) {
     List<String> objects = new ArrayList<>();
-    String keyToken = "\"" + fieldName + "\"";
-    int keyIdx = json.indexOf(keyToken);
-    if (keyIdx < 0) {
+    if (json == null || fieldName == null) {
       return objects;
     }
-    int openBracket = json.indexOf('[', keyIdx + keyToken.length());
-    if (openBracket < 0) {
+    int len = json.length();
+    int i = skipJsonWhitespace(json, 0);
+    if (i >= len || json.charAt(i) != '{') {
       return objects;
     }
+    i++;
+    while (i < len) {
+      i = skipJsonWhitespace(json, i);
+      if (i >= len || json.charAt(i) == '}') {
+        break;
+      }
+      if (json.charAt(i) != '"') {
+        break;
+      }
+      StringBuilder keyBuf = new StringBuilder();
+      int afterKey = readJsonStringToken(json, i, keyBuf);
+      if (afterKey < 0) {
+        break;
+      }
+      i = skipJsonWhitespace(json, afterKey);
+      if (i >= len || json.charAt(i) != ':') {
+        break;
+      }
+      i = skipJsonWhitespace(json, i + 1);
+      if (i >= len) {
+        break;
+      }
+      if (fieldName.equals(keyBuf.toString()) && json.charAt(i) == '[') {
+        return collectTopLevelObjectsInArray(json, i);
+      }
+      int afterVal = skipJsonValue(json, i);
+      if (afterVal < 0) {
+        break;
+      }
+      i = skipJsonWhitespace(json, afterVal);
+      if (i < len && json.charAt(i) == ',') {
+        i++;
+      } else {
+        break;
+      }
+    }
+    return objects;
+  }
+
+  private static List<String> collectTopLevelObjectsInArray(String json, int openBracket) {
+    List<String> objects = new ArrayList<>();
     int depth = 0;
     int objStart = -1;
     boolean inQuotes = false;
@@ -748,5 +1092,100 @@ public final class GitHubReleaseUpdater {
       }
     }
     return objects;
+  }
+
+  private static int skipJsonWhitespace(String s, int idx) {
+    while (idx < s.length() && Character.isWhitespace(s.charAt(idx))) {
+      idx++;
+    }
+    return idx;
+  }
+
+  private static int readJsonStringToken(String s, int openQuote, StringBuilder out) {
+    int i = openQuote + 1;
+    while (i < s.length()) {
+      char c = s.charAt(i++);
+      if (c == '\\') {
+        if (i >= s.length()) {
+          return -1;
+        }
+        char esc = s.charAt(i++);
+        switch (esc) {
+          case '"', '\\', '/' -> out.append(esc);
+          case 'n' -> out.append('\n');
+          case 'r' -> out.append('\r');
+          case 't' -> out.append('\t');
+          case 'b' -> out.append('\b');
+          case 'f' -> out.append('\f');
+          case 'u' -> {
+            if (i + 4 > s.length()) {
+              return -1;
+            }
+            try {
+              out.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
+            } catch (NumberFormatException e) {
+              return -1;
+            }
+            i += 4;
+          }
+          default -> out.append(esc);
+        }
+      } else if (c == '"') {
+        return i;
+      } else {
+        out.append(c);
+      }
+    }
+    return -1;
+  }
+
+  private static int skipJsonValue(String s, int idx) {
+    if (idx >= s.length()) {
+      return -1;
+    }
+    char c = s.charAt(idx);
+    if (c == '"') {
+      return readJsonStringToken(s, idx, new StringBuilder());
+    }
+    if (c == '{' || c == '[') {
+      int depth = 0;
+      boolean inQuotes = false;
+      boolean escaped = false;
+      for (int i = idx; i < s.length(); i++) {
+        char ch = s.charAt(i);
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (inQuotes) {
+          if (ch == '\\') {
+            escaped = true;
+          } else if (ch == '"') {
+            inQuotes = false;
+          }
+          continue;
+        }
+        if (ch == '"') {
+          inQuotes = true;
+        } else if (ch == '{' || ch == '[') {
+          depth++;
+        } else if (ch == '}' || ch == ']') {
+          depth--;
+          if (depth == 0) {
+            return i + 1;
+          }
+        }
+      }
+      return -1;
+    }
+    int i = idx;
+    while (i < s.length()) {
+      char ch = s.charAt(i);
+      if (ch == ',' || ch == '}' || ch == ']' || Character.isWhitespace(ch)) {
+        break;
+      }
+      i++;
+    }
+    return i > idx ? i : -1;
   }
 }
