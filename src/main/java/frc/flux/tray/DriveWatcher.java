@@ -12,17 +12,21 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 /**
  * Watches the synced Google Drive {@code code/} folder (and {@code code/configs/*.csv}) with
- * SHA-256 2-poll stabilization, persisted applied/rejected state hashes in {@code
- * drive-watcher-state.json}, local fail-closed validation, pull-pending-logs-FIRST before mutating
- * the robot, atomic deploy + restart, and a {@code >= 25 s} empty-{@code code/} rollback debounce.
+ * SHA-256 2-poll stabilization, per-robot persisted applied state and global rejected latches in
+ * {@code drive-watcher-state.json}, local fail-closed validation, pull-pending-logs-FIRST before
+ * mutating the robot, atomic deploy + restart, and a {@code >= 25 s} empty-{@code code/} rollback
+ * debounce. Supports offline-first sync on home Wi-Fi followed by automatic deploy upon connecting
+ * to each robot ({@code FUEL}, {@code CORAL}, etc.).
  */
 public final class DriveWatcher {
 
@@ -33,6 +37,9 @@ public final class DriveWatcher {
   public static final String STATE_FILE_NAME = "drive-watcher-state.json";
   public static final String PARTIAL_CONFIGS_ERROR_MESSAGE =
       "code/configs/ requires full config folder including parameters.csv";
+  private static final String ROBOT_PKG_KEY_PREFIX = "robotPkg.";
+  private static final String ROBOT_CFG_KEY_PREFIX = "robotCfg.";
+  private static final String ROBOT_ACTIVE_KEY_PREFIX = "robotActivePkg.";
 
   public enum ActionType {
     NONE,
@@ -71,7 +78,8 @@ public final class DriveWatcher {
   private int stablePackagePolls = 0;
   private String lastAppliedPackageHash = null;
   private String lastRejectedPackageHash = null;
-  private boolean hadActivePackage = false;
+  private final Map<String, String> appliedPackageHashByRobot = new LinkedHashMap<>();
+  private final Map<String, Boolean> hadActivePackageByRobot = new LinkedHashMap<>();
   private int emptyPackagePolls = 0;
   private long emptyCodeSinceMs = -1L;
   private CachedFileFingerprint cachedPkgFingerprint = null;
@@ -83,10 +91,12 @@ public final class DriveWatcher {
   private int stableConfigsPolls = 0;
   private String lastAppliedConfigsHash = null;
   private String lastRejectedConfigsHash = null;
+  private final Map<String, String> appliedConfigsHashByRobot = new LinkedHashMap<>();
   private String cachedConfigsMetadataSignature = null;
   private String cachedConfigsHash = null;
   private String lastValidatedConfigsHash = null;
 
+  private String connectedRobotId = null;
   private long nextReachableProbeAllowedMs = 0L;
   private long currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
 
@@ -178,8 +188,24 @@ public final class DriveWatcher {
     return stateFile;
   }
 
-  /** Clears unreachable-robot probe backoff (called immediately when NT4 reconnects). */
+  /**
+   * Clears unreachable-robot probe backoff and cached robot identity (called immediately when NT4
+   * connects or reconnects so swapping between robots such as {@code FUEL} and {@code CORAL}
+   * resolves the newly connected robot).
+   */
+  public synchronized void onRobotConnected() {
+    connectedRobotId = null;
+    resetUnreachableBackoff();
+  }
+
+  /** Clears cached robot identity when disconnected so the next connected robot is re-identified. */
+  public synchronized void onRobotDisconnected() {
+    connectedRobotId = null;
+  }
+
+  /** Clears unreachable-robot probe backoff and cached robot identity. */
   public synchronized void resetUnreachableBackoff() {
+    connectedRobotId = null;
     nextReachableProbeAllowedMs = 0L;
     currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
   }
@@ -193,12 +219,60 @@ public final class DriveWatcher {
       return false;
     }
     if (robot.isReachable()) {
-      resetUnreachableBackoff();
+      nextReachableProbeAllowedMs = 0L;
+      currentUnreachableBackoffMs = INITIAL_UNREACHABLE_BACKOFF_MS;
       return true;
     }
+    connectedRobotId = null;
     nextReachableProbeAllowedMs = nowMs + currentUnreachableBackoffMs;
     currentUnreachableBackoffMs =
         Math.min(MAX_UNREACHABLE_BACKOFF_MS, currentUnreachableBackoffMs * 2L);
+    return false;
+  }
+
+  private String resolveConnectedRobotId(long nowMs) {
+    if (connectedRobotId != null) {
+      return connectedRobotId;
+    }
+    try {
+      String resolved = normalizeRobotKey(robot.detectRobotIdentity());
+      connectedRobotId = resolved;
+      return resolved;
+    } catch (IOException ioEx) {
+      connectedRobotId = null;
+      nextReachableProbeAllowedMs = nowMs + currentUnreachableBackoffMs;
+      currentUnreachableBackoffMs =
+          Math.min(MAX_UNREACHABLE_BACKOFF_MS, currentUnreachableBackoffMs * 2L);
+      return null;
+    }
+  }
+
+  private String defaultRobotKey() {
+    return "roborio-2026".equalsIgnoreCase(robot.controllerPlatform()) ? "FUEL" : "COMP_2027";
+  }
+
+  private String normalizeRobotKey(String raw) {
+    if (raw == null || raw.isBlank()) {
+      return defaultRobotKey();
+    }
+    String cleaned = raw.trim().toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_-]", "_");
+    return cleaned.isEmpty() ? defaultRobotKey() : cleaned;
+  }
+
+  private boolean isPackageAlreadyAppliedToConnectedRobot(String pkgHash) {
+    return connectedRobotId != null && pkgHash.equals(appliedPackageHashByRobot.get(connectedRobotId));
+  }
+
+  private boolean isConfigsAlreadyAppliedToConnectedRobot(String cfgHash) {
+    return connectedRobotId != null && cfgHash.equals(appliedConfigsHashByRobot.get(connectedRobotId));
+  }
+
+  private boolean hasAnyActivePackage() {
+    for (Boolean active : hadActivePackageByRobot.values()) {
+      if (Boolean.TRUE.equals(active)) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -211,7 +285,7 @@ public final class DriveWatcher {
         && cachedPkgFingerprint.lastModifiedMs() == mtime) {
       String cachedHash = cachedPkgFingerprint.sha256();
       boolean settled =
-          cachedHash.equals(lastAppliedPackageHash)
+          isPackageAlreadyAppliedToConnectedRobot(cachedHash)
               || cachedHash.equals(lastRejectedPackageHash)
               || (cachedHash.equals(pendingPackageHash)
                   && stablePackagePolls >= REQUIRED_STABLE_POLLS);
@@ -228,7 +302,7 @@ public final class DriveWatcher {
     String metaSig = csvDirectoryMetadataSignature(configsDir);
     if (metaSig.equals(cachedConfigsMetadataSignature) && cachedConfigsHash != null) {
       boolean settled =
-          cachedConfigsHash.equals(lastAppliedConfigsHash)
+          isConfigsAlreadyAppliedToConnectedRobot(cachedConfigsHash)
               || cachedConfigsHash.equals(lastRejectedConfigsHash)
               || (cachedConfigsHash.equals(pendingConfigsHash)
                   && stableConfigsPolls >= REQUIRED_STABLE_POLLS);
@@ -256,9 +330,9 @@ public final class DriveWatcher {
       emptyPackagePolls = 0;
       emptyCodeSinceMs = -1L;
       String pkgHash = resolvePackageHashCached(latestPkg);
-      if (pkgHash.equals(lastAppliedPackageHash)) {
-        if (!hadActivePackage) {
-          hadActivePackage = true;
+      if (isPackageAlreadyAppliedToConnectedRobot(pkgHash)) {
+        if (!Boolean.TRUE.equals(hadActivePackageByRobot.get(connectedRobotId))) {
+          hadActivePackageByRobot.put(connectedRobotId, Boolean.TRUE);
           persistStateQuietly();
         }
       } else if (!pkgHash.equals(lastRejectedPackageHash)) {
@@ -299,70 +373,106 @@ public final class DriveWatcher {
           if (!checkRobotReachableWithBackoff(nowMs)) {
             return new PollOutcome(ActionType.NONE, "Robot unreachable for package deploy", null);
           }
-          transferBusyCallback.accept(true);
-          try {
-            CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "package deploy");
-            PackageDeployer.DeployStamp stamp = deployer.deployPackage(latestPkg, robot, true);
-            lastAppliedPackageHash = pkgHash;
-            lastRejectedPackageHash = null;
+          String robotId = resolveConnectedRobotId(nowMs);
+          if (robotId == null) {
+            return new PollOutcome(ActionType.NONE, "Robot unreachable for package deploy", null);
+          }
+          if (pkgHash.equals(appliedPackageHashByRobot.get(robotId))) {
             pendingPackageHash = null;
             stablePackagePolls = 0;
-            hadActivePackage = true;
-            persistStateQuietly();
-            String msg =
-                "Deployed "
-                    + stamp.packageName()
-                    + " (git="
-                    + stamp.gitSha()
-                    + ", cfg="
-                    + stamp.configSha()
-                    + ") and restarted robot.";
-            notifications.notify("INFO", "FluxTray Deploy Complete", msg);
-            return new PollOutcome(ActionType.DEPLOYED_PACKAGE, msg, preLogs);
-          } finally {
-            transferBusyCallback.accept(false);
+            if (!Boolean.TRUE.equals(hadActivePackageByRobot.get(robotId))) {
+              hadActivePackageByRobot.put(robotId, Boolean.TRUE);
+              persistStateQuietly();
+            }
+          } else {
+            transferBusyCallback.accept(true);
+            try {
+              CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "package deploy");
+              PackageDeployer.DeployStamp stamp = deployer.deployPackage(latestPkg, robot, true);
+              appliedPackageHashByRobot.put(robotId, pkgHash);
+              hadActivePackageByRobot.put(robotId, Boolean.TRUE);
+              lastAppliedPackageHash = pkgHash;
+              lastRejectedPackageHash = null;
+              pendingPackageHash = null;
+              stablePackagePolls = 0;
+              persistStateQuietly();
+              String msg =
+                  "Deployed "
+                      + stamp.packageName()
+                      + " to "
+                      + robotId
+                      + " (git="
+                      + stamp.gitSha()
+                      + ", cfg="
+                      + stamp.configSha()
+                      + ") and restarted robot.";
+              notifications.notify("INFO", "FluxTray Deploy Complete", msg);
+              return new PollOutcome(ActionType.DEPLOYED_PACKAGE, msg, preLogs);
+            } finally {
+              transferBusyCallback.accept(false);
+            }
           }
+        } else {
+          return new PollOutcome(
+              ActionType.NONE, "Stabilizing package " + latestPkg.getFileName(), null);
         }
-        return new PollOutcome(ActionType.NONE, "Stabilizing package " + latestPkg.getFileName(), null);
       }
-    } else if (hadActivePackage) {
+    } else if (hasAnyActivePackage()) {
       pendingPackageHash = null;
       stablePackagePolls = 0;
-      if (emptyCodeSinceMs < 0L) {
-        emptyCodeSinceMs = nowMs;
-      }
-      emptyPackagePolls++;
-      long elapsedEmptyMs = nowMs - emptyCodeSinceMs;
-      if (emptyPackagePolls >= REQUIRED_STABLE_POLLS
-          && elapsedEmptyMs >= emptyCodeRollbackDelayMs) {
-        if (lockout.isEnabled() || lockout.isFmsAttached()) {
-          return new PollOutcome(
-              ActionType.DEFERRED_LOCKOUT, "Deferred Restore STABLE while Enabled/FMS", null);
+      boolean connectedRobotNeverHadPackage =
+          connectedRobotId != null
+              && !Boolean.TRUE.equals(hadActivePackageByRobot.get(connectedRobotId));
+      if (!connectedRobotNeverHadPackage) {
+        if (emptyCodeSinceMs < 0L) {
+          emptyCodeSinceMs = nowMs;
         }
-        if (!checkRobotReachableWithBackoff(nowMs)) {
-          return new PollOutcome(ActionType.NONE, "Robot unreachable for Restore STABLE", null);
-        }
-        transferBusyCallback.accept(true);
-        try {
-          CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "Restore STABLE");
-          if (robot.remoteFileExists("jars/prev_stable.jar")) {
-            deployer.restoreStable(robot);
-            hadActivePackage = false;
-            lastAppliedPackageHash = null;
-            emptyPackagePolls = 0;
-            emptyCodeSinceMs = -1L;
-            persistStateQuietly();
-            String msg = "code/ emptied — restored prev_stable.jar and restarted robot.";
-            notifications.notify("INFO", "FluxTray Restored STABLE", msg);
-            return new PollOutcome(ActionType.RESTORED_STABLE, msg, preLogs);
+        emptyPackagePolls++;
+        long elapsedEmptyMs = nowMs - emptyCodeSinceMs;
+        if (emptyPackagePolls >= REQUIRED_STABLE_POLLS
+            && elapsedEmptyMs >= emptyCodeRollbackDelayMs) {
+          if (lockout.isEnabled() || lockout.isFmsAttached()) {
+            return new PollOutcome(
+                ActionType.DEFERRED_LOCKOUT, "Deferred Restore STABLE while Enabled/FMS", null);
           }
-          hadActivePackage = false;
-          lastAppliedPackageHash = null;
-          emptyPackagePolls = 0;
-          emptyCodeSinceMs = -1L;
-          persistStateQuietly();
-        } finally {
-          transferBusyCallback.accept(false);
+          if (!checkRobotReachableWithBackoff(nowMs)) {
+            return new PollOutcome(ActionType.NONE, "Robot unreachable for Restore STABLE", null);
+          }
+          String robotId = resolveConnectedRobotId(nowMs);
+          if (robotId == null) {
+            return new PollOutcome(ActionType.NONE, "Robot unreachable for Restore STABLE", null);
+          }
+          if (Boolean.TRUE.equals(hadActivePackageByRobot.get(robotId))) {
+            transferBusyCallback.accept(true);
+            try {
+              CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "Restore STABLE");
+              if (robot.remoteFileExists("jars/prev_stable.jar")) {
+                deployer.restoreStable(robot);
+                hadActivePackageByRobot.remove(robotId);
+                appliedPackageHashByRobot.remove(robotId);
+                lastAppliedPackageHash =
+                    appliedPackageHashByRobot.isEmpty() ? null : lastAppliedPackageHash;
+                emptyPackagePolls = 0;
+                emptyCodeSinceMs = -1L;
+                persistStateQuietly();
+                String msg =
+                    "code/ emptied — restored prev_stable.jar on "
+                        + robotId
+                        + " and restarted robot.";
+                notifications.notify("INFO", "FluxTray Restored STABLE", msg);
+                return new PollOutcome(ActionType.RESTORED_STABLE, msg, preLogs);
+              }
+              hadActivePackageByRobot.remove(robotId);
+              appliedPackageHashByRobot.remove(robotId);
+              lastAppliedPackageHash =
+                  appliedPackageHashByRobot.isEmpty() ? null : lastAppliedPackageHash;
+              emptyPackagePolls = 0;
+              emptyCodeSinceMs = -1L;
+              persistStateQuietly();
+            } finally {
+              transferBusyCallback.accept(false);
+            }
+          }
         }
       }
     }
@@ -370,7 +480,8 @@ public final class DriveWatcher {
     Path configsDir = codeDir.resolve("configs");
     if (Files.isDirectory(configsDir) && hasAnyCsvFile(configsDir)) {
       String cfgHash = resolveConfigsHashCached(configsDir);
-      if (!cfgHash.equals(lastAppliedConfigsHash) && !cfgHash.equals(lastRejectedConfigsHash)) {
+      if (!isConfigsAlreadyAppliedToConnectedRobot(cfgHash)
+          && !cfgHash.equals(lastRejectedConfigsHash)) {
         if (cfgHash.equals(pendingConfigsHash)) {
           stableConfigsPolls++;
         } else {
@@ -420,21 +531,36 @@ public final class DriveWatcher {
           if (!checkRobotReachableWithBackoff(nowMs)) {
             return new PollOutcome(ActionType.NONE, "Robot unreachable for config push", null);
           }
-          transferBusyCallback.accept(true);
-          try {
-            CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "config push");
-            String deployedSha =
-                deployer.pushFluxFigConfigs(configsDir, null, FluxFig.Mode.PRODUCTION, robot);
-            lastAppliedConfigsHash = cfgHash;
-            lastRejectedConfigsHash = null;
+          String robotId = resolveConnectedRobotId(nowMs);
+          if (robotId == null) {
+            return new PollOutcome(ActionType.NONE, "Robot unreachable for config push", null);
+          }
+          if (cfgHash.equals(appliedConfigsHashByRobot.get(robotId))) {
             pendingConfigsHash = null;
             stableConfigsPolls = 0;
-            persistStateQuietly();
-            String msg = "Pushed code/configs/*.csv (sha=" + deployedSha + ") and restarted robot.";
-            notifications.notify("INFO", "FluxTray Configs Pushed", msg);
-            return new PollOutcome(ActionType.PUSHED_CONFIGS, msg, preLogs);
-          } finally {
-            transferBusyCallback.accept(false);
+          } else {
+            transferBusyCallback.accept(true);
+            try {
+              CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "config push");
+              String deployedSha =
+                  deployer.pushFluxFigConfigs(configsDir, null, FluxFig.Mode.PRODUCTION, robot);
+              appliedConfigsHashByRobot.put(robotId, cfgHash);
+              lastAppliedConfigsHash = cfgHash;
+              lastRejectedConfigsHash = null;
+              pendingConfigsHash = null;
+              stableConfigsPolls = 0;
+              persistStateQuietly();
+              String msg =
+                  "Pushed code/configs/*.csv to "
+                      + robotId
+                      + " (sha="
+                      + deployedSha
+                      + ") and restarted robot.";
+              notifications.notify("INFO", "FluxTray Configs Pushed", msg);
+              return new PollOutcome(ActionType.PUSHED_CONFIGS, msg, preLogs);
+            } finally {
+              transferBusyCallback.accept(false);
+            }
           }
         }
       }
@@ -496,8 +622,48 @@ public final class DriveWatcher {
       lastAppliedConfigsHash = blankToNull(m.get("lastAppliedConfigsHash"));
       lastRejectedPackageHash = blankToNull(m.get("lastRejectedPackageHash"));
       lastRejectedConfigsHash = blankToNull(m.get("lastRejectedConfigsHash"));
-      hadActivePackage =
-          "true".equalsIgnoreCase(m.get("hadActivePackage")) || lastAppliedPackageHash != null;
+
+      boolean sawPerRobotEntries = false;
+      for (Map.Entry<String, String> entry : m.entrySet()) {
+        String key = entry.getKey();
+        if (key.startsWith(ROBOT_PKG_KEY_PREFIX)) {
+          String robotKey = normalizeRobotKey(key.substring(ROBOT_PKG_KEY_PREFIX.length()));
+          String val = blankToNull(entry.getValue());
+          if (val != null) {
+            appliedPackageHashByRobot.put(robotKey, val);
+            sawPerRobotEntries = true;
+          }
+        } else if (key.startsWith(ROBOT_CFG_KEY_PREFIX)) {
+          String robotKey = normalizeRobotKey(key.substring(ROBOT_CFG_KEY_PREFIX.length()));
+          String val = blankToNull(entry.getValue());
+          if (val != null) {
+            appliedConfigsHashByRobot.put(robotKey, val);
+            sawPerRobotEntries = true;
+          }
+        } else if (key.startsWith(ROBOT_ACTIVE_KEY_PREFIX)) {
+          String robotKey = normalizeRobotKey(key.substring(ROBOT_ACTIVE_KEY_PREFIX.length()));
+          if ("true".equalsIgnoreCase(entry.getValue())) {
+            hadActivePackageByRobot.put(robotKey, Boolean.TRUE);
+            sawPerRobotEntries = true;
+          }
+        }
+      }
+      if (!sawPerRobotEntries) {
+        String fallbackRobot = defaultRobotKey();
+        if (lastAppliedPackageHash != null) {
+          appliedPackageHashByRobot.put(fallbackRobot, lastAppliedPackageHash);
+          hadActivePackageByRobot.put(fallbackRobot, Boolean.TRUE);
+        } else if ("true".equalsIgnoreCase(m.get("hadActivePackage"))) {
+          hadActivePackageByRobot.put(fallbackRobot, Boolean.TRUE);
+        }
+        if (lastAppliedConfigsHash != null) {
+          appliedConfigsHashByRobot.put(fallbackRobot, lastAppliedConfigsHash);
+        }
+      } else {
+        for (String robotKey : appliedPackageHashByRobot.keySet()) {
+          hadActivePackageByRobot.putIfAbsent(robotKey, Boolean.TRUE);
+        }
+      }
     } catch (IOException ignored) {
     }
   }
@@ -510,23 +676,45 @@ public final class DriveWatcher {
       if (stateFile.getParent() != null) {
         Files.createDirectories(stateFile.getParent());
       }
-      String json =
-          "{\n"
-              + "  \"lastAppliedPackageHash\": \""
-              + esc(lastAppliedPackageHash)
-              + "\",\n"
-              + "  \"lastAppliedConfigsHash\": \""
-              + esc(lastAppliedConfigsHash)
-              + "\",\n"
-              + "  \"lastRejectedPackageHash\": \""
-              + esc(lastRejectedPackageHash)
-              + "\",\n"
-              + "  \"lastRejectedConfigsHash\": \""
-              + esc(lastRejectedConfigsHash)
-              + "\",\n"
-              + "  \"hadActivePackage\": "
-              + hadActivePackage
-              + "\n}\n";
+      StringBuilder sb = new StringBuilder(512);
+      sb.append("{\n");
+      sb.append("  \"lastAppliedPackageHash\": \"").append(esc(lastAppliedPackageHash)).append("\",\n");
+      sb.append("  \"lastAppliedConfigsHash\": \"").append(esc(lastAppliedConfigsHash)).append("\",\n");
+      sb.append("  \"lastRejectedPackageHash\": \"").append(esc(lastRejectedPackageHash)).append("\",\n");
+      sb.append("  \"lastRejectedConfigsHash\": \"").append(esc(lastRejectedConfigsHash)).append("\",\n");
+      sb.append("  \"hadActivePackage\": ").append(hasAnyActivePackage());
+      TreeSet<String> allRobots = new TreeSet<>();
+      allRobots.addAll(appliedPackageHashByRobot.keySet());
+      allRobots.addAll(appliedConfigsHashByRobot.keySet());
+      allRobots.addAll(hadActivePackageByRobot.keySet());
+      for (String robotKey : allRobots) {
+        String pkg = appliedPackageHashByRobot.get(robotKey);
+        if (pkg != null) {
+          sb.append(",\n  \"")
+              .append(ROBOT_PKG_KEY_PREFIX)
+              .append(esc(robotKey))
+              .append("\": \"")
+              .append(esc(pkg))
+              .append("\"");
+        }
+        String cfg = appliedConfigsHashByRobot.get(robotKey);
+        if (cfg != null) {
+          sb.append(",\n  \"")
+              .append(ROBOT_CFG_KEY_PREFIX)
+              .append(esc(robotKey))
+              .append("\": \"")
+              .append(esc(cfg))
+              .append("\"");
+        }
+        if (Boolean.TRUE.equals(hadActivePackageByRobot.get(robotKey))) {
+          sb.append(",\n  \"")
+              .append(ROBOT_ACTIVE_KEY_PREFIX)
+              .append(esc(robotKey))
+              .append("\": true");
+        }
+      }
+      sb.append("\n}\n");
+      String json = sb.toString();
       Path tmp = stateFile.resolveSibling(stateFile.getFileName().toString() + ".tmp");
       Files.writeString(tmp, json, StandardCharsets.UTF_8);
       try {

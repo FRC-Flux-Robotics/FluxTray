@@ -1209,8 +1209,9 @@ public final class FluxTrayMain {
           boolean conn = ntClient.isConnected();
           ntConnected.set(conn);
           if (conn) {
-            driveWatcher.resetUnreachableBackoff();
+            driveWatcher.onRobotConnected();
           } else {
+            driveWatcher.onRobotDisconnected();
             // Return icon to Gray on disconnect while robot-side /tmp/flux-robot-state stays fail-closed,
             // and trigger the 15 s debrief auto-stop/spool window if the robot breaker dropped mid-recording.
             displayedEnabled.set(false);

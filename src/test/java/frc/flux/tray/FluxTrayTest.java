@@ -127,7 +127,8 @@ public final class FluxTrayTest {
       testCrashBootRecoveryAllowsDeployAndRestoreWhenNoRobotJvmRunning();
       testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout();
       testReadDiagnosticsUsesBusyBoxSafeDfKilobytes();
-      System.out.println("FluxTrayTest: ALL 35 SUITES PASSED");
+      testDriveWatcherOfflineSyncAndPerRobotMultiChassisUpdates();
+      System.out.println("FluxTrayTest: ALL 36 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -4110,6 +4111,295 @@ public final class FluxTrayTest {
         transport.runLocalProcess(List.of("/bin/sh", "-c", awkTest), null, Duration.ofSeconds(5));
     assertEquals(0, awkRes.exitCode(), "Wrapped BusyBox df -k awk parser exits 0");
     assertEquals("/dev/ubi0_0|400|500", awkRes.stdout().trim(), "Wrapped BusyBox df -k parses MB");
+  }
+
+  private static void testDriveWatcherOfflineSyncAndPerRobotMultiChassisUpdates() throws Exception {
+    Path temp = createTempDir("fluxtray-offline-multirobot-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer fuel = new MockRobotServer(temp.resolve("rio-fuel"), "roborio-2026");
+    fuel.setRobotIdentityFile("FUEL");
+    fuel.setRobotStateFile(false, false, "FUEL");
+    fuel.setReachable(false);
+
+    MockRobotServer coral = new MockRobotServer(temp.resolve("rio-coral"), "roborio-2026");
+    coral.setRobotIdentityFile("CORAL");
+    coral.setRobotStateFile(false, false, "CORAL");
+    coral.setReachable(true);
+
+    MockRobotServer chassis3 = new MockRobotServer(temp.resolve("rio-chassis3"), "roborio-2026");
+    chassis3.setRobotIdentityFile("CHASSIS_3");
+    chassis3.setRobotStateFile(false, false, "CHASSIS_3");
+    chassis3.setReachable(true);
+
+    AtomicReference<MockRobotServer> activeRobot = new AtomicReference<>(fuel);
+    RobotTransport switchableRobot =
+        new RobotTransport() {
+          @Override
+          public String controllerPlatform() {
+            return activeRobot.get().controllerPlatform();
+          }
+
+          @Override
+          public String currentBootEpochId() {
+            return activeRobot.get().currentBootEpochId();
+          }
+
+          @Override
+          public boolean isReachable() {
+            return activeRobot.get().isReachable();
+          }
+
+          @Override
+          public void assertRobotDisabledForTransfer(String operationName) throws IOException {
+            activeRobot.get().assertRobotDisabledForTransfer(operationName);
+          }
+
+          @Override
+          public String readRemoteText(String remoteRelativePath) throws IOException {
+            return activeRobot.get().readRemoteText(remoteRelativePath);
+          }
+
+          @Override
+          public void writeRemoteText(String remoteRelativePath, String content) throws IOException {
+            activeRobot.get().writeRemoteText(remoteRelativePath, content);
+          }
+
+          @Override
+          public void uploadFile(Path localFile, String remoteRelativePath) throws IOException {
+            activeRobot.get().uploadFile(localFile, remoteRelativePath);
+          }
+
+          @Override
+          public void uploadFileAtomic(Path localFile, String remoteRelativePath) throws IOException {
+            activeRobot.get().uploadFileAtomic(localFile, remoteRelativePath);
+          }
+
+          @Override
+          public void replaceRemoteDirectoryAtomic(Path localDir, String remoteRelativeDir)
+              throws IOException {
+            activeRobot.get().replaceRemoteDirectoryAtomic(localDir, remoteRelativeDir);
+          }
+
+          @Override
+          public boolean copyRemoteFile(String fromRelativePath, String toRelativePath)
+              throws IOException {
+            return activeRobot.get().copyRemoteFile(fromRelativePath, toRelativePath);
+          }
+
+          @Override
+          public boolean copyRemoteDirectory(String fromRelativeDir, String toRelativeDir)
+              throws IOException {
+            return activeRobot.get().copyRemoteDirectory(fromRelativeDir, toRelativeDir);
+          }
+
+          @Override
+          public boolean remoteFileExists(String remoteRelativePath) throws IOException {
+            return activeRobot.get().remoteFileExists(remoteRelativePath);
+          }
+
+          @Override
+          public boolean deleteRemoteFile(String remoteRelativePath) throws IOException {
+            return activeRobot.get().deleteRemoteFile(remoteRelativePath);
+          }
+
+          @Override
+          public void restartRobotCode() throws IOException {
+            activeRobot.get().restartRobotCode();
+          }
+
+          @Override
+          public List<String> listRemoteLogFiles() throws IOException {
+            return activeRobot.get().listRemoteLogFiles();
+          }
+
+          @Override
+          public List<RemoteLogEntry> listRemoteLogEntries() throws IOException {
+            return activeRobot.get().listRemoteLogEntries();
+          }
+
+          @Override
+          public Map<String, Path> downloadAllLogs(Path localDestinationDir) throws IOException {
+            return activeRobot.get().downloadAllLogs(localDestinationDir);
+          }
+
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RemoteLogEntry> entries, Path localDestinationDir) throws IOException {
+            return activeRobot.get().downloadSelectedLogs(entries, localDestinationDir);
+          }
+
+          @Override
+          public String captureSystemSnapshotRaw() throws IOException {
+            return activeRobot.get().captureSystemSnapshotRaw();
+          }
+        };
+
+    // Stage both a new package and config overlay offline while disconnected from every robot.
+    Path pkgCfg = createSampleFluxFigConfigs(temp.resolve("pkg-cfg"), "Drivetrain", 60.0);
+    Path jar = temp.resolve("v2.jar");
+    Files.writeString(jar, "V2_OFFLINE_SYNC_JAR", StandardCharsets.UTF_8);
+    Path pkgZip =
+        PackageDeployer.createFluxPkgZip(
+            codeDir.resolve("STABLE_v2_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_v2", "roborio-2026", "STABLE", "abc2222", false, "cfg2222", "boris"),
+            jar,
+            pkgCfg);
+    createSampleFluxFigConfigs(codeDir.resolve("configs"), "Drivetrain", 55.0);
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+
+    DriveWatcher watcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            switchableRobot,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> {},
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+
+    long t = 1_763_670_000_000L;
+    for (int i = 0; i < 6; i++) {
+      assertEquals(
+          ActionType.NONE,
+          watcher.pollOnce(t + i * 1_000L).action(),
+          "Offline home-Wi-Fi poll " + i + " must stay NONE while robot disconnected");
+    }
+    assertEquals(1, watcher.packageValidationExtractCount(), "Offline ZIP validated once");
+    assertEquals(0, fuel.restartCount(), "FUEL untouched while disconnected");
+
+    // Connect FUEL offline from internet: deploys waiting package first, then waiting configs.
+    fuel.setReachable(true);
+    watcher.onRobotConnected();
+    assertEquals(
+        ActionType.DEPLOYED_PACKAGE,
+        watcher.pollOnce(t + 7_000L).action(),
+        "Connecting FUEL deploys queued offline package");
+    assertEquals(
+        ActionType.NONE,
+        watcher.pollOnce(t + 8_000L).action(),
+        "Queued configs stabilize poll 1 on FUEL");
+    assertEquals(
+        ActionType.PUSHED_CONFIGS,
+        watcher.pollOnce(t + 9_000L).action(),
+        "Queued configs push on FUEL");
+    assertEquals(
+        ActionType.NONE,
+        watcher.pollOnce(t + 10_000L).action(),
+        "FUEL stays idle once both package and configs are applied");
+    assertEquals(2, fuel.restartCount(), "FUEL restarted once for package and once for configs");
+
+    // Swap to CORAL across a simulated laptop reboot: must still deploy the SAME package & configs.
+    watcher.onRobotDisconnected();
+    activeRobot.set(coral);
+    DriveWatcher rebootedWatcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            switchableRobot,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> {},
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 20_000L).action(),
+        "Fresh watcher poll 1 stabilizes package for CORAL");
+    assertEquals(
+        ActionType.DEPLOYED_PACKAGE,
+        rebootedWatcher.pollOnce(t + 21_000L).action(),
+        "CORAL receives the same offline package already deployed to FUEL");
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 22_000L).action(),
+        "CORAL configs stabilize poll 1");
+    assertEquals(
+        ActionType.PUSHED_CONFIGS,
+        rebootedWatcher.pollOnce(t + 23_000L).action(),
+        "CORAL receives the same offline configs already pushed to FUEL");
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 24_000L).action(),
+        "CORAL stays idle once updated");
+    assertEquals(2, coral.restartCount(), "CORAL restarted once for package and once for configs");
+
+    // Reconnect FUEL: already up to date, zero redundant redeploys.
+    rebootedWatcher.onRobotDisconnected();
+    activeRobot.set(fuel);
+    rebootedWatcher.onRobotConnected();
+    for (int i = 0; i < 4; i++) {
+      assertEquals(
+          ActionType.NONE,
+          rebootedWatcher.pollOnce(t + 30_000L + i * 1_000L).action(),
+          "Reconnecting FUEL must not redeploy already-applied package/configs");
+    }
+    assertEquals(2, fuel.restartCount(), "FUEL restart count unchanged on reconnect");
+
+    // Emptying code/ (including configs/) rolls back FUEL and CORAL independently, without touching CHASSIS_3.
+    Files.deleteIfExists(pkgZip);
+    try (Stream<Path> cfgFiles = Files.list(codeDir.resolve("configs"))) {
+      for (Path f : cfgFiles.toList()) {
+        Files.deleteIfExists(f);
+      }
+    }
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 40_000L).action(),
+        "Empty code/ starts debounce for FUEL");
+    assertEquals(
+        ActionType.RESTORED_STABLE,
+        rebootedWatcher.pollOnce(t + 66_000L).action(),
+        "FUEL restores STABLE after 25 s empty-code debounce");
+    assertEquals(3, fuel.restartCount(), "FUEL restarted after Restore STABLE");
+
+    rebootedWatcher.onRobotDisconnected();
+    activeRobot.set(coral);
+    rebootedWatcher.onRobotConnected();
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 70_000L).action(),
+        "Empty code/ starts debounce for CORAL");
+    assertEquals(
+        ActionType.RESTORED_STABLE,
+        rebootedWatcher.pollOnce(t + 96_000L).action(),
+        "CORAL also restores STABLE independently");
+    assertEquals(3, coral.restartCount(), "CORAL restarted after Restore STABLE");
+
+    rebootedWatcher.onRobotDisconnected();
+    activeRobot.set(chassis3);
+    rebootedWatcher.onRobotConnected();
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 100_000L).action(),
+        "Untouched CHASSIS_3 does not trigger spurious rollback");
+    assertEquals(
+        ActionType.NONE,
+        rebootedWatcher.pollOnce(t + 130_000L).action(),
+        "Untouched CHASSIS_3 stays idle after 30 s");
+    assertEquals(0, chassis3.restartCount(), "CHASSIS_3 was never restarted");
+    audio.close();
   }
 
   private static byte[] encodeNt4IntFrame(int topicId, long timestampUs, int intVal) {
