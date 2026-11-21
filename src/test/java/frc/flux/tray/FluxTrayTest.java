@@ -124,7 +124,10 @@ public final class FluxTrayTest {
       testHb13SingleInstanceLockContentionAndRelease();
       testHb14LockedDriverStationLogSkippedWithoutAbortingPull();
       testHb15DriveWatcherCachesValidationAndBacksOffWhenUnreachable();
-      System.out.println("FluxTrayTest: ALL 32 SUITES PASSED");
+      testCrashBootRecoveryAllowsDeployAndRestoreWhenNoRobotJvmRunning();
+      testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout();
+      testReadDiagnosticsUsesBusyBoxSafeDfKilobytes();
+      System.out.println("FluxTrayTest: ALL 35 SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
@@ -3860,6 +3863,253 @@ public final class FluxTrayTest {
         watcher.packageValidationExtractCount(),
         "Cached validation avoids redundant ZIP re-extraction on reconnect");
     audio.close();
+  }
+
+  private static void testCrashBootRecoveryAllowsDeployAndRestoreWhenNoRobotJvmRunning()
+      throws Exception {
+    long remoteNowSec = 1_763_660_000L;
+    AtomicReference<String> probeResponse = new AtomicReference<>("");
+    SshRobotTransport.ProcessRunner stubRunner =
+        (argv, stdin, timeout) -> {
+          String cmd = argv.get(argv.size() - 1);
+          if (cmd.contains("HEARTBEAT_PRESENT=")) {
+            return new SshRobotTransport.ProcessResult(0, probeResponse.get(), "");
+          }
+          return new SshRobotTransport.ProcessResult(0, "OK\n", "");
+        };
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    SshRobotTransport transport =
+        new SshRobotTransport(
+            List.of("10.104.13.2"), false, lockout, false, "/tmp/flux-robot-state", stubRunner);
+
+    // Absent heartbeat + ROBOT_JVM_RUNNING=0 (crash-booted robot): recovery transfer MUST proceed.
+    probeResponse.set("REMOTE_EPOCH_SEC=" + remoteNowSec + "\nROBOT_JVM_RUNNING=0\nHEARTBEAT_PRESENT=0\n");
+    transport.assertRobotDisabledForTransfer("crashRecoveryAbsent");
+
+    // Stale heartbeat + ROBOT_JVM_RUNNING=0: recovery transfer MUST proceed.
+    probeResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=0\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + ((remoteNowSec - 30L) * 1_000L)
+            + "\n");
+    transport.assertRobotDisabledForTransfer("crashRecoveryStale");
+
+    // Absent heartbeat + ROBOT_JVM_RUNNING=1 (live non-Flux JVM): MUST still fail closed.
+    probeResponse.set("REMOTE_EPOCH_SEC=" + remoteNowSec + "\nROBOT_JVM_RUNNING=1\nHEARTBEAT_PRESENT=0\n");
+    boolean blockedLiveAbsent = false;
+    try {
+      transport.assertRobotDisabledForTransfer("liveJvmAbsent");
+    } catch (IllegalStateException expected) {
+      blockedLiveAbsent = expected.getMessage().contains("LOCKOUT");
+    }
+    assertTrue(blockedLiveAbsent, "Absent heartbeat with live robot JVM must still fail closed");
+
+    // Stale heartbeat + ROBOT_JVM_RUNNING=1: MUST still fail closed.
+    probeResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=1\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + ((remoteNowSec - 30L) * 1_000L)
+            + "\n");
+    boolean blockedLiveStale = false;
+    try {
+      transport.assertRobotDisabledForTransfer("liveJvmStale");
+    } catch (IllegalStateException expected) {
+      blockedLiveStale = expected.getMessage().contains("LOCKOUT");
+    }
+    assertTrue(blockedLiveStale, "Stale heartbeat with live robot JVM must still fail closed");
+
+    // Fresh ENABLED heartbeat: ALWAYS blocked even if ROBOT_JVM_RUNNING=0 were somehow spoofed.
+    probeResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=0\nHEARTBEAT_PRESENT=1\nSTATE=ENABLED\nENABLED=true\nFMS=false\nEPOCH_MS="
+            + (remoteNowSec * 1_000L)
+            + "\n");
+    boolean blockedFreshEnabled = false;
+    try {
+      transport.assertRobotDisabledForTransfer("freshEnabled");
+    } catch (IllegalStateException expected) {
+      blockedFreshEnabled = expected.getMessage().contains("LOCKOUT");
+    }
+    assertTrue(blockedFreshEnabled, "Fresh ENABLED heartbeat must always block transfers");
+
+    // Inline guard script must contain the /proc/[0-9]*/comm crash-recovery check and stay valid POSIX sh.
+    String inlineGuard = transport.buildInlineHeartbeatGuard();
+    assertTrue(
+        inlineGuard.contains("/proc/[0-9]*/comm") && inlineGuard.contains("_jvm"),
+        "Inline guard must check /proc/[0-9]*/comm for running Java processes");
+    SshRobotTransport.ProcessResult syntaxCheck =
+        transport.runLocalProcess(
+            List.of("/bin/sh", "-n", "-c", inlineGuard + " && echo OK"),
+            null,
+            Duration.ofSeconds(5));
+    assertEquals(0, syntaxCheck.exitCode(), "Inline heartbeat guard must pass POSIX sh -n syntax check");
+  }
+
+  private static void testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-nonfatal-prepull-");
+    Path codeDir = temp.resolve("drive/code");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(codeDir);
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("FUEL");
+    rio.seedSimulatedMatchLogs("2026-11-21_12-00-00", "FUEL", "cafebabe");
+
+    AtomicBoolean failDownloadIo = new AtomicBoolean(true);
+    AtomicBoolean failListLockout = new AtomicBoolean(false);
+    RobotTransport flakyLogRobot =
+        new DelegatingRobotTransport(rio) {
+          @Override
+          public List<RobotTransport.RemoteLogEntry> listRemoteLogEntries() throws IOException {
+            if (failListLockout.get()) {
+              throw new IllegalStateException("LOCKOUT [/tmp/flux-robot-state]: Robot is ENABLED");
+            }
+            return super.listRemoteLogEntries();
+          }
+
+          @Override
+          public Map<String, Path> downloadSelectedLogs(
+              List<RobotTransport.RemoteLogEntry> entries, Path localDestinationDir)
+              throws IOException {
+            if (failDownloadIo.get()) {
+              throw new IOException("Simulated Drive/SSH log download failure");
+            }
+            return super.downloadSelectedLogs(entries, localDestinationDir);
+          }
+        };
+
+    Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
+    Path jar = temp.resolve("fix.jar");
+    Files.writeString(jar, "FIXED_PACKAGE_JAR", StandardCharsets.UTF_8);
+    PackageDeployer.createFluxPkgZip(
+        codeDir.resolve("STABLE_fix_roborio-2026_fluxpkg.zip"),
+        new PackageManifest(
+            "STABLE_fix", "roborio-2026", "STABLE", "def5678", false, "cfg5678", "boris"),
+        jar,
+        cfg);
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(
+            temp.resolve("hub"),
+            stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME),
+            lockout,
+            audio);
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    List<String> notifications = new CopyOnWriteArrayList<>();
+    DriveWatcher watcher =
+        new DriveWatcher(
+            codeDir,
+            logsDir,
+            dsDir,
+            flakyLogRobot,
+            deployer,
+            runMgr,
+            lockout,
+            (lvl, title, msg) -> notifications.add(lvl + ":" + title + ":" + msg),
+            stateDir,
+            DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS);
+
+    long baseMs = 1_763_660_100_000L;
+    watcher.pollOnce(baseMs);
+    PollOutcome deployed = watcher.pollOnce(baseMs + 1_000L);
+    assertEquals(
+        ActionType.DEPLOYED_PACKAGE,
+        deployed.action(),
+        "Package deploy must still succeed when pre-deploy log pull hits IOException");
+    assertTrue(
+        notifications.stream().anyMatch(n -> n.contains("Pre-Deploy Log Pull Skipped")),
+        "Warning toast must be emitted when pre-deploy log pull is skipped");
+
+    // Manual Restore STABLE must also succeed when pre-restore log pull throws IOException.
+    int restartsBeforeRestore = rio.restartCount();
+    try (FluxTrayMain.TrayActionCoordinator coord =
+        new FluxTrayMain.TrayActionCoordinator(
+            flakyLogRobot,
+            deployer,
+            runMgr,
+            audio,
+            lockout,
+            dsDir,
+            logsDir,
+            stateDir.resolve("fluxtray.log"),
+            (lvl, title, msg) -> notifications.add(lvl + ":" + title + ":" + msg),
+            busy -> {})) {
+      coord.submitManualRestoreStable().get(5, TimeUnit.SECONDS);
+    }
+    assertEquals(
+        restartsBeforeRestore + 1,
+        rio.restartCount(),
+        "Manual Restore STABLE must still restore prev_stable and restart despite log pull IOException");
+    assertTrue(
+        notifications.stream().anyMatch(n -> n.contains("Pre-Restore Log Pull Skipped")),
+        "Warning toast must be emitted when pre-restore log pull is skipped");
+
+    // Safety LOCKOUT during pre-deploy log pull MUST still abort the deploy.
+    failDownloadIo.set(false);
+    failListLockout.set(true);
+    Files.writeString(jar, "LOCKOUT_TEST_JAR", StandardCharsets.UTF_8);
+    PackageDeployer.createFluxPkgZip(
+        codeDir.resolve("STABLE_fix2_roborio-2026_fluxpkg.zip"),
+        new PackageManifest(
+            "STABLE_fix2", "roborio-2026", "STABLE", "abc9999", false, "cfg9999", "boris"),
+        jar,
+        cfg);
+    watcher.pollOnce(baseMs + 3_000L);
+    boolean lockoutAborted = false;
+    try {
+      watcher.pollOnce(baseMs + 4_000L);
+    } catch (IllegalStateException expected) {
+      lockoutAborted = expected.getMessage().contains("LOCKOUT");
+    }
+    assertTrue(lockoutAborted, "Live LOCKOUT during pre-deploy log pull must abort deploy");
+    audio.close();
+  }
+
+  private static void testReadDiagnosticsUsesBusyBoxSafeDfKilobytes() throws Exception {
+    AtomicReference<String> capturedScript = new AtomicReference<>("");
+    SshRobotTransport.ProcessRunner runner =
+        (argv, stdin, timeout) -> {
+          String script = argv.get(argv.size() - 1);
+          capturedScript.set(script);
+          return new SshRobotTransport.ProcessResult(
+              0, "INT=285|450\nUSB=1|14800|15200\nWPI=3|4096\nHOOT=0|0\nPID=4321\nUP=up 5 min\n", "");
+        };
+    SshRobotTransport transport =
+        new SshRobotTransport(List.of("10.104.13.2"), false, null, false, runner);
+    RobotTransport.RobotDiagnostics diag = transport.readDiagnostics();
+    assertTrue(
+        !capturedScript.get().contains("df -Pm"),
+        "readDiagnostics must not use GNU-only df -Pm");
+    assertTrue(
+        capturedScript.get().contains("df -k "),
+        "readDiagnostics must use BusyBox-safe df -k");
+    assertEquals(285L, diag.internalFreeMb(), "Parsed internal free MB");
+    assertEquals(450L, diag.internalTotalMb(), "Parsed internal total MB");
+    assertTrue(diag.usbMounted(), "Parsed USB mounted flag");
+    assertEquals(14800L, diag.usbFreeMb(), "Parsed USB free MB");
+
+    // Verify wrapped 2-line BusyBox df -k output executes cleanly under real /bin/sh + awk.
+    String awkTest =
+        "printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\\n"
+            + "/dev/ubi0_0\\n"
+            + "  512000 102400 409600 20%% /\\n' | "
+            + "awk 'NR==1{next} NF==1{dev=$1; next} "
+            + "{if(dev==\"\"){dev=$1}; avail=int($(NF-2)/1024); tot=int($(NF-4)/1024); "
+            + "printf \"%s|%d|%d\\n\", dev, avail, tot; exit}'";
+    SshRobotTransport.ProcessResult awkRes =
+        transport.runLocalProcess(List.of("/bin/sh", "-c", awkTest), null, Duration.ofSeconds(5));
+    assertEquals(0, awkRes.exitCode(), "Wrapped BusyBox df -k awk parser exits 0");
+    assertEquals("/dev/ubi0_0|400|500", awkRes.stdout().trim(), "Wrapped BusyBox df -k parses MB");
   }
 
   private static byte[] encodeNt4IntFrame(int topicId, long timestampUs, int intVal) {

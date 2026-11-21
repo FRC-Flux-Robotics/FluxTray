@@ -82,7 +82,8 @@ public final class SshRobotTransport implements RobotTransport {
     }
   }
 
-  private record HeartbeatSample(boolean present, long remoteEpochSec, RobotStateHeartbeat heartbeat) {}
+  private record HeartbeatSample(
+      boolean present, long remoteEpochSec, RobotStateHeartbeat heartbeat, boolean robotJvmRunning) {}
 
   private final List<String> candidateHosts;
   private volatile String activeHost;
@@ -306,10 +307,16 @@ public final class SshRobotTransport implements RobotTransport {
     return readRobotStateHeartbeatWithClock().heartbeat();
   }
 
+  private static final String PROC_JAVA_RUNNING_SNIPPET =
+      "_jvm=0; for _c in /proc/[0-9]*/comm; do [ -r \"$_c\" ] && "
+          + "case \"$(cat \"$_c\" 2>/dev/null)\" in java*) _jvm=1; break;; esac; done";
+
   private HeartbeatSample readRobotStateHeartbeatWithClock() throws IOException {
     String quotedHb = shQuote(heartbeatFilePath);
     String cmd =
         "printf 'REMOTE_EPOCH_SEC=%s\\n' \"$(date +%s)\" && "
+            + PROC_JAVA_RUNNING_SNIPPET
+            + "; printf 'ROBOT_JVM_RUNNING=%s\\n' \"$_jvm\" && "
             + "if [ -f "
             + quotedHb
             + " ]; then printf 'HEARTBEAT_PRESENT=1\\n'; cat "
@@ -319,10 +326,14 @@ public final class SshRobotTransport implements RobotTransport {
     String out = runSshCommand(cmd);
     long remoteEpochSec = -1L;
     boolean present = false;
+    // Fail closed if the remote output omitted ROBOT_JVM_RUNNING (assume a robot JVM may be alive).
+    boolean robotJvmRunning = true;
     StringBuilder body = new StringBuilder();
     for (String line : out.split("\\R")) {
       if (line.startsWith("REMOTE_EPOCH_SEC=")) {
         remoteEpochSec = parseLongSafe(line.substring("REMOTE_EPOCH_SEC=".length()), -1L);
+      } else if (line.startsWith("ROBOT_JVM_RUNNING=")) {
+        robotJvmRunning = !"0".equals(line.substring("ROBOT_JVM_RUNNING=".length()).trim());
       } else if (line.startsWith("HEARTBEAT_PRESENT=")) {
         present = "1".equals(line.substring("HEARTBEAT_PRESENT=".length()).trim());
       } else {
@@ -330,14 +341,15 @@ public final class SshRobotTransport implements RobotTransport {
       }
     }
     if (!present) {
-      return new HeartbeatSample(false, remoteEpochSec, RobotStateHeartbeat.absent());
+      return new HeartbeatSample(
+          false, remoteEpochSec, RobotStateHeartbeat.absent(), robotJvmRunning);
     }
     RobotStateHeartbeat hb = RobotStateHeartbeat.parse(body.toString());
     if (!hb.present()) {
       // File existed on disk but was empty or whitespace-only; treat as present-but-corrupt.
       hb = new RobotStateHeartbeat(true, false, "CORRUPT", false, false, 0L, "", 0L);
     }
-    return new HeartbeatSample(true, remoteEpochSec, hb);
+    return new HeartbeatSample(true, remoteEpochSec, hb, robotJvmRunning);
   }
 
   @Override
@@ -347,19 +359,27 @@ public final class SshRobotTransport implements RobotTransport {
     }
     HeartbeatSample sample = readRobotStateHeartbeatWithClock();
     if (!sample.present()) {
-      if (allowMissingHeartbeat) {
+      if (allowMissingHeartbeat || !sample.robotJvmRunning()) {
         return;
       }
       throw new IllegalStateException(
-          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is ABSENT (fail-closed; pass --allow-missing-heartbeat only for initial bootstrap); blocked "
+          "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is ABSENT while robot JVM is running (fail-closed; pass --allow-missing-heartbeat only for initial bootstrap); blocked "
               + operationName);
     }
     RobotStateHeartbeat hb = sample.heartbeat();
     if (!hb.valid()) {
+      if (!sample.robotJvmRunning()) {
+        return;
+      }
       throw new IllegalStateException(
           "LOCKOUT [/tmp/flux-robot-state]: Heartbeat file is CORRUPT; blocked " + operationName);
     }
     if (hb.enabled() || hb.fmsAttached()) {
+      if (!sample.robotJvmRunning()
+          && sample.remoteEpochSec() > 0L
+          && hb.isStale(sample.remoteEpochSec() * 1_000L, HEARTBEAT_MAX_AGE_MS)) {
+        return;
+      }
       if (lockout != null) {
         lockout.updateState(hb.enabled(), hb.fmsAttached(), System.currentTimeMillis());
       }
@@ -374,6 +394,9 @@ public final class SshRobotTransport implements RobotTransport {
     }
     long remoteNowMs = sample.remoteEpochSec() * 1_000L;
     if (hb.isStale(remoteNowMs, HEARTBEAT_MAX_AGE_MS)) {
+      if (!sample.robotJvmRunning()) {
+        return;
+      }
       long ageMs = remoteNowMs - hb.epochMs();
       throw new IllegalStateException(
           "LOCKOUT [/tmp/flux-robot-state]: Heartbeat is STALE (age="
@@ -389,7 +412,8 @@ public final class SshRobotTransport implements RobotTransport {
    * Builds a pure POSIX/BusyBox shell guard checking {@code /tmp/flux-robot-state} atomically
    * inside the same SSH command immediately before a transfer, swap, or robot JVM restart. Uses
    * POSIX parameter expansion ({@code ${_ep%???}}) rather than 41-bit division so 32-bit BusyBox
-   * {@code ash} on ARMv7 roboRIO 2.0 never overflows.
+   * {@code ash} on ARMv7 roboRIO 2.0 never overflows, and permits crash-boot recovery when zero
+   * {@code java} process is running on the controller.
    */
   String buildInlineHeartbeatGuard() {
     String quotedHb = shQuote(heartbeatFilePath);
@@ -404,31 +428,45 @@ public final class SshRobotTransport implements RobotTransport {
             + "esac; done < "
             + quotedHb
             + "; "
+            + "_hb_valid=1; _hb_stale=0; "
+            + "case \"$_ep\" in ''|0*|*[!0-9]*) _hb_valid=0 ;; esac; "
+            + "if [ \"$_hb_valid\" -eq 1 ]; then "
+            + "_hb=${_ep%???}; [ -n \"$_hb\" ] || _hb=0; _now=$(date +%s); _age=$((_now - _hb)); "
+            + "if [ \"$_age\" -gt "
+            + HEARTBEAT_MAX_AGE_SEC
+            + " ] || [ \"$_age\" -lt -"
+            + HEARTBEAT_MAX_AGE_SEC
+            + " ]; then _hb_stale=1; fi; "
+            + "fi; "
+            + "if [ \"$_hb_valid\" -eq 0 ]; then "
+            + PROC_JAVA_RUNNING_SNIPPET
+            + "; [ \"$_jvm\" -eq 0 ] || { echo 'LOCKOUT: corrupt EPOCH_MS' >&2; exit "
+            + LOCKOUT_EXIT_CODE
+            + "; }; "
+            + "elif [ \"$_hb_stale\" -eq 1 ]; then "
+            + PROC_JAVA_RUNNING_SNIPPET
+            + "; [ \"$_jvm\" -eq 0 ] || { echo \"LOCKOUT: stale heartbeat age=${_age}s\" >&2; exit "
+            + LOCKOUT_EXIT_CODE
+            + "; }; "
+            + "else "
             + "[ \"$_st\" = 'DISABLED' ] && [ \"$_en\" = 'false' ] && [ \"$_fm\" = 'false' ] "
             + "|| { echo \"LOCKOUT: state=$_st enabled=$_en fms=$_fm\" >&2; exit "
             + LOCKOUT_EXIT_CODE
             + "; }; "
-            + "case \"$_ep\" in ''|0*|*[!0-9]*) echo 'LOCKOUT: corrupt EPOCH_MS' >&2; exit "
-            + LOCKOUT_EXIT_CODE
-            + ";; esac; "
-            + "_hb=${_ep%???}; [ -n \"$_hb\" ] || _hb=0; _now=$(date +%s); _age=$((_now - _hb)); "
-            + "[ \"$_age\" -le "
-            + HEARTBEAT_MAX_AGE_SEC
-            + " ] && [ \"$_age\" -ge -"
-            + HEARTBEAT_MAX_AGE_SEC
-            + " ] || { echo \"LOCKOUT: stale heartbeat age=${_age}s\" >&2; exit "
-            + LOCKOUT_EXIT_CODE
-            + "; }";
+            + "fi";
     if (allowMissingHeartbeat) {
       return "( if [ -f " + quotedHb + " ]; then " + verifyBody + "; fi )";
     }
-    return "( [ -f "
+    return "( if [ ! -f "
         + quotedHb
-        + " ] || { echo 'LOCKOUT: /tmp/flux-robot-state absent' >&2; exit "
+        + " ]; then "
+        + PROC_JAVA_RUNNING_SNIPPET
+        + "; [ \"$_jvm\" -eq 0 ] || { echo 'LOCKOUT: /tmp/flux-robot-state absent' >&2; exit "
         + LOCKOUT_EXIT_CODE
         + "; }; "
+        + "else "
         + verifyBody
-        + " )";
+        + "; fi )";
   }
 
   @Override
@@ -767,19 +805,29 @@ public final class SshRobotTransport implements RobotTransport {
   @Override
   public RobotDiagnostics readDiagnostics() throws IOException {
     String homeLogs = shQuote(remoteHomeDir + "/logs");
+    // BusyBox df on roboRIO 2.0 supports -k (not GNU -m) and may wrap long device names onto 2 lines.
+    String dfParseAwk =
+        "awk 'NR==1{next} NF==1{dev=$1; next} "
+            + "{if(dev==\"\"){dev=$1}; avail=int($(NF-2)/1024); tot=int($(NF-4)/1024); "
+            + "printf \"%s|%d|%d\\n\", dev, avail, tot; exit}'";
     String script =
-        "hdev=$(df -Pm "
+        "hinfo=$(df -k "
             + shQuote(remoteHomeDir)
-            + " 2>/dev/null | awk 'NR==2{print $1}'); "
-            + "df -Pm "
-            + shQuote(remoteHomeDir)
-            + " 2>/dev/null | awk 'NR==2{printf \"INT=%s|%s\\n\", $4, $2}'; "
+            + " 2>/dev/null | "
+            + dfParseAwk
+            + "); "
+            + "hdev=${hinfo%%|*}; "
+            + "hrest=${hinfo#*|}; "
+            + "[ -n \"$hinfo\" ] && printf 'INT=%s\\n' \"$hrest\"; "
             + "usb='0|-1|-1'; "
             + "for u in /U /media/sda1; do "
             + "  [ -d \"$u\" ] || continue; "
-            + "  udev=$(df -Pm \"$u\" 2>/dev/null | awk 'NR==2{print $1}'); "
+            + "  uinfo=$(df -k \"$u\" 2>/dev/null | "
+            + dfParseAwk
+            + "); "
+            + "  udev=${uinfo%%|*}; urest=${uinfo#*|}; "
             + "  if [ -n \"$udev\" ] && [ \"$udev\" != \"$hdev\" ]; then "
-            + "    usb=$(df -Pm \"$u\" 2>/dev/null | awk 'NR==2{printf \"1|%s|%s\", $4, $2}'); "
+            + "    usb=\"1|${urest}\"; "
             + "    break; "
             + "  fi; "
             + "done; "

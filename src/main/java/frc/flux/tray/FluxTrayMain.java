@@ -939,17 +939,38 @@ public final class FluxTrayMain {
             setBusySyncing(true);
             try {
               long nowMs = System.currentTimeMillis();
-              CompletedRunBundle preLogs =
-                  runMgr.pullDriveSafeRunZip(
-                      "prerestore_" + nowMs,
-                      null,
-                      robot,
-                      dsLogDir,
-                      logsDir,
-                      nowMs,
-                      false,
-                      true,
-                      true);
+              CompletedRunBundle preLogs = null;
+              try {
+                preLogs =
+                    runMgr.pullDriveSafeRunZip(
+                        "prerestore_" + nowMs,
+                        null,
+                        robot,
+                        dsLogDir,
+                        logsDir,
+                        nowMs,
+                        false,
+                        true,
+                        true);
+              } catch (IllegalStateException lockoutEx) {
+                String msg = lockoutEx.getMessage();
+                boolean isLockout =
+                    lockout.isEnabled()
+                        || lockout.isFmsAttached()
+                        || (msg != null && msg.toUpperCase(Locale.ROOT).contains("LOCKOUT"));
+                if (isLockout) {
+                  throw lockoutEx;
+                }
+                notify.notify(
+                    "WARN",
+                    "Pre-Restore Log Pull Skipped",
+                    "Continuing Restore STABLE after log pull error: " + msg);
+              } catch (Exception pullEx) {
+                notify.notify(
+                    "WARN",
+                    "Pre-Restore Log Pull Skipped",
+                    "Continuing Restore STABLE after log pull error: " + pullEx.getMessage());
+              }
               deployer.restoreStable(robot);
               String suffix =
                   (preLogs != null && preLogs.zipArchive() != null)

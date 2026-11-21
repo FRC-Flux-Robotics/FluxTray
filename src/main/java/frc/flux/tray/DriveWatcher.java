@@ -301,7 +301,7 @@ public final class DriveWatcher {
           }
           transferBusyCallback.accept(true);
           try {
-            CompletedRunBundle preLogs = pullPendingLogsBeforeMutating(nowMs);
+            CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "package deploy");
             PackageDeployer.DeployStamp stamp = deployer.deployPackage(latestPkg, robot, true);
             lastAppliedPackageHash = pkgHash;
             lastRejectedPackageHash = null;
@@ -344,7 +344,7 @@ public final class DriveWatcher {
         }
         transferBusyCallback.accept(true);
         try {
-          CompletedRunBundle preLogs = pullPendingLogsBeforeMutating(nowMs);
+          CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "Restore STABLE");
           if (robot.remoteFileExists("jars/prev_stable.jar")) {
             deployer.restoreStable(robot);
             hadActivePackage = false;
@@ -422,7 +422,7 @@ public final class DriveWatcher {
           }
           transferBusyCallback.accept(true);
           try {
-            CompletedRunBundle preLogs = pullPendingLogsBeforeMutating(nowMs);
+            CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "config push");
             String deployedSha =
                 deployer.pushFluxFigConfigs(configsDir, null, FluxFig.Mode.PRODUCTION, robot);
             lastAppliedConfigsHash = cfgHash;
@@ -441,6 +441,35 @@ public final class DriveWatcher {
     }
 
     return new PollOutcome(ActionType.NONE, "Idle", null);
+  }
+
+  private CompletedRunBundle pullPendingLogsBestEffort(long nowMs, String actionLabel) {
+    try {
+      return pullPendingLogsBeforeMutating(nowMs);
+    } catch (IllegalStateException lockoutEx) {
+      if (isSafetyLockoutError(lockoutEx)) {
+        throw lockoutEx;
+      }
+      notifications.notify(
+          "WARN",
+          "FluxTray Pre-Deploy Log Pull Skipped",
+          "Continuing " + actionLabel + " after pre-pull error: " + lockoutEx.getMessage());
+      return null;
+    } catch (IOException | RuntimeException ex) {
+      notifications.notify(
+          "WARN",
+          "FluxTray Pre-Deploy Log Pull Skipped",
+          "Continuing " + actionLabel + " after pre-pull error: " + ex.getMessage());
+      return null;
+    }
+  }
+
+  private boolean isSafetyLockoutError(IllegalStateException ex) {
+    if (lockout.isEnabled() || lockout.isFmsAttached()) {
+      return true;
+    }
+    String msg = ex.getMessage();
+    return msg != null && msg.toUpperCase(Locale.ROOT).contains("LOCKOUT");
   }
 
   private CompletedRunBundle pullPendingLogsBeforeMutating(long nowMs) throws IOException {
