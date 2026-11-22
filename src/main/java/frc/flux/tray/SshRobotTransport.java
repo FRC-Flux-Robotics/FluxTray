@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
@@ -95,6 +96,7 @@ public final class SshRobotTransport implements RobotTransport {
   private final boolean allowMissingHeartbeat;
   private final String heartbeatFilePath;
   private final ProcessRunner processRunner;
+  private final Predicate<String> tcpProbe;
   private final Set<Process> activeProcesses = ConcurrentHashMap.newKeySet();
   private final Set<String> createdRemoteDirs = ConcurrentHashMap.newKeySet();
 
@@ -148,6 +150,24 @@ public final class SshRobotTransport implements RobotTransport {
       boolean allowMissingHeartbeat,
       String heartbeatFilePath,
       ProcessRunner processRunner) {
+    this(
+        candidateHosts,
+        isSystemCore,
+        lockout,
+        allowMissingHeartbeat,
+        heartbeatFilePath,
+        processRunner,
+        null);
+  }
+
+  SshRobotTransport(
+      List<String> candidateHosts,
+      boolean isSystemCore,
+      RobotSafetyLockout lockout,
+      boolean allowMissingHeartbeat,
+      String heartbeatFilePath,
+      ProcessRunner processRunner,
+      Predicate<String> tcpProbe) {
     List<String> resolved =
         (candidateHosts == null || candidateHosts.isEmpty())
             ? (isSystemCore ? SYSTEMCORE_CANDIDATE_HOSTS : ROBORIO_CANDIDATE_HOSTS)
@@ -181,6 +201,12 @@ public final class SshRobotTransport implements RobotTransport {
                 return runLocalProcessToFile(argv, stdin, stdoutTargetFile, timeout);
               }
             };
+    // Live production transports probe TCP:22 before spawning ssh; stub ProcessRunner tests bypass
+    // socket probing unless an explicit tcpProbe is injected.
+    this.tcpProbe =
+        tcpProbe != null
+            ? tcpProbe
+            : (processRunner == null ? SshRobotTransport::isTcp22Reachable : ignoredHost -> true);
     if (lockout != null) {
       lockout.addAbortListener(this::abortActiveProcesses);
     }
@@ -257,18 +283,37 @@ public final class SshRobotTransport implements RobotTransport {
     activeProcesses.clear();
   }
 
+  /** Hints the active host from a live NT4 connection so SSH avoids probing dead addresses. */
+  public void preferHost(String host) {
+    if (host == null || host.isBlank()) {
+      return;
+    }
+    String trimmed = host.trim();
+    if (!candidateHosts.contains(trimmed)) {
+      return;
+    }
+    if (!trimmed.equals(activeHost)) {
+      createdRemoteDirs.clear();
+      activeHost = trimmed;
+    }
+  }
+
   /** Probes candidate hosts on TCP port 22 and caches the first reachable controller address. */
   public String discoverReachableHost() {
-    if (candidateHosts.size() == 1) {
-      activeHost = candidateHosts.get(0);
-      return activeHost;
-    }
+    String found = findReachableHostOrNull();
+    return found != null ? found : activeHost;
+  }
+
+  private String findReachableHostOrNull() {
     String current = activeHost;
-    if (current != null && isTcp22Reachable(current)) {
+    if (current != null && tcpProbe.test(current)) {
       return current;
     }
     for (String candidate : candidateHosts) {
-      if (isTcp22Reachable(candidate)) {
+      if (candidate.equals(current)) {
+        continue;
+      }
+      if (tcpProbe.test(candidate)) {
         if (!candidate.equals(activeHost)) {
           createdRemoteDirs.clear();
         }
@@ -276,7 +321,7 @@ public final class SshRobotTransport implements RobotTransport {
         return candidate;
       }
     }
-    return activeHost;
+    return null;
   }
 
   private static boolean isTcp22Reachable(String host) {
@@ -305,13 +350,16 @@ public final class SshRobotTransport implements RobotTransport {
 
   @Override
   public boolean isReachable() {
-    discoverReachableHost();
+    String host = findReachableHostOrNull();
+    if (host == null) {
+      return false;
+    }
     try {
-      String out = runSshCommand("echo OK");
+      String out = runSshCommandOnHost(host, "echo OK", null, COMMAND_TIMEOUT_SEC);
       return out.contains("OK");
     } catch (IOException e) {
       for (String candidate : candidateHosts) {
-        if (candidate.equals(activeHost)) {
+        if (candidate.equals(host) || !tcpProbe.test(candidate)) {
           continue;
         }
         try {
@@ -676,8 +724,12 @@ public final class SshRobotTransport implements RobotTransport {
     if (isSystemCore) {
       runSshCommand(
           guard
-              + " && (if command -v systemctl >/dev/null 2>&1; then sudo -n systemctl restart frc-robot </dev/null >/dev/null 2>&1 || systemctl restart frc-robot </dev/null >/dev/null 2>&1 || true; "
-              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then /usr/local/frc/bin/frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1; fi)");
+              + " && (if command -v systemctl >/dev/null 2>&1; then "
+              + "(sudo -n systemctl restart frc-robot </dev/null >/dev/null 2>&1 "
+              + "|| systemctl restart frc-robot </dev/null >/dev/null 2>&1); "
+              + "elif [ -x /usr/local/frc/bin/frcKillRobot.sh ]; then "
+              + "/usr/local/frc/bin/frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1; "
+              + "else echo 'No SystemCore robot restart mechanism found' >&2; exit 1; fi)");
     } else {
       runSshCommand(guard + " && /usr/local/frc/bin/frcKillRobot.sh -t -r </dev/null >/dev/null 2>&1");
     }
@@ -1023,8 +1075,9 @@ public final class SshRobotTransport implements RobotTransport {
     int slash = fullRemotePath.lastIndexOf('/');
     if (slash > 0) {
       String remoteParentDir = fullRemotePath.substring(0, slash);
-      if (createdRemoteDirs.add(remoteParentDir)) {
+      if (!createdRemoteDirs.contains(remoteParentDir)) {
         runSshCommand("mkdir -p " + shQuote(remoteParentDir));
+        createdRemoteDirs.add(remoteParentDir);
       }
     }
   }

@@ -92,49 +92,64 @@ public final class FluxTrayTest {
 
   public static void main(String[] args) throws Exception {
     try {
-      testSafetyLockoutAndAbort();
-      testPackageDeployAndRollbackRing();
-      testPracticeAndFmsCaptureSyncWorkflow();
-      testHealthyAndAnomalousSystemSnapshots();
-      testFluxFigTuningModeSwitchAndVersionPromotion();
-      testScoutingPwaAndSignedQrScanner();
-      testNt4WebSocketLiveLockoutAndOncePerDisableAutoPull();
-      testRoboRioRobotCommandAtomicDeployRestartAndRobotStateLockout();
-      testDriveWatcherIncrementalLedgerDsLogFilterAtomicZipAndRealWavAudio();
-      testSshTransportBlocksOnEnabledHeartbeatAndQuotesRemotePaths();
-      testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus();
-      testUtcRobotLogNamesAndLocalDsLogWindowWithMtimeGuard();
-      testTrayActionCoordinatorSerializesDrivePollsAndOnlySetsBusyOnTransfer();
-      testAudioRecorderReEnableInsideDebriefClosesRun1AndStartsRun2();
-      testUsbLogRootDeduplicationAndUsbRunMetaHydration();
-      testDriveWatcherStatePersistenceRejectedLatchPartialConfigsAndDebounce();
-      testFailedPullKeepsMentorAudio();
-      testManualRestoreStablePullsLogsFirst();
-      testZipBuiltInTempBeforeMoveAndAudioFailureNotifies();
-      testMalformedManifestFailsClosedAndRollbackChecksDeployCopy();
-      testTruncatedMsgPackFrameNeverMarksDisabled();
-      testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell();
-      testGitHubReleaseUpdaterIntegritySafetyLockoutAndRealPosixSwap();
-      testInspectRobotCodeDistinguishesLegacyFromFlux2027();
-      testHb08SshAsyncStdinLockoutExit42AndTimeout();
-      testHb09AudioSpoolBeforeSshFailureAndAutoStopCaps();
-      testHb10AudioZeroByteReadSpinExitsQuicklyAndNotifies();
-      testHb11SshStreamingBinaryDownloadDirectToDisk();
-      testHb12UpdaterOptInTimeoutSemVerTransientRetryAndWindowsQuoting();
-      testHb13SingleInstanceLockContentionAndRelease();
-      testHb14LockedDriverStationLogSkippedWithoutAbortingPull();
-      testHb15DriveWatcherCachesValidationAndBacksOffWhenUnreachable();
-      testCrashBootRecoveryAllowsDeployAndRestoreWhenNoRobotJvmRunning();
-      testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout();
-      testReadDiagnosticsUsesBusyBoxSafeDfKilobytes();
-      testDriveWatcherOfflineSyncAndPerRobotMultiChassisUpdates();
-      testFailedDeployBacksOffAndRotatesRollbackRingOnce();
-      testUnidentifiedRobotIsNotDeployedUnderGuessedName();
-      testM130SwitchConfigPresetsLiveTuningTunedSnapshotPosixPathAndRestoreStable();
-      System.out.println("FluxTrayTest: ALL 39 SUITES PASSED");
+      List<RunnableTest> suites =
+          List.of(
+              FluxTrayTest::testSafetyLockoutAndAbort,
+              FluxTrayTest::testPackageDeployAndRollbackRing,
+              FluxTrayTest::testPracticeAndFmsCaptureSyncWorkflow,
+              FluxTrayTest::testHealthyAndAnomalousSystemSnapshots,
+              FluxTrayTest::testFluxFigTuningModeSwitchAndVersionPromotion,
+              FluxTrayTest::testScoutingPwaAndSignedQrScanner,
+              FluxTrayTest::testNt4WebSocketLiveLockoutAndOncePerDisableAutoPull,
+              FluxTrayTest::testRoboRioRobotCommandAtomicDeployRestartAndRobotStateLockout,
+              FluxTrayTest::testDriveWatcherIncrementalLedgerDsLogFilterAtomicZipAndRealWavAudio,
+              FluxTrayTest::testSshTransportBlocksOnEnabledHeartbeatAndQuotesRemotePaths,
+              FluxTrayTest::testNt4IdleTimeoutReconnectsAndDisconnectClearsDisplayedStatus,
+              FluxTrayTest::testUtcRobotLogNamesAndLocalDsLogWindowWithMtimeGuard,
+              FluxTrayTest::testTrayActionCoordinatorSerializesDrivePollsAndOnlySetsBusyOnTransfer,
+              FluxTrayTest::testAudioRecorderReEnableInsideDebriefClosesRun1AndStartsRun2,
+              FluxTrayTest::testUsbLogRootDeduplicationAndUsbRunMetaHydration,
+              FluxTrayTest::testDriveWatcherStatePersistenceRejectedLatchPartialConfigsAndDebounce,
+              FluxTrayTest::testFailedPullKeepsMentorAudio,
+              FluxTrayTest::testManualRestoreStablePullsLogsFirst,
+              FluxTrayTest::testZipBuiltInTempBeforeMoveAndAudioFailureNotifies,
+              FluxTrayTest::testMalformedManifestFailsClosedAndRollbackChecksDeployCopy,
+              FluxTrayTest::testTruncatedMsgPackFrameNeverMarksDisabled,
+              FluxTrayTest::testSshBinaryStreamingAndBusyBoxHeartbeatGuardViaRealShell,
+              FluxTrayTest::testGitHubReleaseUpdaterIntegritySafetyLockoutAndRealPosixSwap,
+              FluxTrayTest::testInspectRobotCodeDistinguishesLegacyFromFlux2027,
+              FluxTrayTest::testHb08SshAsyncStdinLockoutExit42AndTimeout,
+              FluxTrayTest::testHb09AudioSpoolBeforeSshFailureAndAutoStopCaps,
+              FluxTrayTest::testHb10AudioZeroByteReadSpinExitsQuicklyAndNotifies,
+              FluxTrayTest::testHb11SshStreamingBinaryDownloadDirectToDisk,
+              FluxTrayTest::testHb12UpdaterOptInTimeoutSemVerTransientRetryAndWindowsQuoting,
+              FluxTrayTest::testHb13SingleInstanceLockContentionAndRelease,
+              FluxTrayTest::testHb14LockedDriverStationLogSkippedWithoutAbortingPull,
+              FluxTrayTest::testHb15DriveWatcherCachesValidationAndBacksOffWhenUnreachable,
+              FluxTrayTest::testCrashBootRecoveryAllowsDeployAndRestoreWhenNoRobotJvmRunning,
+              FluxTrayTest::testPreDeployAndPreRestoreLogPullFailureIsNonFatalExceptLockout,
+              FluxTrayTest::testReadDiagnosticsUsesBusyBoxSafeDfKilobytes,
+              FluxTrayTest::testDriveWatcherOfflineSyncAndPerRobotMultiChassisUpdates,
+              FluxTrayTest::testFailedDeployBacksOffAndRotatesRollbackRingOnce,
+              FluxTrayTest::testUnidentifiedRobotIsNotDeployedUnderGuessedName,
+              FluxTrayTest::testM130SwitchConfigPresetsLiveTuningTunedSnapshotPosixPathAndRestoreStable,
+              FluxTrayTest::testR1LockoutConcurrencyNt4DisconnectAndSnapshotLockoutRethrow,
+              FluxTrayTest::testR2ConfigSwitcherNoPrevStablePresetToPresetHashParityAndJarShaIntegrity,
+              FluxTrayTest::testR3SshLockoutMutantsCreatedDirsPoisoningOfflineStallAndSystemCoreRestart);
+      int ran = 0;
+      for (RunnableTest suite : suites) {
+        suite.run();
+        ran++;
+      }
+      System.out.println("FluxTrayTest: ALL " + ran + " SUITES PASSED");
     } finally {
       cleanupTempDirs();
     }
+  }
+
+  @FunctionalInterface
+  private interface RunnableTest {
+    void run() throws Exception;
   }
 
   private static void testSafetyLockoutAndAbort() {
@@ -192,10 +207,9 @@ public final class FluxTrayTest {
         pathPlannerDir.resolve("Shop_Center_Shuttle.path"),
         "{\"version\":\"2025.0\",\"waypoints\":[]}",
         StandardCharsets.UTF_8);
-    Path jarV1 = temp.resolve("v1.jar");
-    Path jarV2Exp = temp.resolve("v2-exp.jar");
-    Files.writeString(jarV1, "STABLE_JAR_V1_BYTES", StandardCharsets.UTF_8);
-    Files.writeString(jarV2Exp, "EXP_STUDENT_JAR_V2_BYTES", StandardCharsets.UTF_8);
+    Path jarV1 = writeMinimalJar(temp.resolve("v1.jar"), "STABLE_JAR_V1_BYTES");
+    Path jarV2Exp = writeMinimalJar(temp.resolve("v2-exp.jar"), "EXP_STUDENT_JAR_V2_BYTES");
+    String validCfgSha = configShaOf(validConfigs);
 
     Path pkgStableV1 =
         PackageDeployer.createFluxPkgZip(
@@ -206,7 +220,7 @@ public final class FluxTrayTest {
                 "STABLE",
                 "1111111",
                 false,
-                "a1b2c3d4",
+                validCfgSha,
                 "pit-laptop-A"),
             jarV1,
             validConfigs);
@@ -214,11 +228,11 @@ public final class FluxTrayTest {
     deployerA.deployPackage(pkgStableV1, robot, false);
     assertEquals(
         "STABLE_JAR_V1_BYTES",
-        robot.readRemoteText("frcUserProgram.jar"),
+        readJarMarker(robot.rootDir().resolve("frcUserProgram.jar")),
         "Active JAR is STABLE v1");
     assertEquals(
         "STABLE_JAR_V1_BYTES",
-        robot.readRemoteText("jars/prev_stable.jar"),
+        readJarMarker(robot.rootDir().resolve("jars/prev_stable.jar")),
         "prev_stable.jar saved");
     assertEquals(
         "{\"version\":\"2025.0\",\"waypoints\":[]}",
@@ -235,7 +249,7 @@ public final class FluxTrayTest {
                 "EXPERIMENTAL",
                 "2222222",
                 true,
-                "a1b2c3d4",
+                validCfgSha,
                 "pit-laptop-B"),
             jarV2Exp,
             validConfigs);
@@ -251,29 +265,30 @@ public final class FluxTrayTest {
     deployerB.deployPackage(pkgExpV2, robot, true);
     assertEquals(
         "EXP_STUDENT_JAR_V2_BYTES",
-        robot.readRemoteText("frcUserProgram.jar"),
+        readJarMarker(robot.rootDir().resolve("frcUserProgram.jar")),
         "Active JAR updated to EXPERIMENTAL v2");
     assertEquals(
         "STABLE_JAR_V1_BYTES",
-        robot.readRemoteText("jars/prev_1.jar"),
+        readJarMarker(robot.rootDir().resolve("jars/prev_1.jar")),
         "prev_1.jar holds previous STABLE v1");
     assertEquals(
         "STABLE_JAR_V1_BYTES",
-        robot.readRemoteText("jars/prev_stable.jar"),
+        readJarMarker(robot.rootDir().resolve("jars/prev_stable.jar")),
         "prev_stable.jar remains untouched by EXPERIMENTAL deploy");
     assertEquals(2, robot.restartCount(), "Robot restarted after second deploy");
 
     deployerB.restoreStable(robot);
     assertEquals(
         "STABLE_JAR_V1_BYTES",
-        robot.readRemoteText("frcUserProgram.jar"),
+        readJarMarker(robot.rootDir().resolve("frcUserProgram.jar")),
         "Restore STABLE restored STABLE v1");
     assertEquals(3, robot.restartCount(), "Robot restarted after Restore STABLE");
 
     Path badConfigs = createSampleFluxFigConfigs(temp.resolve("configs-bad"), "can_s1", 120.0);
+    ConfigSwitcher switcherA = new ConfigSwitcher(lockout);
     boolean badConfigBlocked = false;
     try {
-      deployerA.pushFluxFigConfigs(badConfigs, "COMP_2027", robot);
+      switcherA.pushFluxFigConfigs(badConfigs, "COMP_2027", robot);
     } catch (IllegalStateException expected) {
       badConfigBlocked = true;
     }
@@ -489,12 +504,12 @@ public final class FluxTrayTest {
     MockRobotServer robot = new MockRobotServer(temp.resolve("robot"), "systemcore-2027");
     robot.seedSimulatedMatchLogs("2027-02-19_10-00-00");
     RobotSafetyLockout lockout = new RobotSafetyLockout();
-    PackageDeployer deployer = new PackageDeployer(lockout, "pit-laptop-A");
+    ConfigSwitcher switcher = new ConfigSwitcher(lockout);
 
     String initialSha =
-        deployer.pushFluxFigConfigs(hubConfigs, "COMP_2027", FluxFig.Mode.PRODUCTION, robot);
+        switcher.pushFluxFigConfigs(hubConfigs, "COMP_2027", FluxFig.Mode.PRODUCTION, robot);
     FluxFig.ActiveProfileDirective tuningDirective =
-        deployer.switchActiveMode("COMP_2027", FluxFig.Mode.TUNING, initialSha, robot);
+        switcher.switchActiveMode("COMP_2027", FluxFig.Mode.TUNING, initialSha, robot);
     assertEquals(FluxFig.Mode.TUNING, tuningDirective.mode(), "Switched robot to Mode.TUNING");
     assertEquals("COMP_2027", tuningDirective.profile(), "Retained active profile COMP_2027");
 
@@ -529,7 +544,7 @@ public final class FluxTrayTest {
         "Post-run auto-pull safety net archived tuned-snapshot.txt");
 
     FluxFig.ReleaseEntry release =
-        deployer.promoteRemoteTuningSnapshot(
+        switcher.promoteRemoteTuningSnapshot(
             hubConfigs, "student-alex", "Dialed Elevator kP", robot);
     assertEquals("v1", release.version(), "First promoted release is v1");
     assertTrue(
@@ -755,23 +770,23 @@ public final class FluxTrayTest {
 
     RobotSafetyLockout lockout = new RobotSafetyLockout();
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    ConfigSwitcher switcher = new ConfigSwitcher(lockout);
 
     Path cfgV1 = createSampleFluxFigConfigs(temp.resolve("cfg-v1"), "Drivetrain", 60.0);
     Files.writeString(cfgV1.resolve("marker.txt"), "DEPLOY_V1_MARKER", StandardCharsets.UTF_8);
-    Path jarV1 = temp.resolve("fuel-v1.jar");
-    Files.writeString(jarV1, "ROBORIO_STABLE_V1", StandardCharsets.UTF_8);
+    Path jarV1 = writeMinimalJar(temp.resolve("fuel-v1.jar"), "ROBORIO_STABLE_V1");
     Path pkgV1 =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("STABLE_v1_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_v1", "roborio-2026", "STABLE", "aaa1111", false, "cfg11111", "boris"),
+                "STABLE_v1", "roborio-2026", "STABLE", "aaa1111", false, configShaOf(cfgV1), "boris"),
             jarV1,
             cfgV1);
 
     deployer.deployPackage(pkgV1, rio, true);
     assertEquals(
         "ROBORIO_STABLE_V1",
-        rio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        readJarMarker(rio.rootDir().resolve("Flux-RoboRIO-2027.jar")),
         "Deployed onto exact robotCommand JAR target Flux-RoboRIO-2027.jar");
     assertTrue(
         !rio.remoteFileExists("frcUserProgram.jar"),
@@ -786,20 +801,22 @@ public final class FluxTrayTest {
     // Dirty EXPERIMENTAL package must NOT overwrite prev_stable even if channel mistakenly says STABLE.
     Path cfgV2 = createSampleFluxFigConfigs(temp.resolve("cfg-v2"), "Drivetrain", 60.0);
     Files.writeString(cfgV2.resolve("marker.txt"), "DEPLOY_V2_EXP_MARKER", StandardCharsets.UTF_8);
-    Path jarV2 = temp.resolve("fuel-v2-dirty.jar");
-    Files.writeString(jarV2, "ROBORIO_DIRTY_V2", StandardCharsets.UTF_8);
+    Path jarV2 = writeMinimalJar(temp.resolve("fuel-v2-dirty.jar"), "ROBORIO_DIRTY_V2");
     Path pkgDirty =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("EXP_v2_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "EXP_v2", "roborio-2026", "STABLE", "bbb2222", true, "cfg22222", "boris"),
+                "EXP_v2", "roborio-2026", "STABLE", "bbb2222", true, configShaOf(cfgV2), "boris"),
             jarV2,
             cfgV2);
     deployer.deployPackage(pkgDirty, rio, true);
-    assertEquals("ROBORIO_DIRTY_V2", rio.readRemoteText("Flux-RoboRIO-2027.jar"), "Live JAR is v2");
+    assertEquals(
+        "ROBORIO_DIRTY_V2",
+        readJarMarker(rio.rootDir().resolve("Flux-RoboRIO-2027.jar")),
+        "Live JAR is v2");
     assertEquals(
         "ROBORIO_STABLE_V1",
-        rio.readRemoteText("jars/prev_stable.jar"),
+        readJarMarker(rio.rootDir().resolve("jars/prev_stable.jar")),
         "Dirty package did NOT overwrite jars/prev_stable.jar");
     assertEquals(
         "DEPLOY_V1_MARKER",
@@ -810,7 +827,7 @@ public final class FluxTrayTest {
     deployer.restoreStable(rio);
     assertEquals(
         "ROBORIO_STABLE_V1",
-        rio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        readJarMarker(rio.rootDir().resolve("Flux-RoboRIO-2027.jar")),
         "Restore STABLE restored exact robotCommand JAR");
     assertEquals(
         "DEPLOY_V1_MARKER",
@@ -820,14 +837,14 @@ public final class FluxTrayTest {
 
     // switchActiveMode with null profile must preserve detected robot identity FUEL (not COMP_2027).
     FluxFig.ActiveProfileDirective dir =
-        deployer.switchActiveMode(null, FluxFig.Mode.TUNING, "cfg11111", rio);
+        switcher.switchActiveMode(null, FluxFig.Mode.TUNING, configShaOf(cfgV1), rio);
     assertEquals("FUEL", dir.profile(), "switchActiveMode resolved FUEL rather than COMP_2027");
 
     // Robot-side /tmp/flux-robot-state ENABLED must block both deploy and log pull even if local lockout is idle.
     rio.setRobotStateFile(true, false, "FUEL");
     boolean blockedByStateFile = false;
     try {
-      deployer.pushFluxFigConfigs(cfgV1, null, rio);
+      switcher.pushFluxFigConfigs(cfgV1, null, rio);
     } catch (IllegalStateException expected) {
       blockedByStateFile = expected.getMessage().contains("/tmp/flux-robot-state");
     }
@@ -918,12 +935,11 @@ public final class FluxTrayTest {
 
     // Seed a valid STABLE roboRIO package into code/.
     Path cfgDir = createSampleFluxFigConfigs(temp.resolve("pkg-cfg"), "Drivetrain", 60.0);
-    Path jarFile = temp.resolve("fuel.jar");
-    Files.writeString(jarFile, "FUEL_CT_PACKAGE_BYTES", StandardCharsets.UTF_8);
+    Path jarFile = writeMinimalJar(temp.resolve("fuel.jar"), "FUEL_CT_PACKAGE_BYTES");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_v2027.2.0_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_v2027.2.0", "roborio-2026", "STABLE", "abc1234", false, "cafebabe", "boris"),
+            "STABLE_v2027.2.0", "roborio-2026", "STABLE", "abc1234", false, configShaOf(cfgDir), "boris"),
         jarFile,
         cfgDir);
 
@@ -1193,22 +1209,21 @@ public final class FluxTrayTest {
     MockRobotServer mockRio = new MockRobotServer(temp.resolve("rollback-rio"), "roborio-2026");
     mockRio.setRobotIdentityFile("FUEL");
     Path cfgValid = createSampleFluxFigConfigs(temp.resolve("rb-cfg"), "Drivetrain", 60.0);
-    Path jarV1 = temp.resolve("v1.jar");
-    Path jarV2 = temp.resolve("v2.jar");
-    Files.writeString(jarV1, "LIVE_STABLE_JAR_V1", StandardCharsets.UTF_8);
-    Files.writeString(jarV2, "NEW_BROKEN_DEPLOY_JAR_V2", StandardCharsets.UTF_8);
+    String cfgValidSha = configShaOf(cfgValid);
+    Path jarV1 = writeMinimalJar(temp.resolve("v1.jar"), "LIVE_STABLE_JAR_V1");
+    Path jarV2 = writeMinimalJar(temp.resolve("v2.jar"), "NEW_BROKEN_DEPLOY_JAR_V2");
     Path pkgV1 =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("v1_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_v1", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+                "STABLE_v1", "roborio-2026", "STABLE", "1111111", false, cfgValidSha, "boris"),
             jarV1,
             cfgValid);
     Path pkgV2 =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("v2_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "EXP_v2", "roborio-2026", "EXPERIMENTAL", "2222222", true, "cfg22222", "boris"),
+                "EXP_v2", "roborio-2026", "EXPERIMENTAL", "2222222", true, cfgValidSha, "boris"),
             jarV2,
             cfgValid);
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
@@ -1231,7 +1246,7 @@ public final class FluxTrayTest {
     assertTrue(deployFailed, "deployPackage must propagate deploy/ failure");
     assertEquals(
         "LIVE_STABLE_JAR_V1",
-        mockRio.readRemoteText("Flux-RoboRIO-2027.jar"),
+        readJarMarker(mockRio.rootDir().resolve("Flux-RoboRIO-2027.jar")),
         "Live JAR must roll back to prev_1.jar when replaceRemoteDirectoryAtomic fails");
   }
 
@@ -2065,12 +2080,11 @@ public final class FluxTrayTest {
       // Actual Drive package deploy MUST turn busySyncing true during transfer and false after.
       busyTransitions.clear();
       Path cfg = createSampleFluxFigConfigs(temp.resolve("coord-cfg"), "Drivetrain", 60.0);
-      Path jar = temp.resolve("coord.jar");
-      Files.writeString(jar, "COORD_DEPLOY_JAR", StandardCharsets.UTF_8);
+      Path jar = writeMinimalJar(temp.resolve("coord.jar"), "COORD_DEPLOY_JAR");
       PackageDeployer.createFluxPkgZip(
           codeDir.resolve("STABLE_coord_roborio-2026_fluxpkg.zip"),
           new PackageManifest(
-              "STABLE_coord", "roborio-2026", "STABLE", "abc1234", false, "11223344", "boris"),
+              "STABLE_coord", "roborio-2026", "STABLE", "abc1234", false, configShaOf(cfg), "boris"),
           jar,
           cfg);
       coordinator.submitDrivePollIfIdle(watcher, () -> 1_763_650_010_000L).get(5, TimeUnit.SECONDS);
@@ -2301,13 +2315,12 @@ public final class FluxTrayTest {
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
 
     Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg-ok"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("ok.jar");
-    Files.writeString(jar, "PERSIST_STABLE_JAR", StandardCharsets.UTF_8);
+    Path jar = writeMinimalJar(temp.resolve("ok.jar"), "PERSIST_STABLE_JAR");
     Path validPkg =
         PackageDeployer.createFluxPkgZip(
             codeDir.resolve("STABLE_persist_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_persist", "roborio-2026", "STABLE", "aaa1111", false, "cfg11111", "boris"),
+                "STABLE_persist", "roborio-2026", "STABLE", "aaa1111", false, configShaOf(cfg), "boris"),
             jar,
             cfg);
 
@@ -2546,13 +2559,12 @@ public final class FluxTrayTest {
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
 
     Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("stable.jar");
-    Files.writeString(jar, "STABLE_BASELINE_JAR", StandardCharsets.UTF_8);
+    Path jar = writeMinimalJar(temp.resolve("stable.jar"), "STABLE_BASELINE_JAR");
     Path stablePkg =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("STABLE_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, configShaOf(cfg), "boris"),
             jar,
             cfg);
     deployer.deployPackage(stablePkg, rio, true);
@@ -2697,23 +2709,24 @@ public final class FluxTrayTest {
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
 
     Path validCfg = createSampleFluxFigConfigs(temp.resolve("valid-cfg"), "Drivetrain", 60.0);
-    Path jarV1 = temp.resolve("stable.jar");
-    Path jarExp = temp.resolve("exp.jar");
-    Files.writeString(jarV1, "STABLE_JAR_BASE", StandardCharsets.UTF_8);
-    Files.writeString(jarExp, "EXP_SINGLE_LINE_JAR", StandardCharsets.UTF_8);
+    String validCfgSha = configShaOf(validCfg);
+    Path jarV1 = writeMinimalJar(temp.resolve("stable.jar"), "STABLE_JAR_BASE");
+    Path jarExp = writeMinimalJar(temp.resolve("exp.jar"), "EXP_SINGLE_LINE_JAR");
 
     Path stableZip =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("stable_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, "cfg11111", "boris"),
+                "STABLE_base", "roborio-2026", "STABLE", "1111111", false, validCfgSha, "boris"),
             jarV1,
             validCfg);
     deployer.deployPackage(stableZip, rio, true);
 
     // Single-line JSON manifest parses EXPERIMENTAL + gitDirty=true and must NOT overwrite prev_stable.
     String singleLineExpManifest =
-        "{\"packageName\":\"EXP_one_line\",\"targetPlatform\":\"roborio-2026\",\"channel\":\"EXPERIMENTAL\",\"gitSha\":\"9999999\",\"gitDirty\":true,\"configSha\":\"cfg99999\",\"authorLaptop\":\"boris\"}";
+        "{\"packageName\":\"EXP_one_line\",\"targetPlatform\":\"roborio-2026\",\"channel\":\"EXPERIMENTAL\",\"gitSha\":\"9999999\",\"gitDirty\":true,\"configSha\":\""
+            + validCfgSha
+            + "\",\"authorLaptop\":\"boris\"}";
     Path singleLineZip =
         createCustomFluxPkgZip(
             temp.resolve("single_line_exp_fluxpkg.zip"), singleLineExpManifest, jarExp, validCfg);
@@ -2721,7 +2734,7 @@ public final class FluxTrayTest {
     assertEquals("EXPERIMENTAL", expStamp.channel(), "Single-line manifest parsed EXPERIMENTAL");
     assertEquals(
         "STABLE_JAR_BASE",
-        rio.readRemoteText("jars/prev_stable.jar"),
+        readJarMarker(rio.rootDir().resolve("jars/prev_stable.jar")),
         "Single-line dirty EXPERIMENTAL package must NOT overwrite prev_stable.jar");
 
     // Malformed manifest missing channel/gitDirty/targetPlatform must fail closed (never default to STABLE).
@@ -3182,8 +3195,7 @@ public final class FluxTrayTest {
     // Full .fluxpkg.zip deploy: deploy-stamp.json present.
     Path pkgDir = createTempDir("fluxtray-inspect-pkg-");
     Path cfgDir = createSampleFluxFigConfigs(pkgDir.resolve("configs"), "FUEL", 50.0);
-    Path fakeJar = pkgDir.resolve("Flux-RoboRIO-2027.jar");
-    Files.writeString(fakeJar, "FAKE_JAR", StandardCharsets.UTF_8);
+    Path fakeJar = writeMinimalJar(pkgDir.resolve("Flux-RoboRIO-2027.jar"), "FAKE_JAR");
     Path pkgZip =
         PackageDeployer.createFluxPkgZip(
             pkgDir.resolve("STABLE_v2027.1.0_roborio-2026_fluxpkg.zip"),
@@ -3193,7 +3205,7 @@ public final class FluxTrayTest {
                 "STABLE",
                 "abc1234",
                 false,
-                "cfg999",
+                configShaOf(cfgDir),
                 "test-laptop"),
             fakeJar,
             cfgDir);
@@ -3831,12 +3843,11 @@ public final class FluxTrayTest {
         };
 
     Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("hb15.jar");
-    Files.writeString(jar, "HB15_PACKAGE_JAR", StandardCharsets.UTF_8);
+    Path jar = writeMinimalJar(temp.resolve("hb15.jar"), "HB15_PACKAGE_JAR");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_hb15_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_hb15", "roborio-2026", "STABLE", "abc1234", false, "cfg1234", "boris"),
+            "STABLE_hb15", "roborio-2026", "STABLE", "abc1234", false, configShaOf(cfg), "boris"),
         jar,
         cfg);
 
@@ -4009,12 +4020,12 @@ public final class FluxTrayTest {
         };
 
     Path cfg = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("fix.jar");
-    Files.writeString(jar, "FIXED_PACKAGE_JAR", StandardCharsets.UTF_8);
+    String cfgSha = configShaOf(cfg);
+    Path jar = writeMinimalJar(temp.resolve("fix.jar"), "FIXED_PACKAGE_JAR");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_fix_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_fix", "roborio-2026", "STABLE", "def5678", false, "cfg5678", "boris"),
+            "STABLE_fix", "roborio-2026", "STABLE", "def5678", false, cfgSha, "boris"),
         jar,
         cfg);
 
@@ -4079,11 +4090,11 @@ public final class FluxTrayTest {
     // Safety LOCKOUT during pre-deploy log pull MUST still abort the deploy.
     failDownloadIo.set(false);
     failListLockout.set(true);
-    Files.writeString(jar, "LOCKOUT_TEST_JAR", StandardCharsets.UTF_8);
+    writeMinimalJar(jar, "LOCKOUT_TEST_JAR");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_fix2_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_fix2", "roborio-2026", "STABLE", "abc9999", false, "cfg9999", "boris"),
+            "STABLE_fix2", "roborio-2026", "STABLE", "abc9999", false, cfgSha, "boris"),
         jar,
         cfg);
     watcher.pollOnce(baseMs + 3_000L);
@@ -4264,13 +4275,12 @@ public final class FluxTrayTest {
 
     // Stage both a new package and config overlay offline while disconnected from every robot.
     Path pkgCfg = createSampleFluxFigConfigs(temp.resolve("pkg-cfg"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("v2.jar");
-    Files.writeString(jar, "V2_OFFLINE_SYNC_JAR", StandardCharsets.UTF_8);
+    Path jar = writeMinimalJar(temp.resolve("v2.jar"), "V2_OFFLINE_SYNC_JAR");
     Path pkgZip =
         PackageDeployer.createFluxPkgZip(
             codeDir.resolve("STABLE_v2_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_v2", "roborio-2026", "STABLE", "abc2222", false, "cfg2222", "boris"),
+                "STABLE_v2", "roborio-2026", "STABLE", "abc2222", false, configShaOf(pkgCfg), "boris"),
             jar,
             pkgCfg);
     createSampleFluxFigConfigs(codeDir.resolve("configs"), "Drivetrain", 55.0);
@@ -4477,12 +4487,11 @@ public final class FluxTrayTest {
         };
 
     Path cfgDir = createSampleFluxFigConfigs(temp.resolve("cfg-v7"), "Drivetrain", 60.0);
-    Path jarV7 = temp.resolve("v7.jar");
-    Files.writeString(jarV7, "JAR_V7", StandardCharsets.UTF_8);
+    Path jarV7 = writeMinimalJar(temp.resolve("v7.jar"), "JAR_V7");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_v7_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_v7", "roborio-2026", "STABLE", "7777777", false, "cfg7777", "boris"),
+            "STABLE_v7", "roborio-2026", "STABLE", "7777777", false, configShaOf(cfgDir), "boris"),
         jarV7,
         cfgDir);
 
@@ -4554,7 +4563,7 @@ public final class FluxTrayTest {
     assertEquals(1, jarUploads.get(), "Recovery retry still does not re-upload JAR");
     assertEquals(
         "JAR_V7",
-        Files.readString(rio.rootDir().resolve(activeJar), StandardCharsets.UTF_8),
+        readJarMarker(rio.rootDir().resolve(activeJar)),
         "Active JAR is V7");
     assertEquals(
         "JAR_V5",
@@ -4652,12 +4661,11 @@ public final class FluxTrayTest {
         "Second unidentified roboRIO must also report 'unknown'");
 
     Path cfgDir = createSampleFluxFigConfigs(temp.resolve("cfg"), "Drivetrain", 60.0);
-    Path jar = temp.resolve("robot.jar");
-    Files.writeString(jar, "UNIDENTIFIED_GUARD_JAR", StandardCharsets.UTF_8);
+    Path jar = writeMinimalJar(temp.resolve("robot.jar"), "UNIDENTIFIED_GUARD_JAR");
     PackageDeployer.createFluxPkgZip(
         codeDir.resolve("STABLE_guard_roborio-2026_fluxpkg.zip"),
         new PackageManifest(
-            "STABLE_guard", "roborio-2026", "STABLE", "abc1234", false, "cfg1234", "boris"),
+            "STABLE_guard", "roborio-2026", "STABLE", "abc1234", false, configShaOf(cfgDir), "boris"),
         jar,
         cfgDir);
     createSampleFluxFigConfigs(codeDir.resolve("configs"), "Drivetrain", 55.0);
@@ -4815,11 +4823,12 @@ public final class FluxTrayTest {
         !Files.exists(watcher.stateFile()),
         "State file must not be persisted for unidentified robots");
 
+    ConfigSwitcher switcher = new ConfigSwitcher(lockout);
     assertThrowsIllegalState(
-        () -> deployer.pushFluxFigConfigs(cfgDir, null, FluxFig.Mode.PRODUCTION, rioA),
+        () -> switcher.pushFluxFigConfigs(cfgDir, null, FluxFig.Mode.PRODUCTION, rioA),
         "pushFluxFigConfigs without explicit profile must fail closed on unidentified robot");
     assertThrowsIllegalState(
-        () -> deployer.switchToLiveTuning(rioA),
+        () -> switcher.switchToLiveTuning(rioA),
         "switchToLiveTuning must fail closed on unidentified robot");
 
     // Explicit bootstrap opt-in permits deploying to an unidentified robot without recording FUEL.
@@ -4914,13 +4923,18 @@ public final class FluxTrayTest {
             + "2026-B01,FLUX-BAT-2026-B01,2026,15.2,22.0\n",
         StandardCharsets.UTF_8);
 
-    Path fakeJar = temp.resolve("Flux-RoboRIO-2027.jar");
-    Files.writeString(fakeJar, "STABLE_CHASSIS3_JAR", StandardCharsets.UTF_8);
+    Path fakeJar = writeMinimalJar(temp.resolve("Flux-RoboRIO-2027.jar"), "STABLE_CHASSIS3_JAR");
     Path stablePkg =
         PackageDeployer.createFluxPkgZip(
             temp.resolve("STABLE_m130_roborio-2026_fluxpkg.zip"),
             new PackageManifest(
-                "STABLE_m130", "roborio-2026", "STABLE", "abc9999", false, "cfg9999", "boris"),
+                "STABLE_m130",
+                "roborio-2026",
+                "STABLE",
+                "abc9999",
+                false,
+                configShaOf(baseCfg),
+                "boris"),
             fakeJar,
             baseCfg);
 
@@ -4936,6 +4950,7 @@ public final class FluxTrayTest {
 
     RobotSafetyLockout lockout = new RobotSafetyLockout();
     PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    ConfigSwitcher switcher = new ConfigSwitcher(lockout);
     deployer.deployPackage(stablePkg, spyRobot, true);
     String prevStableParamsBaseline =
         Files.readString(
@@ -4955,15 +4970,15 @@ public final class FluxTrayTest {
     Path illegalBusPreset = temp.resolve("bad_bus.csv");
     Files.writeString(illegalBusPreset, "key,DEFAULT\nswerveCanBus,Drivetrain\n", StandardCharsets.UTF_8);
 
-    List<PackageDeployer.ConfigPresetInfo> discovered =
-        PackageDeployer.discoverBehavioralPresets(codeDir);
+    List<ConfigSwitcher.ConfigPresetInfo> discovered =
+        ConfigSwitcher.discoverBehavioralPresets(codeDir);
     assertEquals(2, discovered.size(), "Two presets discovered under code/configs/presets/");
     assertEquals("01_crawl_1p5mps", discovered.get(0).name(), "First preset sorted by name");
     assertEquals("02_normal_3p5mps", discovered.get(1).name(), "Second preset sorted by name");
 
     boolean rejectedIllegalPreset = false;
     try {
-      deployer.switchToBehavioralPreset(illegalBusPreset, FluxFig.Mode.PRODUCTION, spyRobot);
+      switcher.switchToBehavioralPreset(illegalBusPreset, FluxFig.Mode.PRODUCTION, spyRobot);
     } catch (IllegalArgumentException expected) {
       rejectedIllegalPreset = expected.getMessage().contains("hardware topology");
     }
@@ -5083,6 +5098,654 @@ public final class FluxTrayTest {
       assertEquals(4.5, restoredCfg.getDouble("maxLinearSpeedMps"), "Restore STABLE returns 4.5 m/s base");
     }
     audio.close();
+  }
+
+  private static void testR1LockoutConcurrencyNt4DisconnectAndSnapshotLockoutRethrow()
+      throws Exception {
+    // Throwing abort listener must never skip downstream listeners or hold the lockout monitor.
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    AtomicBoolean secondListenerRan = new AtomicBoolean(false);
+    AtomicBoolean listenerHeldLockoutMonitor = new AtomicBoolean(false);
+    lockout.addAbortListener(
+        () -> {
+          listenerHeldLockoutMonitor.set(Thread.holdsLock(lockout));
+          throw new RuntimeException("Simulated failing abort listener");
+        });
+    lockout.addAbortListener(() -> secondListenerRan.set(true));
+    lockout.updateState(true, false, 1_000L);
+    assertTrue(secondListenerRan.get(), "Downstream abort listener must still run if earlier throws");
+    assertTrue(
+        !listenerHeldLockoutMonitor.get(),
+        "Abort listeners must run outside the RobotSafetyLockout monitor");
+
+    // Aborted transfer's stale lease close must never decrement a subsequent transfer's count.
+    lockout.updateState(false, false, 2_000L);
+    RobotSafetyLockout.TransferLease leaseA = lockout.beginTransferLeaseOrThrow("transferA");
+    assertEquals(1, lockout.activeTransferCount(), "Transfer A active");
+    lockout.updateState(true, false, 3_000L);
+    assertEquals(0, lockout.activeTransferCount(), "Enable aborts active Transfer A");
+    assertEquals(1, lockout.abortedTransferCount(), "Aborted count incremented once");
+    lockout.updateState(false, false, 4_000L);
+    RobotSafetyLockout.TransferLease leaseB = lockout.beginTransferLeaseOrThrow("transferB");
+    assertEquals(1, lockout.activeTransferCount(), "Transfer B active");
+    leaseA.close();
+    assertEquals(
+        1,
+        lockout.activeTransferCount(),
+        "Stale Transfer A lease close must not decrement Transfer B active count");
+    leaseB.close();
+    assertEquals(0, lockout.activeTransferCount(), "Transfer B lease close clears active count");
+
+    // NT4 disconnect while Enabled must clear stale lockout and prevent bogus cold-boot auto-pull.
+    RobotSafetyLockout ntLockout = new RobotSafetyLockout();
+    AtomicInteger connCount = new AtomicInteger(0);
+    CountDownLatch sawEnabled = new CountDownLatch(1);
+    CountDownLatch sawDisconnect = new CountDownLatch(1);
+    CountDownLatch sawColdBootDisabled = new CountDownLatch(1);
+    AtomicBoolean lockoutEnabledOnDisconnect = new AtomicBoolean(true);
+    try (ServerSocket server = new ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))) {
+      int port = server.getLocalPort();
+      AtomicBoolean stop = new AtomicBoolean(false);
+      Thread serverThread =
+          new Thread(
+              () -> {
+                while (!stop.get()) {
+                  try {
+                    Socket client = server.accept();
+                    int idx = connCount.incrementAndGet();
+                    Thread h =
+                        new Thread(
+                            () -> {
+                              try (Socket s = client) {
+                                performWsServerHandshake(s);
+                                OutputStream out = s.getOutputStream();
+                                String announce =
+                                    "[{\"method\":\"announce\",\"params\":{\"name\":\"/FMSInfo/FMSControlData\",\"id\":7,\"type\":\"int\",\"properties\":{}}}]";
+                                sendWsFrame(out, 0x01, announce.getBytes(StandardCharsets.UTF_8));
+                                if (idx == 1) {
+                                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 1_000_000L, 0x21));
+                                  sawEnabled.await(3, TimeUnit.SECONDS);
+                                  // Drop socket immediately while Enabled (simulating breaker cut).
+                                } else {
+                                  sendWsFrame(out, 0x02, encodeNt4IntFrame(7, 2_000_000L, 0x20));
+                                  sawColdBootDisabled.await(3, TimeUnit.SECONDS);
+                                }
+                              } catch (Exception ignored) {
+                              }
+                            },
+                            "r1-nt4-conn-" + idx);
+                    h.setDaemon(true);
+                    h.start();
+                  } catch (IOException ignored) {
+                    break;
+                  }
+                }
+              },
+              "r1-nt4-server");
+      serverThread.setDaemon(true);
+      serverThread.start();
+
+      try (Nt4RobotStateClient ntClient =
+          new Nt4RobotStateClient(
+              List.of("127.0.0.1"),
+              port,
+              ntLockout,
+              (enabled, fms, word, host, ts) -> {
+                if (enabled && word == 0x21) {
+                  sawEnabled.countDown();
+                } else if (!enabled && word == 0x20 && connCount.get() >= 2) {
+                  sawColdBootDisabled.countDown();
+                }
+              },
+              () -> 100_000L,
+              100L,
+              300L,
+              50L,
+              true)) {
+        AtomicBoolean hadConn = new AtomicBoolean(false);
+        ntClient.setConnectionChangeListener(
+            () -> {
+              if (ntClient.isConnected()) {
+                hadConn.set(true);
+              } else if (hadConn.get()) {
+                lockoutEnabledOnDisconnect.set(ntLockout.isEnabled());
+                sawDisconnect.countDown();
+              }
+            });
+        ntClient.start();
+        assertTrue(sawEnabled.await(4, TimeUnit.SECONDS), "Initial Enabled frame observed");
+        assertTrue(sawDisconnect.await(4, TimeUnit.SECONDS), "Disconnect observed after breaker drop");
+        assertTrue(
+            !lockoutEnabledOnDisconnect.get(),
+            "NT4 disconnect while Enabled must clear stuck-Enabled in-memory lockout");
+        assertTrue(
+            sawColdBootDisabled.await(4, TimeUnit.SECONDS),
+            "Reconnected cold-boot Disabled frame observed");
+        assertTrue(
+            !ntLockout.isReadyForAutoLogPull(120_000L),
+            "Cold-boot Disabled after disconnect-while-Enabled must NOT arm bogus auto-pull");
+      } finally {
+        stop.set(true);
+      }
+    }
+
+    // captureSystemSnapshotNonFatal must rethrow LOCKOUT without writing ZIP or updating ledger.
+    Path temp = createTempDir("fluxtray-r1-snap-lockout-");
+    Path logsDir = temp.resolve("drive/logs");
+    Path dsDir = temp.resolve("ds");
+    Path stateDir = temp.resolve("state");
+    Files.createDirectories(logsDir);
+    Files.createDirectories(dsDir);
+    MockRobotServer rio = new MockRobotServer(temp.resolve("rio"), "roborio-2026");
+    rio.setRobotIdentityFile("CHASSIS_3");
+    rio.seedSimulatedMatchLogs("2026-11-22_03-00-00", "CHASSIS_3", "a1b2c3d4");
+    RobotTransport lockoutOnSnapshotRobot =
+        new DelegatingRobotTransport(rio) {
+          @Override
+          public String captureSystemSnapshotRaw() {
+            throw new IllegalStateException("LOCKOUT [/tmp/flux-robot-state]: Robot is ENABLED");
+          }
+        };
+    RobotSafetyLockout pullLockout = new RobotSafetyLockout();
+    MultiMicAudioRecorder audio = new MultiMicAudioRecorder(fmt -> null);
+    Path ledgerFile = stateDir.resolve(BatteryAndRunManager.SYNCED_LEDGER_FILE_NAME);
+    BatteryAndRunManager runMgr =
+        new BatteryAndRunManager(temp.resolve("hub"), ledgerFile, pullLockout, audio);
+    boolean threwLockout = false;
+    try {
+      runMgr.pullDriveSafeRunZip(
+          "r1_lockout_snap",
+          null,
+          lockoutOnSnapshotRobot,
+          dsDir,
+          logsDir,
+          Instant.parse("2026-11-22T03:01:00Z").toEpochMilli(),
+          false,
+          true,
+          false);
+    } catch (IllegalStateException expected) {
+      threwLockout = expected.getMessage().contains("LOCKOUT");
+    }
+    assertTrue(threwLockout, "captureSystemSnapshotNonFatal must rethrow LOCKOUT safety errors");
+    assertTrue(
+        !Files.exists(ledgerFile),
+        "Synced ledger must NOT advance when snapshot capture hits safety LOCKOUT");
+    try (Stream<Path> s = Files.list(logsDir)) {
+      assertEquals(0L, s.count(), "No ZIP may be published when snapshot capture hits LOCKOUT");
+    }
+    audio.close();
+  }
+
+  private static void testR2ConfigSwitcherNoPrevStablePresetToPresetHashParityAndJarShaIntegrity()
+      throws Exception {
+    Path temp = createTempDir("fluxtray-r2-");
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    PackageDeployer deployer = new PackageDeployer(lockout, "ct-laptop");
+    ConfigSwitcher switcher = new ConfigSwitcher(lockout);
+
+    // Controller loaded via ./gradlew deploy (no jars/prev_stable_deploy): switchToStableConfig
+    // must fail closed before any preset backup exists, and restore the pre-preset base after.
+    MockRobotServer gradleRio = new MockRobotServer(temp.resolve("gradle-rio"), "roborio-2026");
+    gradleRio.setRobotIdentityFile("CHASSIS_3");
+    gradleRio.setRobotStateFile(false, false, "CHASSIS_3");
+    String baseParams =
+        "key,DEFAULT,CHASSIS_3\n"
+            + "controllerProfile,ROBORIO_CANIVORE_2026,ROBORIO_CANIVORE_2026\n"
+            + "loopPeriodMs,20,20\n"
+            + "swerveCanBus,rio,rio\n"
+            + "mechCanBus,rio,rio\n"
+            + "auxCanBus,rio,rio\n"
+            + "maxLinearSpeedMps,4.5,\n"
+            + "maxAngularSpeedRadPerSec,4.71,\n"
+            + "driveStatorLimitAmps,60.0,\n"
+            + "driveSupplyLimitAmps,40.0,\n"
+            + "driveSlipCurrentAmps,60.0,\n"
+            + "joystickSensitivity,0.80,\n";
+    String baseMechs =
+        "robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio\n"
+            + "CHASSIS_3,SwerveDriveFL,1,rio,60.0,40.0,60.0,NONE,0.90,0.0,0.0,0.14,0.79,0.10,0.0,-10000.0,10000.0,-1,false,false,6.3947\n";
+    gradleRio.writeRemoteText("deploy/configs/parameters.csv", baseParams);
+    gradleRio.writeRemoteText("deploy/configs/mechanisms.csv", baseMechs);
+
+    boolean failedWithoutBase = false;
+    try {
+      switcher.switchToStableConfig(gradleRio);
+    } catch (IOException expected) {
+      failedWithoutBase = expected.getMessage().contains("Cannot restore STABLE config");
+    }
+    assertTrue(
+        failedWithoutBase,
+        "switchToStableConfig must fail closed when neither prev_stable_deploy nor pre-preset backup exists");
+
+    Path presetA = temp.resolve("01_crawl_1p5mps.csv");
+    Files.writeString(
+        presetA,
+        "key,DEFAULT\nmaxLinearSpeedMps,1.5\njoystickSensitivity,0.65\n",
+        StandardCharsets.UTF_8);
+    Path presetB = temp.resolve("02_normal_3p5mps.csv");
+    Files.writeString(
+        presetB,
+        "key,DEFAULT\nmaxLinearSpeedMps,3.5\n",
+        StandardCharsets.UTF_8);
+
+    switcher.switchToBehavioralPreset(presetA, FluxFig.Mode.PRODUCTION, gradleRio);
+    assertTrue(
+        gradleRio.remoteFileExists(ConfigSwitcher.PRE_PRESET_BASE_DIR + "/parameters.csv"),
+        "First preset switch without prev_stable_deploy must snapshot pre-preset base");
+    FluxFig afterA = FluxFig.load(gradleRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(1.5, afterA.getDouble("maxLinearSpeedMps"), "Preset A linear speed applied");
+    assertEquals(0.65, afterA.getDouble("joystickSensitivity"), "Preset A joystickSensitivity applied");
+
+    // Switching Preset A -> Preset B (omitting joystickSensitivity) must merge onto the locked base.
+    switcher.switchToBehavioralPreset(presetB, FluxFig.Mode.PRODUCTION, gradleRio);
+    FluxFig afterB = FluxFig.load(gradleRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(3.5, afterB.getDouble("maxLinearSpeedMps"), "Preset B linear speed applied");
+    assertEquals(
+        0.80,
+        afterB.getDouble("joystickSensitivity"),
+        "Preset B must revert joystickSensitivity to locked base 0.80 instead of leaking Preset A");
+
+    // switchActiveMode(PRODUCTION) while a preset is active must preserve preset and restart robot.
+    int restartsBeforeMode = gradleRio.restartCount();
+    FluxFig.ActiveProfileDirective modeDir =
+        switcher.switchActiveMode(null, FluxFig.Mode.PRODUCTION, null, gradleRio);
+    assertEquals("EXPERIMENTAL", modeDir.channel(), "switchActiveMode keeps EXPERIMENTAL on preset");
+    assertEquals("02_normal_3p5mps", modeDir.preset(), "switchActiveMode preserves active preset");
+    assertEquals(
+        restartsBeforeMode + 1,
+        gradleRio.restartCount(),
+        "switchActiveMode must restart robot code so boot-time FluxFig mode reloads");
+
+    // switchToStableConfig now restores the snapshotted pre-preset base (4.5 m/s, STABLE).
+    ConfigSwitcher.ConfigSwitchResult restoredNoStable = switcher.switchToStableConfig(gradleRio);
+    assertEquals("STABLE", restoredNoStable.channel(), "Restored channel is STABLE");
+    assertEquals("STABLE", restoredNoStable.preset(), "Restored preset is STABLE");
+    FluxFig restoredGradleCfg =
+        FluxFig.load(gradleRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(
+        4.5,
+        restoredGradleCfg.getDouble("maxLinearSpeedMps"),
+        "switchToStableConfig without prev_stable_deploy must restore 4.5 m/s base, never stay at 1.5");
+
+    // Controller WITH prev_stable_deploy: preset switch must match live deploy/configs SHA even
+    // after mechanisms.csv was edited on deploy/configs, and switchToStableConfig restores prev_stable.
+    MockRobotServer stableRio = new MockRobotServer(temp.resolve("stable-rio"), "roborio-2026");
+    stableRio.setRobotIdentityFile("CHASSIS_3");
+    stableRio.setRobotStateFile(false, false, "CHASSIS_3");
+    Path baseCfgDir = temp.resolve("base-cfg");
+    Files.createDirectories(baseCfgDir);
+    Files.writeString(baseCfgDir.resolve("parameters.csv"), baseParams, StandardCharsets.UTF_8);
+    Files.writeString(baseCfgDir.resolve("mechanisms.csv"), baseMechs, StandardCharsets.UTF_8);
+    Path validJar = writeMinimalJar(temp.resolve("stable.jar"), "STABLE_R2_JAR");
+    Path stablePkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("STABLE_r2_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_r2",
+                "roborio-2026",
+                "STABLE",
+                "abc1234",
+                false,
+                configShaOf(baseCfgDir),
+                "boris"),
+            validJar,
+            baseCfgDir);
+    deployer.deployPackage(stablePkg, stableRio, true);
+
+    // Verify clean STABLE deploy copies prev_stable.jar remotely instead of uploading twice.
+    List<String> stableOps = stableRio.operationLog();
+    assertTrue(
+        stableOps.stream().noneMatch(op -> op.equals("uploadAtomic:jars/prev_stable.jar")),
+        "Clean STABLE deploy must remote-copy prev_stable.jar instead of re-uploading JAR: "
+            + stableOps);
+    assertTrue(
+        stableOps.stream().anyMatch(op -> op.endsWith("->jars/prev_stable.jar")),
+        "Clean STABLE deploy must snapshot prev_stable.jar via remote copy: " + stableOps);
+
+    // Modify mechanisms.csv in live deploy/configs, then apply Preset A -> Preset B -> STABLE.
+    stableRio.writeRemoteText(
+        "deploy/configs/mechanisms.csv", baseMechs.replace(",60.0,40.0,", ",50.0,40.0,"));
+    ConfigSwitcher.ConfigSwitchResult presetRes =
+        switcher.switchToBehavioralPreset(presetA, FluxFig.Mode.PRODUCTION, stableRio);
+    FluxFig liveAfterPreset =
+        FluxFig.load(stableRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(
+        presetRes.configSha256(),
+        liveAfterPreset.getConfigSha256(),
+        "Preset active-profile.txt SHA must exactly match live deploy/configs SHA");
+    assertEquals(1.5, liveAfterPreset.getDouble("maxLinearSpeedMps"), "Preset A active on stableRio");
+    String liveMechsAfterPreset =
+        Files.readString(
+            stableRio.rootDir().resolve("deploy/configs/mechanisms.csv"), StandardCharsets.UTF_8);
+    assertTrue(
+        liveMechsAfterPreset.contains(",60.0,40.0,")
+            && !liveMechsAfterPreset.contains(",50.0,40.0,"),
+        "Preset switch must merge onto locked prev_stable_deploy/configs (60A), not drifted deploy/configs (50A)");
+    assertTrue(
+        !stableRio.remoteFileExists(ConfigSwitcher.PRE_PRESET_BASE_DIR + "/parameters.csv"),
+        "Preset switch with prev_stable_deploy present must not snapshot drifted deploy/configs");
+
+    switcher.switchToBehavioralPreset(presetB, FluxFig.Mode.PRODUCTION, stableRio);
+    FluxFig liveAfterPresetB =
+        FluxFig.load(stableRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(
+        0.80,
+        liveAfterPresetB.getDouble("joystickSensitivity"),
+        "Preset B on stableRio must merge from prev_stable_deploy (0.80), not Preset A (0.65)");
+
+    ConfigSwitcher.ConfigSwitchResult backToStable = switcher.switchToStableConfig(stableRio);
+    assertEquals("STABLE", backToStable.channel(), "switchToStableConfig restores STABLE channel");
+    FluxFig liveAfterStable =
+        FluxFig.load(stableRio.rootDir().resolve("deploy/configs"), "CHASSIS_3");
+    assertEquals(
+        4.5,
+        liveAfterStable.getDouble("maxLinearSpeedMps"),
+        "switchToStableConfig must restore 4.5 m/s from jars/prev_stable_deploy/configs");
+    assertEquals(
+        backToStable.configSha256(),
+        liveAfterStable.getConfigSha256(),
+        "Restored STABLE SHA matches live deploy/configs");
+
+    // Corrupt non-ZIP JAR and mismatched configSha must fail validation; 00000000 fallback allowed.
+    Path corruptJar = temp.resolve("corrupt.jar");
+    Files.writeString(corruptJar, "NOT_A_ZIP_ARCHIVE", StandardCharsets.UTF_8);
+    Path corruptJarPkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("corrupt_jar_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_corrupt",
+                "roborio-2026",
+                "STABLE",
+                "bad0001",
+                false,
+                configShaOf(baseCfgDir),
+                "boris"),
+            corruptJar,
+            baseCfgDir);
+    boolean corruptJarRejected = false;
+    try {
+      PackageDeployer.validatePackageArchiveLocally(corruptJarPkg, "roborio-2026");
+    } catch (IOException expected) {
+      corruptJarRejected = expected.getMessage().contains("Corrupt or non-ZIP");
+    }
+    assertTrue(corruptJarRejected, "Corrupt non-ZIP frcUserProgram.jar must fail validation");
+
+    Path badShaPkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("bad_sha_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_badsha",
+                "roborio-2026",
+                "STABLE",
+                "bad0002",
+                false,
+                "deadbeef",
+                "boris"),
+            validJar,
+            baseCfgDir);
+    boolean badShaRejected = false;
+    try {
+      PackageDeployer.validatePackageArchiveLocally(badShaPkg, "roborio-2026");
+    } catch (IllegalStateException expected) {
+      badShaRejected = expected.getMessage().contains("Config SHA-256 mismatch");
+    }
+    assertTrue(badShaRejected, "Mismatched manifest.configSha must fail validation");
+
+    Path fallbackShaPkg =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("fallback_sha_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_fallback",
+                "roborio-2026",
+                "STABLE",
+                "ok00003",
+                false,
+                "00000000",
+                "boris"),
+            validJar,
+            baseCfgDir);
+    PackageDeployer.validatePackageArchiveLocally(fallbackShaPkg, "roborio-2026");
+
+    // Failed prev_stable_deploy snapshot must leave existing prev_stable.jar untouched.
+    Path validJarV2 = writeMinimalJar(temp.resolve("stable-v2.jar"), "STABLE_R2_JAR_V2");
+    Path stablePkgV2 =
+        PackageDeployer.createFluxPkgZip(
+            temp.resolve("STABLE_r2_v2_roborio-2026_fluxpkg.zip"),
+            new PackageManifest(
+                "STABLE_r2_v2",
+                "roborio-2026",
+                "STABLE",
+                "abc9999",
+                false,
+                configShaOf(baseCfgDir),
+                "boris"),
+            validJarV2,
+            baseCfgDir);
+    RobotTransport failPrevStableDeployCopy =
+        new DelegatingRobotTransport(stableRio) {
+          @Override
+          public boolean copyRemoteDirectory(String fromRelativeDir, String toRelativeDir)
+              throws IOException {
+            if ("jars/prev_stable_deploy".equals(toRelativeDir)) {
+              return false;
+            }
+            return super.copyRemoteDirectory(fromRelativeDir, toRelativeDir);
+          }
+        };
+    boolean snapshotFailed = false;
+    try {
+      deployer.deployPackage(stablePkgV2, failPrevStableDeployCopy, true);
+    } catch (IOException expected) {
+      snapshotFailed = expected.getMessage().contains("prev_stable_deploy");
+    }
+    assertTrue(snapshotFailed, "Failed prev_stable_deploy snapshot must abort deploy");
+    assertEquals(
+        "STABLE_R2_JAR",
+        readJarMarker(stableRio.rootDir().resolve("jars/prev_stable.jar")),
+        "prev_stable.jar must stay on V1 when prev_stable_deploy snapshot fails");
+  }
+
+  private static void
+      testR3SshLockoutMutantsCreatedDirsPoisoningOfflineStallAndSystemCoreRestart()
+          throws Exception {
+    Path temp = createTempDir("fluxtray-r3-");
+    long remoteNowSec = 1_763_750_000L;
+    AtomicReference<String> hbResponse = new AtomicReference<>("");
+    AtomicInteger mkdirCalls = new AtomicInteger(0);
+    AtomicBoolean failFirstMkdir = new AtomicBoolean(true);
+    List<String> capturedCmds = new ArrayList<>();
+    SshRobotTransport.ProcessRunner stubRunner =
+        (argv, stdin, timeout) -> {
+          String cmd = argv.get(argv.size() - 1);
+          capturedCmds.add(cmd);
+          if (cmd.contains("HEARTBEAT_PRESENT=")) {
+            return new SshRobotTransport.ProcessResult(0, hbResponse.get(), "");
+          }
+          if (cmd.startsWith("mkdir -p ")) {
+            mkdirCalls.incrementAndGet();
+            if (failFirstMkdir.getAndSet(false)) {
+              return new SshRobotTransport.ProcessResult(255, "", "Simulated SSH drop on mkdir");
+            }
+          }
+          return new SshRobotTransport.ProcessResult(0, "OK\n", "");
+        };
+
+    RobotSafetyLockout lockout = new RobotSafetyLockout();
+    SshRobotTransport ssh =
+        new SshRobotTransport(
+            List.of("10.104.13.2"), false, lockout, false, "/tmp/flux-robot-state", stubRunner);
+
+    // Kills M4: stale ENABLED heartbeat while ROBOT_JVM_RUNNING=1 MUST block transfer.
+    hbResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=1\nHEARTBEAT_PRESENT=1\nSTATE=ENABLED\nENABLED=true\nFMS=false\nEPOCH_MS="
+            + ((remoteNowSec - 30L) * 1_000L)
+            + "\nROBOT_ID=FUEL\nPID=4321\n");
+    assertThrowsIllegalState(
+        () -> ssh.assertRobotDisabledForTransfer("staleEnabledLiveJvm"),
+        "Stale ENABLED heartbeat with ROBOT_JVM_RUNNING=1 must fail closed");
+    lockout.updateState(false, false, System.currentTimeMillis());
+
+    // Fresh FMS heartbeat (STATE=FMS, ENABLED=false, FMS=true) MUST block transfer.
+    hbResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=1\nHEARTBEAT_PRESENT=1\nSTATE=FMS\nENABLED=false\nFMS=true\nEPOCH_MS="
+            + (remoteNowSec * 1_000L)
+            + "\nROBOT_ID=FUEL\nPID=4321\n");
+    assertThrowsIllegalState(
+        () -> ssh.assertRobotDisabledForTransfer("fmsAttachedLiveJvm"),
+        "Fresh FMS heartbeat must fail closed");
+    lockout.updateState(false, false, System.currentTimeMillis());
+
+    // Kills M5 via real /bin/sh: both STATE=FMS and STATE=DISABLED+FMS=true must exit 42.
+    Path hbFile = temp.resolve("flux-robot-state");
+    SshRobotTransport realShellSsh =
+        new SshRobotTransport(
+            List.of("127.0.0.1"), false, lockout, false, hbFile.toString(), stubRunner);
+    String guard = realShellSsh.buildInlineHeartbeatGuard();
+
+    Files.writeString(
+        hbFile,
+        "STATE=FMS\nENABLED=false\nFMS=true\nEPOCH_MS=" + System.currentTimeMillis() + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult fmsStateRes =
+        realShellSsh.runLocalProcess(List.of("/bin/sh", "-c", guard), null, Duration.ofSeconds(5));
+    assertEquals(
+        SshRobotTransport.LOCKOUT_EXIT_CODE,
+        fmsStateRes.exitCode(),
+        "Inline guard must exit 42 on STATE=FMS");
+
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=true\nEPOCH_MS=" + System.currentTimeMillis() + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult fmsFlagOnlyRes =
+        realShellSsh.runLocalProcess(List.of("/bin/sh", "-c", guard), null, Duration.ofSeconds(5));
+    assertEquals(
+        SshRobotTransport.LOCKOUT_EXIT_CODE,
+        fmsFlagOnlyRes.exitCode(),
+        "Inline guard must exit 42 on FMS=true even when STATE=DISABLED");
+
+    // Failed mkdir -p must NOT poison createdRemoteDirs on retry.
+    hbResponse.set(
+        "REMOTE_EPOCH_SEC="
+            + remoteNowSec
+            + "\nROBOT_JVM_RUNNING=1\nHEARTBEAT_PRESENT=1\nSTATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS="
+            + (remoteNowSec * 1_000L)
+            + "\nROBOT_ID=FUEL\nPID=4321\n");
+    Path sampleFile = temp.resolve("sample.txt");
+    Files.writeString(sampleFile, "payload", StandardCharsets.UTF_8);
+    boolean firstUploadFailed = false;
+    try {
+      ssh.uploadFileAtomic(sampleFile, "jars/sub/file.txt");
+    } catch (IOException expected) {
+      firstUploadFailed = true;
+    }
+    assertTrue(firstUploadFailed, "First upload fails on simulated mkdir -p error");
+    ssh.uploadFileAtomic(sampleFile, "jars/sub/file.txt");
+    assertEquals(2, mkdirCalls.get(), "Retry must re-run mkdir -p after earlier mkdir failure");
+    ssh.uploadFileAtomic(sampleFile, "jars/sub/file2.txt");
+    assertEquals(2, mkdirCalls.get(), "Subsequent upload reuses cached dir after mkdir succeeded");
+
+    // Offline isReachable() short-circuits when TCP:22 probe fails: 0 ssh calls, 1 probe/host.
+    List<String> probedHosts = new ArrayList<>();
+    AtomicInteger offlineSshCalls = new AtomicInteger(0);
+    SshRobotTransport offlineSsh =
+        new SshRobotTransport(
+            List.of("10.104.13.2", "172.22.11.2", "roboRIO-10413-FRC.local"),
+            false,
+            lockout,
+            false,
+            "/tmp/flux-robot-state",
+            (argv, stdin, timeout) -> {
+              offlineSshCalls.incrementAndGet();
+              return new SshRobotTransport.ProcessResult(0, "OK\n", "");
+            },
+            host -> {
+              probedHosts.add(host);
+              return false;
+            });
+    assertTrue(!offlineSsh.isReachable(), "Unreachable TCP:22 hosts return false");
+    assertEquals(0, offlineSshCalls.get(), "Offline isReachable must invoke 0 ssh subprocesses");
+    assertEquals(
+        3,
+        probedHosts.size(),
+        "Offline isReachable must probe each candidate host at most once: " + probedHosts);
+    offlineSsh.preferHost("172.22.11.2");
+    assertEquals("172.22.11.2", offlineSsh.activeHost(), "preferHost switches activeHost");
+
+    // SystemCore restart command must NOT swallow errors via '|| true' and must fail loudly.
+    capturedCmds.clear();
+    SshRobotTransport sysCoreSsh =
+        new SshRobotTransport(
+            List.of("10.104.13.2"), true, lockout, false, hbFile.toString(), stubRunner);
+    sysCoreSsh.restartRobotCode();
+    String sysCoreRestartCmd = capturedCmds.get(capturedCmds.size() - 1);
+    assertTrue(
+        !sysCoreRestartCmd.contains("|| true"),
+        "SystemCore restart command must never contain '|| true': " + sysCoreRestartCmd);
+    assertTrue(
+        sysCoreRestartCmd.contains("exit 1"),
+        "SystemCore restart command must fail when no restart tool exists: " + sysCoreRestartCmd);
+
+    Path fakeBin = temp.resolve("fake-bin");
+    Files.createDirectories(fakeBin);
+    Path fakeSystemctl = fakeBin.resolve("systemctl");
+    Files.writeString(fakeSystemctl, "#!/bin/sh\nexit 1\n", StandardCharsets.UTF_8);
+    Files.setPosixFilePermissions(
+        fakeSystemctl,
+        Set.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_EXECUTE));
+    Path fakeSudo = fakeBin.resolve("sudo");
+    Files.writeString(fakeSudo, "#!/bin/sh\nexit 1\n", StandardCharsets.UTF_8);
+    Files.setPosixFilePermissions(
+        fakeSudo,
+        Set.of(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_EXECUTE));
+    Files.writeString(
+        hbFile,
+        "STATE=DISABLED\nENABLED=false\nFMS=false\nEPOCH_MS=" + System.currentTimeMillis() + "\n",
+        StandardCharsets.UTF_8);
+    SshRobotTransport.ProcessResult failedRestart =
+        sysCoreSsh.runLocalProcess(
+            List.of(
+                "/bin/sh",
+                "-c",
+                "PATH=" + SshRobotTransport.shQuote(fakeBin.toString() + ":/usr/bin:/bin") + "; " + sysCoreRestartCmd),
+            null,
+            Duration.ofSeconds(5));
+    assertTrue(
+        failedRestart.exitCode() != 0,
+        "SystemCore restart must exit non-zero when systemctl fails");
+  }
+
+  private static Path writeMinimalJar(Path jarPath, String marker) throws IOException {
+    if (jarPath.getParent() != null) {
+      Files.createDirectories(jarPath.getParent());
+    }
+    try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(jarPath))) {
+      zos.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
+      zos.write("Manifest-Version: 1.0\n".getBytes(StandardCharsets.UTF_8));
+      zos.closeEntry();
+      zos.putNextEntry(new ZipEntry("MARKER.txt"));
+      zos.write(marker.getBytes(StandardCharsets.UTF_8));
+      zos.closeEntry();
+    }
+    return jarPath;
+  }
+
+  private static String readJarMarker(Path jarPath) throws IOException {
+    return readZipEntryText(jarPath, "MARKER.txt");
+  }
+
+  private static String configShaOf(Path configDir) throws IOException {
+    return new FluxFig(configDir).getConfigSha256();
   }
 
   private static byte[] encodeNt4IntFrame(int topicId, long timestampUs, int intVal) {

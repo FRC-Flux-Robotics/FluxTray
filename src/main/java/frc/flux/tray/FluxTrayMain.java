@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Entry point for {@code FluxTray.jar} — the Driver Station System Tray Agent, live NT4 safety
@@ -162,9 +164,9 @@ public final class FluxTrayMain {
         String configSha = getFlagValue(args, "--config-sha", null);
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
         FluxFig.ActiveProfileDirective directive =
-            deployer.switchActiveMode(profile, mode, configSha, robot);
+            switcher.switchActiveMode(profile, mode, configSha, robot);
         System.out.println(
             "Switched robot to mode="
                 + directive.mode()
@@ -185,8 +187,8 @@ public final class FluxTrayMain {
                 getFlagValue(args, "--mode", "PRODUCTION").trim().toUpperCase(Locale.ROOT));
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
-        String sha = deployer.pushFluxFigConfigs(configDir, profile, mode, robot);
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
+        String sha = switcher.pushFluxFigConfigs(configDir, profile, mode, robot);
         System.out.println(
             "Pushed FluxFig configs ("
                 + sha
@@ -198,8 +200,8 @@ public final class FluxTrayMain {
       case "--switch-stable-config" -> {
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
-        PackageDeployer.ConfigSwitchResult res = deployer.switchToStableConfig(robot);
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
+        ConfigSwitcher.ConfigSwitchResult res = switcher.switchToStableConfig(robot);
         System.out.println(
             "Switched "
                 + res.robotId()
@@ -220,9 +222,9 @@ public final class FluxTrayMain {
                 getFlagValue(args, "--mode", "PRODUCTION").trim().toUpperCase(Locale.ROOT));
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
-        PackageDeployer.ConfigSwitchResult res =
-            deployer.switchToBehavioralPreset(presetCsv, mode, robot);
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
+        ConfigSwitcher.ConfigSwitchResult res =
+            switcher.switchToBehavioralPreset(presetCsv, mode, robot);
         System.out.println(
             "Switched "
                 + res.robotId()
@@ -239,8 +241,8 @@ public final class FluxTrayMain {
       case "--switch-live-tuning" -> {
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
-        PackageDeployer.ConfigSwitchResult res = deployer.switchToLiveTuning(robot);
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
+        ConfigSwitcher.ConfigSwitchResult res = switcher.switchToLiveTuning(robot);
         System.out.println(
             "Switched "
                 + res.robotId()
@@ -260,9 +262,9 @@ public final class FluxTrayMain {
         String notes = getFlagValue(args, "--notes", "");
         RobotSafetyLockout lockout = new RobotSafetyLockout();
         RobotTransport robot = parseTransportArgs(args, lockout, false);
-        PackageDeployer deployer = new PackageDeployer(lockout, resolveLaptopId());
+        ConfigSwitcher switcher = new ConfigSwitcher(lockout);
         FluxFig.ReleaseEntry release =
-            deployer.promoteRemoteTuningSnapshot(configDir, author, notes, robot);
+            switcher.promoteRemoteTuningSnapshot(configDir, author, notes, robot);
         System.out.println(
             "Promoted remote tuning snapshot -> "
                 + release.version()
@@ -692,18 +694,29 @@ public final class FluxTrayMain {
           "robot,mechanism,motorId,canBus,statorLimitAmps,supplyLimitAmps,slipCurrentAmps,gravityType,kP,kI,kD,kS,kV,kA,kG,minPosRot,maxPosRot,followerMotorId,invertFollower,motorInverted,gearRatio\n"
               + "FUEL,Elevator,10,Mech,60.0,40.0,60.0,Elevator_Static,2.4,0.0,0.1,0.18,0.12,0.01,0.35,0.0,48.0,11,false,false,1.0\n",
           StandardCharsets.UTF_8);
-      List<String> validViolations = new FluxFig(validCfg).validateStrict();
+      FluxFig validFig = new FluxFig(validCfg);
+      List<String> validViolations = validFig.validateStrict();
       if (!validViolations.isEmpty()) {
         throw new IllegalStateException("Self-test valid FluxFig failed: " + validViolations);
       }
 
       Path fakeJar = tmp.resolve("Flux-RoboRIO-2027.jar");
-      Files.writeString(fakeJar, "SELFTEST_JAR", StandardCharsets.UTF_8);
+      try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(fakeJar))) {
+        zos.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
+        zos.write("Manifest-Version: 1.0\n".getBytes(StandardCharsets.UTF_8));
+        zos.closeEntry();
+      }
       Path pkgZip =
           PackageDeployer.createFluxPkgZip(
               tmp.resolve("STABLE_selftest_roborio-2026_fluxpkg.zip"),
               new PackageDeployer.PackageManifest(
-                  "STABLE_selftest", "roborio-2026", "STABLE", "abc1234", false, "cfg1234", "self-test"),
+                  "STABLE_selftest",
+                  "roborio-2026",
+                  "STABLE",
+                  "abc1234",
+                  false,
+                  validFig.getConfigSha256(),
+                  "self-test"),
               fakeJar,
               validCfg);
       PackageDeployer.PackageManifest parsedManifest =
@@ -813,6 +826,7 @@ public final class FluxTrayMain {
   static final class TrayActionCoordinator implements Closeable {
     private final RobotTransport robot;
     private final PackageDeployer deployer;
+    private final ConfigSwitcher configSwitcher;
     private final BatteryAndRunManager runMgr;
     private final MultiMicAudioRecorder audio;
     private final RobotSafetyLockout lockout;
@@ -840,6 +854,7 @@ public final class FluxTrayMain {
         Consumer<Boolean> busyListener) {
       this.robot = robot;
       this.deployer = deployer;
+      this.configSwitcher = new ConfigSwitcher(lockout);
       this.runMgr = runMgr;
       this.audio = audio;
       this.lockout = lockout;
@@ -1064,7 +1079,7 @@ public final class FluxTrayMain {
               CompletedRunBundle preLogs =
                   pullPendingLogsBeforeMutation(
                       "preswitch", "Pre-Switch Log Pull Skipped", "Switch Config (STABLE)");
-              PackageDeployer.ConfigSwitchResult res = deployer.switchToStableConfig(robot);
+              ConfigSwitcher.ConfigSwitchResult res = configSwitcher.switchToStableConfig(robot);
               String suffix =
                   (preLogs != null && preLogs.zipArchive() != null)
                       ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
@@ -1096,8 +1111,8 @@ public final class FluxTrayMain {
               CompletedRunBundle preLogs =
                   pullPendingLogsBeforeMutation(
                       "preswitch", "Pre-Switch Log Pull Skipped", "Switch Config preset");
-              PackageDeployer.ConfigSwitchResult res =
-                  deployer.switchToBehavioralPreset(presetCsv, mode, robot);
+              ConfigSwitcher.ConfigSwitchResult res =
+                  configSwitcher.switchToBehavioralPreset(presetCsv, mode, robot);
               String suffix =
                   (preLogs != null && preLogs.zipArchive() != null)
                       ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
@@ -1133,7 +1148,7 @@ public final class FluxTrayMain {
               CompletedRunBundle preLogs =
                   pullPendingLogsBeforeMutation(
                       "preswitch", "Pre-Switch Log Pull Skipped", "Live Tuning");
-              PackageDeployer.ConfigSwitchResult res = deployer.switchToLiveTuning(robot);
+              ConfigSwitcher.ConfigSwitchResult res = configSwitcher.switchToLiveTuning(robot);
               String suffix =
                   (preLogs != null && preLogs.zipArchive() != null)
                       ? " (archived pending logs to " + preLogs.zipArchive().getFileName() + ")"
@@ -1358,33 +1373,52 @@ public final class FluxTrayMain {
             DriveWatcher.DEFAULT_EMPTY_CODE_ROLLBACK_DELAY_MS,
             coordinator::setBusySyncing);
 
+    ExecutorService audioStateExecutor =
+        Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "fluxtray-audio-state");
+              t.setDaemon(true);
+              return t;
+            });
+
     Nt4RobotStateClient ntClient =
         new Nt4RobotStateClient(
             robot.candidateHosts(),
             Nt4RobotStateClient.DEFAULT_NT4_PORT,
             lockout,
             (enabled, fms, controlWord, host, nowMs) -> {
-              audio.onRobotStateChanged(enabled, nowMs);
+              robot.preferHost(host);
+              audioStateExecutor.execute(() -> audio.onRobotStateChanged(enabled, nowMs));
               ntConnected.set(true);
               displayedEnabled.set(enabled);
               displayedFms.set(fms);
               refreshIcon.run();
-            });
+            },
+            System::currentTimeMillis,
+            Nt4RobotStateClient.DEFAULT_PING_INTERVAL_MS,
+            Nt4RobotStateClient.DEFAULT_IDLE_TIMEOUT_MS,
+            Nt4RobotStateClient.DEFAULT_RECONNECT_BACKOFF_MS,
+            !robot.isAllowMissingHeartbeat());
     ntClient.setConnectionChangeListener(
         () -> {
           boolean conn = ntClient.isConnected();
           ntConnected.set(conn);
           if (conn) {
+            robot.preferHost(ntClient.connectedHost());
             driveWatcher.onRobotConnected();
           } else {
             driveWatcher.onRobotDisconnected();
             // Return icon to Gray on disconnect while robot-side /tmp/flux-robot-state stays fail-closed,
-            // and trigger the 15 s debrief auto-stop/spool window if the robot breaker dropped mid-recording.
+            // and trigger the 15 s debrief auto-stop/spool window off the NT4 thread if the breaker dropped.
             displayedEnabled.set(false);
             displayedFms.set(false);
-            if (audio.isRecording()) {
-              audio.onRobotStateChanged(false, System.currentTimeMillis());
-            }
+            long disconnectNowMs = System.currentTimeMillis();
+            audioStateExecutor.execute(
+                () -> {
+                  if (audio.isRecording()) {
+                    audio.onRobotStateChanged(false, disconnectNowMs);
+                  }
+                });
           }
           refreshIcon.run();
         });
@@ -1395,6 +1429,7 @@ public final class FluxTrayMain {
             new Thread(
                 () -> {
                   ntClient.close();
+                  audioStateExecutor.shutdownNow();
                   audio.close();
                   coordinator.close();
                   instanceLock.close();
@@ -1439,6 +1474,7 @@ public final class FluxTrayMain {
                   () -> {
                     ntClient.close();
                     scheduler.shutdownNow();
+                    audioStateExecutor.shutdownNow();
                     audio.close();
                     removeTrayIconSynchronously(tray, icon);
                     instanceLock.close();
@@ -1465,6 +1501,7 @@ public final class FluxTrayMain {
           appendTrayLog(logFile, "INFO", "FluxTray exiting by user request.");
           ntClient.close();
           scheduler.shutdownNow();
+          audioStateExecutor.shutdownNow();
           coordinator.close();
           audio.close();
           removeTrayIconSynchronously(tray, icon);
@@ -1503,14 +1540,14 @@ public final class FluxTrayMain {
     switchConfigMenu.add(stableItem);
     switchConfigMenu.addSeparator();
 
-    List<PackageDeployer.ConfigPresetInfo> presets =
-        PackageDeployer.discoverBehavioralPresets(codeDir);
+    List<ConfigSwitcher.ConfigPresetInfo> presets =
+        ConfigSwitcher.discoverBehavioralPresets(codeDir);
     if (presets.isEmpty()) {
       MenuItem emptyItem = new MenuItem("(No presets in code/configs/presets/)");
       emptyItem.setEnabled(false);
       switchConfigMenu.add(emptyItem);
     } else {
-      for (PackageDeployer.ConfigPresetInfo preset : presets) {
+      for (ConfigSwitcher.ConfigPresetInfo preset : presets) {
         MenuItem presetItem = new MenuItem(preset.displayName());
         presetItem.addActionListener(
             e -> coordinator.submitSwitchToPreset(preset.filePath(), FluxFig.Mode.PRODUCTION));

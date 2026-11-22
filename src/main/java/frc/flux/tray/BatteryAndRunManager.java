@@ -219,9 +219,11 @@ public final class BatteryAndRunManager {
       throw new IllegalStateException(
           "Robot must be Disabled for >= 3.0 seconds after Enabled -> Disabled and off-FMS before auto log pull.");
     }
-    lockout.beginTransferOrThrow("pullDriveSafeRunZip:" + runId);
-    Path tempStageRoot = Files.createTempDirectory("fluxtray-run-stage-");
-    try {
+    RobotSafetyLockout.TransferLease lease =
+        lockout.beginTransferLeaseOrThrow("pullDriveSafeRunZip:" + runId);
+    Path tempStageRoot = null;
+    try (lease) {
+      tempStageRoot = Files.createTempDirectory("fluxtray-run-stage-");
       long audioEnableMs = audioRecorder.enableStartEpochMs();
       long audioDisableMs = audioRecorder.disableStartEpochMs();
       if (audioRecorder.isRecording()) {
@@ -331,7 +333,6 @@ public final class BatteryAndRunManager {
           runId, null, finalZip, batteryName, "COMPLETE", snapshot, decisions);
     } finally {
       deleteRecursivelyQuietly(tempStageRoot);
-      lockout.endTransfer();
     }
   }
 
@@ -428,8 +429,9 @@ public final class BatteryAndRunManager {
       throw new IllegalStateException(
           "Robot must be Disabled for >= 3.0 seconds and not on FMS before pulling practice logs.");
     }
-    lockout.beginTransferOrThrow("pullPracticeRunLogs:" + runId);
-    try {
+    RobotSafetyLockout.TransferLease lease =
+        lockout.beginTransferLeaseOrThrow("pullPracticeRunLogs:" + runId);
+    try (lease) {
       robot.assertRobotDisabledForTransfer("pullPracticeRunLogs:" + runId);
       Path baseLogsDir =
           (customOutputDir != null)
@@ -527,8 +529,6 @@ public final class BatteryAndRunManager {
 
       return new CompletedRunBundle(
           runId, runDir, zipPath, batteryName, "COMPLETE", snapshot, decisions);
-    } finally {
-      lockout.endTransfer();
     }
   }
 
@@ -577,8 +577,9 @@ public final class BatteryAndRunManager {
 
   /** Competition FMS Step 2 ("Sync in Pit"): Merges pending field runs with robot logs in pit. */
   public List<CompletedRunBundle> syncPendingFmsRuns(RobotTransport robot) throws IOException {
-    lockout.beginTransferOrThrow("syncPendingFmsRuns");
-    try {
+    RobotSafetyLockout.TransferLease lease =
+        lockout.beginTransferLeaseOrThrow("syncPendingFmsRuns");
+    try (lease) {
       robot.assertRobotDisabledForTransfer("syncPendingFmsRuns");
       Path logsRoot = hubRootDir.resolve(DEFAULT_LOGS_SUBDIR_NAME);
       if (!Files.isDirectory(logsRoot)) {
@@ -690,8 +691,6 @@ public final class BatteryAndRunManager {
         }
       }
       return Collections.unmodifiableList(synced);
-    } finally {
-      lockout.endTransfer();
     }
   }
 
@@ -1039,14 +1038,28 @@ public final class BatteryAndRunManager {
     }
   }
 
-  private static String captureSystemSnapshotNonFatal(RobotTransport robot) {
+  private String captureSystemSnapshotNonFatal(RobotTransport robot) {
     try {
       String raw = robot.captureSystemSnapshotRaw();
       return raw != null ? raw : "";
+    } catch (IllegalStateException ex) {
+      if (isSafetyLockoutError(ex)) {
+        throw ex;
+      }
+      String detail = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
+      return "# system-snapshot capture failed (non-fatal): " + detail + "\n";
     } catch (IOException | RuntimeException ex) {
       String detail = ex.getMessage() != null ? ex.getMessage() : ex.getClass().getSimpleName();
       return "# system-snapshot capture failed (non-fatal): " + detail + "\n";
     }
+  }
+
+  private boolean isSafetyLockoutError(IllegalStateException ex) {
+    if (lockout != null && (lockout.isEnabled() || lockout.isFmsAttached())) {
+      return true;
+    }
+    String msg = ex.getMessage();
+    return msg != null && msg.toUpperCase(Locale.ROOT).contains("LOCKOUT");
   }
 
   private synchronized Map<String, SyncedFileRecord> loadSyncedLedger() {

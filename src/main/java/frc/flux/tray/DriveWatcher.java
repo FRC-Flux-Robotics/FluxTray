@@ -67,6 +67,7 @@ public final class DriveWatcher {
   private final Path localDsLogDir;
   private final RobotTransport robot;
   private final PackageDeployer deployer;
+  private final ConfigSwitcher configSwitcher;
   private final BatteryAndRunManager runManager;
   private final RobotSafetyLockout lockout;
   private final NotificationSink notifications;
@@ -172,6 +173,7 @@ public final class DriveWatcher {
     this.localDsLogDir = localDsLogDir;
     this.robot = robot;
     this.deployer = deployer;
+    this.configSwitcher = new ConfigSwitcher(lockout);
     this.runManager = runManager;
     this.lockout = lockout;
     this.notifications = notifications != null ? notifications : (lvl, title, msg) -> {};
@@ -652,7 +654,8 @@ public final class DriveWatcher {
             try {
               CompletedRunBundle preLogs = pullPendingLogsBestEffort(nowMs, "config push");
               String deployedSha =
-                  deployer.pushFluxFigConfigs(configsDir, null, FluxFig.Mode.PRODUCTION, robot);
+                  configSwitcher.pushFluxFigConfigs(
+                      configsDir, null, FluxFig.Mode.PRODUCTION, robot);
               appliedConfigsHashByRobot.put(robotId, cfgHash);
               if (!BOOTSTRAP_ROBOT_KEY.equals(robotId)) {
                 lastAppliedConfigsHash = cfgHash;

@@ -64,6 +64,7 @@ public final class Nt4RobotStateClient implements Closeable {
   private final long pingIntervalMs;
   private final long idleTimeoutMs;
   private final long reconnectBackoffMs;
+  private final boolean clearLockoutOnDisconnect;
   private final HttpClient httpClient;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicBoolean connected = new AtomicBoolean(false);
@@ -110,6 +111,28 @@ public final class Nt4RobotStateClient implements Closeable {
       long pingIntervalMs,
       long idleTimeoutMs,
       long reconnectBackoffMs) {
+    this(
+        candidateHosts,
+        port,
+        lockout,
+        listener,
+        clockMs,
+        pingIntervalMs,
+        idleTimeoutMs,
+        reconnectBackoffMs,
+        true);
+  }
+
+  public Nt4RobotStateClient(
+      List<String> candidateHosts,
+      int port,
+      RobotSafetyLockout lockout,
+      RobotStateListener listener,
+      LongSupplier clockMs,
+      long pingIntervalMs,
+      long idleTimeoutMs,
+      long reconnectBackoffMs,
+      boolean clearLockoutOnDisconnect) {
     this.candidateHosts =
         (candidateHosts == null || candidateHosts.isEmpty())
             ? SshRobotTransport.ROBORIO_CANDIDATE_HOSTS
@@ -121,6 +144,7 @@ public final class Nt4RobotStateClient implements Closeable {
     this.pingIntervalMs = Math.max(50L, pingIntervalMs);
     this.idleTimeoutMs = Math.max(this.pingIntervalMs + 50L, idleTimeoutMs);
     this.reconnectBackoffMs = Math.max(25L, reconnectBackoffMs);
+    this.clearLockoutOnDisconnect = clearLockoutOnDisconnect;
     this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
   }
 
@@ -234,7 +258,11 @@ public final class Nt4RobotStateClient implements Closeable {
         }
         boolean wasConnected = connected.getAndSet(false);
         connectedHost.set(null);
+        lastControlWord.set(-1);
         if (wasConnected) {
+          if (clearLockoutOnDisconnect && lockout != null) {
+            lockout.onRobotDisconnected();
+          }
           notifyConnectionChanged();
         }
       }
